@@ -237,7 +237,9 @@ Parent失敗後にChild失敗が確定した場合、Child未払い額をParent 
 
 ### 排他的な資金区分
 
-Rootごとの資金を次の排他的口座で表す。集計表示は口座から導出し、親集計と子口座を足し直さない。
+Rootごとの資金を次の排他的区分で表す。集計表示は口座から導出し、親集計と子口座を足し直さない。
+
+`available`と`locked`（child_work／child_payout／parent_payout／refundの4口座）は**現在のEscrow残高を持つ口座**である。`paid`／`refunded`は残高口座ではなく、**確定済み資金移動（TransferReceipt）の累計**であり、受取人別・Child/Parent別の内訳はReceiptとPaymentOperationから導出する。
 
 | 表示 | 意味 |
 |---|---|
@@ -246,10 +248,10 @@ Rootごとの資金を次の排他的口座で表す。集計表示は口座か�
 | locked.child_payout | 成功Childへの送金予約資金。失敗時返却対象にならない |
 | locked.parent_payout | 成功Parentへの送金予約資金 |
 | locked.refund | Root Requesterへの返金予約資金 |
-| paid | 実際にMockWalletへ移転済みのWorker支払い累計。受取人・Child/Parent別内訳あり |
-| refunded | 実際にRoot RequesterのMockWalletへ移転済みの返金累計 |
+| paid | 確定済み資金移動（TransferReceipt）の累計として導出するWorker支払い累計。受取人・Child/Parent別内訳はReceiptとPaymentOperationから導出 |
+| refunded | 確定済み資金移動（TransferReceipt）の累計として導出するRoot Requesterへの返金累計 |
 
-`locked`は上記4用途の合計。PENDING/RETRYABLEの送金もEscrow内でlockedに残る。**APPROVEDやDONEになっただけではpaidを増やさない。** Parentが失敗してもChildのwork／payout口座は返金予約へ移せない。
+`locked`は上記4用途の残高口座の合計。PENDING/RETRYABLEの送金もEscrow内でlockedに残る。**APPROVEDやDONEになっただけではpaidを増やさない。** paid/refundedが増えるのはReceipt（確定済み資金移動の正本）が存在するときだけである。Parentが失敗してもChildのwork／payout口座は返金予約へ移せない。
 
 ```text
 D = Root入金総額（1回）
@@ -258,7 +260,9 @@ D = E + paid + refunded
 D = available + locked + paid + refunded
 ```
 
-全口座は非負。Child支払額は当該Child拘束額以下。MockWalletの入金前残高を含めた全口座間のJournal合計も0。Rootへの入金は事前seedしたRequester MockWalletからの引落しとEscrow増額を同一transactionで行う。seedはデモ準備専用で、Job資金操作から呼べない。
+`D = available + locked + paid + refunded`はJournalの貸借式ではなく、**Root Budgetのライフサイクル不変条件**である。入金から返金までのどの時点でも、入金総額は「現在のEscrow残高（available+locked）」と「確定済み資金移動の累計（paid+refunded）」の和に一致しなければならない。Journalについては「各取引の貸借合計が0」を**独立した不変条件**として定義する。MockWalletの入金前残高を含めた全口座間のJournal累計合計も0である。
+
+全口座は非負。Child支払額は当該Child拘束額以下。Rootへの入金は事前seedしたRequester MockWalletからの引落しとEscrow増額を同一transactionで行う。seedはデモ準備専用で、Job資金操作から呼べない。
 
 ### 100→10の操作一覧
 
@@ -268,12 +272,12 @@ D = available + locked + paid + refunded
 | Claim | なし | なし |
 | Child create 10 | available -10 / child_work +10 | なし |
 | Child approval | child_work -10 / child_payout +10 | まだなし |
-| Child payment success | child_payout -10 / paid(B) +10 | B MockWallet +10 |
+| Child payment success | child_payout -10（確定Receiptによりpaid(B)累計 +10） | B MockWallet +10 |
 | Child failure（判定未確定の原資） | child_work -10 / available +10 | なし |
 | Parent approval（Child成功済み） | available -90 / parent_payout +90 | まだなし |
-| Parent payment success | parent_payout -90 / paid(A) +90 | A MockWallet +90 |
+| Parent payment success | parent_payout -90（確定Receiptによりpaid(A)累計 +90） | A MockWallet +90 |
 | Parent failure（Child拘束10） | available -90 / refund +90 | まだなし |
-| Refund success | refund -90 / refunded +90 | Root Requester MockWallet +90 |
+| Refund success | refund -90（確定Receiptによりrefunded累計 +90） | Root Requester MockWallet +90 |
 
 Parent失敗後のChild失敗では`child_work→available→refund`の2移動を一つのtransactionに記録する。途中のavailableは外から再利用できない。ChildがDONEだが送金障害中の場合は失敗返却を禁止する。
 
@@ -281,7 +285,7 @@ Parent失敗後のChild失敗では`child_work→available→refund`の2移動�
 
 1. 承認／失敗判定のtransactionでAcceptance、Job終端、資金予約、PaymentOperationをまとめて確定する。
 2. 共通settlement処理がPENDING/RETRYABLEを取得し、同じoperation_idでMock.transferを呼ぶ。
-3. Mock.transferはReceiptを先に照会し、既存Receiptの金額・受取人・原資が予約と一致することを確認する。未処理の場合のみlocked減額・Wallet増額・paid/refunded増額・Journal・Receiptを一つのDB transactionで確定する。
+3. Mock.transferはReceiptを先に照会し、既存Receiptの金額・受取人・原資が予約と一致することを確認する。未処理の場合のみlocked減額・Wallet増額・Journal・Receiptを一つのDB transactionで確定する（paid/refundedはReceiptの集計として導出され、Receiptがある時だけ増える）。
 4. 呼出側が結果を記録する前に停止しても、再起動後にReceiptを照会してSUCCEEDEDへ収束させる。Receiptなしでpaidを増やさない。
 5. DB commit前の障害なら全体rollback。commit後の応答消失ならReceiptが正本。再試行でJobをFAILEDにしない。
 
