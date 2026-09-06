@@ -1,7 +1,8 @@
 # OJP 最初のPoC実装計画
 
 作成日: 2026-09-06  
-状態: 計画作成済み・未実装  
+更新日: 2026-09-06
+状態: レビュー指摘計10件を修正済み・設計内容版（SHA-256: `b23a75959fe756f5ea48f3b8a15d843ba759f250088bdee22a621fb7cf553ca0`）は2026-09-06の独立レビューでpass・本状態表示はレビュー後追記・未実装
 プロジェクトルート: 本リポジトリのルート（以下`<project-root>`）。実際の絶対パスはローカル設定で指定する。
 
 ## 1. 目的・資料の位置づけ
@@ -37,7 +38,7 @@ Requesterが事前許可した予算内で、Parent Worker Aが自己資金や�
 | MCP | 公式Python SDKの2.x、stdio | 2026-09-06確認時点の公式READMEは2.xを安定系列と案内。実装開始時に安定版を解決し`<3`上限とlockで固定。旧v1のAPIを混在させない。[公式SDK](https://github.com/modelcontextprotocol/python-sdk) |
 | CLI | 標準argparse | コマンド数が少なく追加フレームワーク不要。JSON入出力を主とする |
 | 検証・テスト | 固定JSON検証器、pytest、標準subprocess／並行実行機能 | 実DB・複数プロセス・MCP stdioを通した再現可能なE2Eを作る |
-| 時間処理 | 共通Clock＋DB期限検索 | 同一コードのtickを常駐ループとテストから呼ぶ。外部キューやスケジューラは不要 |
+| 時間処理 | 共通Clock＋DB期限検索 | 通常はUTC実時刻、test modeはDBの単一行に保存した固定UTC時刻を全プロセスで共有する。第7節の規約に従い、同一tickを常駐ループとテストから呼ぶ |
 
 SQLiteは同時書き込みが1つで、`BEGIN IMMEDIATE`が先に書き込みトランザクションを開始する。この性質を利用する設計である。[SQLite公式](https://www.sqlite.org/lang_transaction.html) Python側は自動開始と明示的BEGINを混在させず、明示SQLでBEGIN／COMMIT／ROLLBACKを統一する。[sqlite3公式](https://docs.python.org/3/library/sqlite3.html#transaction-control)
 
@@ -77,7 +78,7 @@ Mock Escrowはドメイン判断と分離したポートとする。ドメイン
 
 ## 4. ディレクトリ構成
 
-今回作る実体はdocs内の基準資料と本書だけ。下記のsrc、tests、data等は今後の配置案であり、今は作らない。
+アプリケーションのsrc、tests、DBは今後の配置案であり、現在は未作成。基準資料と本書、.gitignoreは作成済みで、data/workには非公開の作業記録を保存できる。
 
 ```text
 <project-root>/
@@ -134,6 +135,7 @@ IDは不透明な文字列。日時はサーバーClock由来のUTC。全参照�
 | Acceptance | job_id, submission_id, decision(APPROVED/REJECTED), decided_by, reason, decided_at | Jobごとに最終判定1つ。Job状態と送金状態を分離 |
 | Dispute | id, job_id, submission_id, opened_by, reason_code, condition_id, evidence, opened_at, due_at, status, resolution | 1有効提出につき最大1。OPEN→RESOLVEDのみ。金額の一部裁定はしない |
 | Event | id, root_id, job_id, actor_id, action, object_id, at | 状態・権限判断を追跡する小さな監査記録。イベント基盤やevent sourcingは不要 |
+| RuntimeClock | singleton_id=1, mode(realtime/test), test_now_utc_us | migration 001に含めるDB当たり1行。testのみ固定UTC時刻を整数マイクロ秒で保持。modeはDB初期化時に固定し、既存DBでは変更不可。通常はtest_now_utc_us=null |
 
 JSONの金額は小数を文字列で渡し、内部は1 mock-USDC=1,000,000 unitsの整数。例: `100.000000`=100,000,000。float経由の変換は禁止。6桁を超える小数、負数、ゼロ入金・ゼロChild予算、SQLiteの64bit整数範囲を越えるRoot予算を拒否する。Root間の資金移動も禁止。
 
@@ -193,6 +195,14 @@ Claimのtransaction内で、Job OPEN・deadline未到来・有効Leaseなし・e
 デモ既定値はLease 60秒、heartbeat目安20秒、検収待ち30秒、Dispute判定待ち30秒、tick間隔1秒。JobVersionに実際の値を保存する。`expires_at=min(now+60秒, Job deadline)`で、heartbeatによってJob deadlineを越えない。
 
 時計の比較は`now < deadline`を有効、`now >= deadline`を失効とする。Claim／heartbeat／submit／Child作成はtick未実行でも期限を検査する。クライアント時刻を信用しない。書込ロックを取得した後のサーバー時刻で決め、期限ちょうどは失効側を優先する。
+
+### 全プロセスで共有するClock
+
+- 書込処理は`BEGIN IMMEDIATE`取得後、RuntimeClockを読み、通常はUTC実時刻、test modeでは保存済み`test_now_utc_us`をそのtransactionの`now`として1回だけ採取する。同じtransaction内の期限比較・記録日時はこの値で統一する。読取処理も同じDB snapshotのClockを使い、プロセス単位で固定時刻をキャッシュしない。
+- MCP・CLI・tickは同じDBからmodeと時刻を読む。test DBの利用には各プロセスで明示的なtest mode起動が必要で、起動設定とDBのmodeが違えば起動を拒否する。通常DBからtest時刻へ切り替える入口は設けない。
+- テストharnessだけが専用test modeの補助処理で、書込transaction内の単一行を指定UTC時刻へ進める。後退は拒否、同じ時刻への設定はno-opとする。一般のJob API、通常CLI、MCPの8 toolsには時刻操作を追加しない。時刻更新transactionにはJob処理を混在させない。
+- 全プロセス停止・再起動でも固定時刻をDBに保持する。実時間経過では自動加算せず、停止中に期限を過ぎるテストもharnessが明示的に進める。次のtransactionは更新後の時刻を読むため、期限ちょうどを決定的に再現できる。
+- 期限処理のE2Eは時刻更新commit後に独立プロセスの`ojp tick --once`完了を待つ。`--watch`の存続確認は観測条件と有限timeoutで待ち、Job期限を実時間sleepで待たない。通信・プロセス待機timeoutにはOSの単調時計を使い、固定Clockに依存させない。
 
 Submitとexpiryが競合した時は同じDB transaction境界で直列化する。先に有効Submitがcommitしたなら、以後のexpiryは何もしない。先にexpiryが確定したらSubmitを拒否する。heartbeatも閉じたLeaseを復活させない。
 
@@ -300,7 +310,17 @@ max_ratio_bpsは0〜10000、max_amountは非負、max_childrenは非負整数、
 
 ### 最小の実証タスク
 
-Rootは固定整数配列の合計をJSONで返す`sum-v1`。例: 入力[1,2,3,4,5]、Parent期待結果は`{"sum":15}`。Rootで許可されたChildタスク`part-1`は部分配列[1,2,3]に対する`{"sum":6}`。AはBの結果を使って残りと統合する。
+Rootは固定整数配列の合計をJSONで返す`sum-v1`。共通fixtureは入力[1,2,3,4,5]、Parent期待結果は`{"sum":15}`。Root公開Versionのカタログには次の3件を固定する。Aは外注した部分の結果と自分で計算した残りを統合する。
+
+| task_key | 固定入力 | 期待JSON | 1件の予算上限（mock-USDC） |
+|---|---|---|---:|
+| part-1 | [1,2,3] | {"sum":6} | 20.000000 |
+| part-2 | [4] | {"sum":4} | 20.000000 |
+| part-3 | [5] | {"sum":5} | 20.000000 |
+
+入力・期待値・検証器・各予算上限は公開後変更できない。Child予算は正かつカタログの1件上限以下で、さらに第10節のRoot全体上限を満たす必要がある。既定のChild予算は10、N07・X02等の競合検証では20を指定する。3件すべての外注は必須ではない。
+
+未知のtask_keyやカタログ条件のすり替えは`TASK_NOT_ALLOWED`、生存中または成功済みtask_keyの再作成は`TASK_CONFLICT`。予算・件数・深さ上限の拒否は`POLICY_LIMIT`とし、`details.reason`で`TASK_BUDGET`／`MAX_AMOUNT`／`MAX_RATIO`／`MAX_CHILDREN`／`MAX_DEPTH`を区別する。金額と比率を同時に超える場合は`MAX_AMOUNT`を返す。Actor・親Job・親Leaseの有効性を確認した後、親がdepth=1ならカタログ参照、task_key重複、予算・件数の検査より先に`POLICY_LIMIT/MAX_DEPTH`を返す。depth=0ではカタログと重複を確認してから予算・件数を検査する。
 
 検証器は整数のみ、キー完全一致、正確な合計を検証する。boolを整数として受理しない。入力件数・整数桁数・JSONサイズ／深さ・重複キーにも上限・拒否規則を定め、NaN/Infinityを許可しない。既定は最大1,000要素、各値の絶対値10^9以下、最大1 MiB、深さ8とする。
 
@@ -349,7 +369,7 @@ stdioのみ。読み取りはJobVersion・予算・次の期限・現在必要�
 | ojp_approve | job_id, submission_id | acceptance, job_state, payment_operation_id, payment_status |
 | ojp_dispute | job_id, submission_id, condition_id, reason_code, evidence | dispute_id, state, due_at |
 
-共通応答は成功時`ok=true, data, operation_id?, replayed?`、失敗時`ok=false, error={code,message,retryable,details}`。ドメインエラーはSDKのtoolエラーとしても識別可能にする。代表コードはFORBIDDEN、INVALID_STATE、LEASE_EXPIRED、CLAIM_CONFLICT、POLICY_LIMIT、CHILDREN_UNRESOLVED、VERIFICATION_FAILED、DISPUTE_WINDOW_CLOSED、IDEMPOTENCY_CONFLICT、DB_BUSY。
+共通応答は成功時`ok=true, data, operation_id?, replayed?`、失敗時`ok=false, error={code,message,retryable,details}`。ドメインエラーはSDKのtoolエラーとしても識別可能にする。代表コードはFORBIDDEN、INVALID_STATE、INVALID_TARGET、LEASE_EXPIRED、CLAIM_CONFLICT、TASK_NOT_ALLOWED、TASK_CONFLICT、POLICY_LIMIT、CHILDREN_UNRESOLVED、VERIFICATION_FAILED、DISPUTE_WINDOW_CLOSED、IDEMPOTENCY_CONFLICT、DB_BUSY。
 
 Paginationの上限は100、既定20。Childの成果物取得はget_jobへ含め、追加のストレージAPIを作らない。Rootの作成・入金・障害注入・tick・決済再試行はCLIへ置き、MCP tool数を8に保つ。
 
@@ -377,6 +397,10 @@ Paginationの上限は100、既定20。Childの成果物取得はget_jobへ含�
 | ojp mcp --actor ALIAS | 信頼済み設定からActorを選びstdioサーバー起動 |
 
 通常CLIも`--actor`で信頼済みローカルActorを選べる。tick／seedはsystem、refundはRoot Requesterまたはsystem、payment retryは予約の支払元Requester・受取Worker・systemに限定する。どの経路も原資や受取人を変更できない。
+
+`refund`は対象JobからRootを解決してActor権限を先に検査する。無権限なら`FORBIDDEN`、権限があっても対象がChildなら`INVALID_TARGET`。Rootの返金予約が1件もなければ`INVALID_STATE`とし、新しい返金予約は作らない。予約済みのものだけを処理し、送金済みなら既存結果を返す。Lifecycleで返金可能額が0のときに予約を作らない規則とは区別する。
+
+`abandon`は対象JobのLeaseに記録されたWorkerとのActor一致、JobがLEASEDであること、Leaseの指定・有効性の順に検査する。提出後もLease履歴を使ってActorを確認できるため、Child Requester Aなら`FORBIDDEN`、提出済みChildのWorker Bなら`INVALID_STATE`となる。いずれもChildを失敗へ変更できない。
 
 共通`--json`を備える。終了コードは成功0、入力・権限・状態違反2、一時障害3。operation replayは成功0。テスト用時刻操作・failpointは専用test modeのみで有効にし、通常MCPから触れない。
 
@@ -444,7 +468,7 @@ DB_BUSYは同じoperation_idでtransaction全体を再試行する。プロセ�
 | E2E | Human CLI＋A/B MCP stdio＋独立tick＋実DB | MCP handshakeと8 toolを実クライアントから操作。内部関数の直呼びだけで代替しない |
 | Sequence | 複数Child、失敗・再試行・期限の順序組合せ | 固定seedの生成操作列を小さな参照会計モデルと比較。各commit後に保存則と権限不変条件を確認 |
 
-4結果は決済完了後に判定する。途中ではlockedやRETRYABLEが残って正しい場合があるため、中間状態の期待値も別に照合する。各E2Eは新しいDBと固定入力を用い、時刻は注入Clockで進め、実時間sleepへの依存を避ける。
+4結果は決済完了後に判定する。途中ではlockedやRETRYABLEが残って正しい場合があるため、中間状態の期待値も別に照合する。各E2Eは新しいtest DBと第11節の固定カタログを用い、第7節のDB共有Clockをharnessから進める。N08は後述の専用timing policyで有効提出後・検収期限前に旧Lease期限だけを越え、X09は期限直前／ちょうど／直後、X10は全プロセス停止と時刻更新・再起動を組み合わせる。CLI・MCP・tickが更新後の同じ時刻を観測した証拠を、記録日時と期限判定から確認する。
 
 障害注入は決済commit前、commit後応答消失、Receipt確定後アプリのstatus更新前、裁定応答なし。再起動テストでは実際にプロセスを終了し、新プロセスが同じDBを読んで回復することを確認する。
 
@@ -454,7 +478,7 @@ DB_BUSYは同じoperation_idでtransaction全体を再試行する。プロセ�
 
 ### 指定4結果
 
-各シナリオはRoot入金100、AのChild発注10から始める。「Child失敗」は提出前abandonまたはexpiry、「Parent失敗」も提出前abandonまたはexpiryで再現し、不正な一方的返金で代替しない。
+各シナリオはRoot入金100、Aの`part-1`へのChild発注10から始める。「Child失敗」は提出前abandonまたはexpiry、「Parent失敗」も提出前abandonまたはexpiryで再現し、不正な一方的返金で代替しない。
 
 | ID | Child | Parent | A支払い | B支払い | Requester返金 | 最終Escrow |
 |---|---|---|---:|---:|---:|---:|
@@ -472,11 +496,11 @@ E01ではRequesterがCLIでRootを作成・入金し、AがMCPでClaim/Child作�
 | 1 / N01 | Child未提出の失敗 | child_work 10がParent availableへ戻る。A Walletへの返金ではない |
 | 2 / N02 | Bへ10支払い後、Parent失敗 | B=10維持、A=0、Requester=90 |
 | 3 / N03 | ChildをLEASED／SUBMITTED／DISPUTEDそれぞれにしてParent失敗 | Child状態と10の拘束を保持。最初の返金は90だけ。各Childは後続処理可能 |
-| 4 / N04 | 有効提出後、Parent AがChild原資の直接返金を試行 | INVALID_STATEまたはFORBIDDEN。状態・資金不変。Root自身の有効提出後の直接返金も拒否 |
+| 4 / N04 | Bのpart-1有効提出後、下記N04の具体的呼び出しを実行。Root自身の有効提出後も別fixtureで確認 | 呼び出しごとの確定エラー、Job状態・全口座残高・予約・Receipt不変。MCPに返金・任意失敗toolなし |
 | 5 / N05 | 同じChildを2回承認（同ID・別ID・同時） | Acceptance/PaymentOperation/Receiptはそれぞれ1件。Bへ10だけ |
 | 6 / N06 | AとBが同じJobへ同時Claim | 1人だけ成立。敗者のheartbeat/submitを拒否 |
-| 7 / N07 | 上限30へChild 20を2件同時作成 | 1件だけ成立。使用額20、available80。件数・比率上限競合も別途確認 |
-| 8 / N08 | 有効提出後に旧Lease期限を越えtick | OPEN/EXPIREDへ戻らず、検収経路で進行 |
+| 7 / N07 | 新規Rootでmax_amount=30、max_ratio_bps=10000、max_children=3。異なるIDでpart-1/part-2を各20で同時作成 | 1件だけ成立、敗者はPOLICY_LIMIT/MAX_AMOUNT。U=20、available=80。重複task_key拒否では代替しない。比率・件数の独立ケースは下記 |
+| 8 / N08 | 下記の専用timing policyで有効提出後、review_due_at前かつ旧Lease expires_at後へ進めてtick | SUBMITTEDを維持しOPEN/EXPIREDへ戻らない。Acceptance・支払い予約なし、Leaseは提出完了で閉じたまま |
 | 9 / N09 | Aプロセス停止、Parent失効、B提出 | Bは固定検証と期限承認で10受領。Requesterは成果物取得可 |
 | 10 / N10 | 不正JSON／誤答／古いVersion／取得不能となる保存失敗 | 有効Submission・review_due_atなし、支払いなし |
 | 11 / N11 | 有効提出後Requesterが無応答 | 異議なしなら期限後承認。異議ありなら固定裁定。裁定無応答も既定PASSで解消 |
@@ -489,20 +513,45 @@ E01ではRequesterがCLIでRootを作成・入金し、AがMCPでClaim/Child作�
 | ID | シナリオ | 期待結果 |
 |---|---|---|
 | X01 | 未入金RootをClaim／二重fund／金額不足入金 | 未入金OPENなし。入金・引落しは1回だけ |
-| X02 | Child approval済み・送金停止中に新Childを作成 | child_payoutも再委託使用額に含み上限を維持 |
+| X02 | max_amount=30、max_ratio_bps=10000、max_children=3、max_depth=1。part-1を20で承認し送金commit前で停止、part-2を20で作成試行後、別operation_idで同じpart-2を10で作成 | 20はPOLICY_LIMIT/MAX_AMOUNT、10は成功。拒否された20の試行はJobもtask_keyも確保しないため、同じpart-2の10は重複扱いにならない。前者のU=20・available=80を維持し、後者はU=30・available=70。child_payoutもUに含む |
 | X03 | Child送金停止中にParent成功 | Parent判定・90支払いは可能。Bの10はlockedに残り復旧後1回支払う |
-| X04 | Child未判定でParent提出 | CHILDREN_UNRESOLVED、タイマーなし。Child判定後に提出できる |
-| X05 | Child失敗後の再発注、累計件数超過、Childから孫発注 | 金額は再利用可、件数枠は戻らず、孫Job拒否 |
+| X04 | part-1がLEASEDの間にParent提出 | CHILDREN_UNRESOLVED、タイマーなし。Child判定後に提出できる |
+| X05 | max_children=3でpart-1を10で作成→失敗を3回繰り返し、4件目のpart-1を試行。別Rootではpart-1 Childの有効Worker Bが、そのChildを親としてpart-2の孫発注を試行 | 2・3件目の作成は成功し各失敗後U=0・available=100。4件目はPOLICY_LIMIT/MAX_CHILDREN。孫要求はtask_key検査より先にPOLICY_LIMIT/MAX_DEPTH、資金移動なし |
 | X06 | A/Bが成功条件・検証器・入力・受取人を書換え | 拒否。公開Versionのhash・受取権者維持 |
 | X07 | 同一operation_idに別金額・別Actor、異なるIDで同じ返金効果 | ID流用拒否、業務キーでも効果は一度だけ |
 | X08 | 同時Refund（初回90・追加10それぞれ）、Parent終了とChild returnの競合 | 返金累計100以下。どちらの順でも同じ最終結果 |
 | X09 | heartbeat/submitと失効、approve/disputeと期限ちょうど | 境界定義どおり。閉じたLeaseや終端状態が復活しない |
 | X10 | 全プロセス再起動後の過期限処理とReceipt照会 | 保存期限から処理再開。二重裁定・二重送金なし |
 | X11 | Root RequesterがA停止後にBの成果物取得、無関係Actorが取得 | Requesterには保存内容/hash一致、無関係Actorには非公開 |
-| X12 | 複数Childの成功・失敗・未提出が混在したままParent失敗 | 生存Child原資は全件保護し、個別解決後の最終合計が一致 |
-| X13 | 同じtask_keyの重複作成、カタログ外の簡単なタスク作成 | 重複／条件すり替え拒否。都度Requester確認を追加しない |
+| X12 | max_amount=30、max_ratio_bps=3000、max_children=3、max_depth=1でpart-1/2/3を各10で作成。part-1成功・Bへ10支払済み、part-2失敗返却、part-3はBが未提出LEASEDのままParent失敗 | 先行返金80、part-3のchild_work=10を保護。別fixtureでpart-3成功ならB累計20・返金80、失敗ならB累計10・返金90。A=0、最終Escrow=0 |
+| X13 | part-1が生存中／成功済みの別fixtureでpart-1を再作成。別ケースで未知part-unknownを指定してカタログ外タスク作成を試行 | 重複はTASK_CONFLICT、未知はTASK_NOT_ALLOWED。予算・件数枠に余裕を持たせ、POLICY_LIMITに隠さない。入力等の書換え拒否はX06でも検証。都度Requester確認なし |
 | X14 | 決定的裁定PASS／証拠付きFAIL／裁定応答なし | PASS→支払い、FAIL→返却、無応答→保存PASS採用。全件解決状態へ |
 | X15 | 別Root・別Lease・非検収者からの操作 | 権限拒否しJob・資金・成果物公開範囲が不変 |
+
+#### N07の独立した上限競合fixture
+
+各ケースは新しいRoot・入金100・有効なParent Leaseで、part-1とpart-2を異なるoperation_idで同時作成する。カタログは第11節のまま、policyだけをRoot公開前に設定する。金額ケースはN07表の設定、比率ケースはmax_amount=100／max_ratio_bps=3000／max_children=3で各20とし、敗者は`POLICY_LIMIT/MAX_RATIO`、U=20・available=80。件数ケースはmax_amount=100／max_ratio_bps=10000／max_children=1で各10とし、敗者は`POLICY_LIMIT/MAX_CHILDREN`、作成数1・U=10・available=90。通信成功だけでなく、拒否理由と確定残高まで照合する。
+
+#### N08の専用時刻fixture
+
+このfixtureだけはRoot JobVersionのLeaseを300秒、Root deadlineを`t0+300秒`より後にし、Child JobVersionのLeaseを60秒、review_windowを120秒、Child deadlineを`t0+180秒`より後に設定する。共有Clockを`t0`に固定したままAがRootをClaimしてChildを作成し、BもChildをClaimするため、AのRoot Leaseは`expires_at=t0+300秒`となる。Bは`expires_at=t0+60秒`を得て、共有Clockの`t0+1秒`で有効提出する。これにより`review_due_at=t0+121秒`となり、旧Child Lease期限より後になる。harnessは共有Clockを`t0+61秒`へ進め、`child_expires_at < now < child_review_due_at < root_lease_expires_at`を確認してから独立tickを1回実行する。
+
+tick後もChildはSUBMITTED、AcceptanceとPaymentOperationは0件、全口座残高は提出直後から不変であることを確認する。Leaseの`expires_at`は監査値として`t0+60秒`のまま、`closed_reason`は提出完了のままで、expiry処理によるEventや新Leaseは作らない。その後は同じfixtureをreview_due_atまで進め、通常の自動承認経路が機能することをN11の一部として確認してよい。
+
+#### N04の具体的呼び出し
+
+RはRoot Requester、AはParent WorkerかつChild Requester、BはChild Worker。まずParentは有効LEASED、Childはpart-1・予算10・Bの有効提出によるSUBMITTED、返金予約なし、検収期限前の固定時刻を用いる。拒否確認中はtickを進めず、各呼び出しに新しいoperation_idを使う。
+
+| 呼び出し（共通root指定・JSON・operation-idは省略） | 期待コード |
+|---|---|
+| `ojp --actor A job refund CHILD` | FORBIDDEN（Childから辿ったRootの返金権限なし） |
+| `ojp --actor A job refund ROOT` | FORBIDDEN |
+| `ojp --actor A job abandon CHILD --lease B_LEASE` | FORBIDDEN（AはChild Workerではない） |
+| `ojp --actor B job abandon CHILD --lease B_LEASE` | INVALID_STATE（有効提出後） |
+| `ojp --actor R job refund CHILD` | INVALID_TARGET（返金対象はRootのみ） |
+| `ojp --actor R job refund ROOT` | INVALID_STATE（返金予約なし） |
+
+Root自身の有効提出後は別fixtureで全Child判定終端・Root SUBMITTED・返金予約なしを作り、Rの`job refund ROOT`とAの`job abandon ROOT --lease A_LEASE`がどちらも`INVALID_STATE`となることを確認する。全拒否操作のCLI終了コードは2。Job状態、有効Submission、Acceptance、全口座残高、Journal、PaymentOperation、Receiptを前後比較し、変化を認めない。拒否のOperation結果・監査記録だけは追加可能。MCPの`tools/list`は第13節の8件と完全一致し、返金・任意fail/cancel toolがないこともassertする。テストのために操作面を追加しない。
 
 ## 19. 実装順序
 
@@ -524,18 +573,18 @@ Phase 6 E2E・再起動・競合・再現手順
 
 各Phaseは後述の完了条件を満たしてから進む。前段の検査で問題が出た場合はそのPhaseを修正する。Agentを利用する場合もこの依存順と検証ゲートを維持し、役割分担を理由に機能を追加しない。
 
-既存の必須オーケストレーション構成は今回の新規ルートにはない。計画作成は直接行い、Worker委任・別モデルレビュー・PR作成は実施していない。後続でorchestrateを使う場合は、その時点の適用ルールに従い担当範囲とレビュー対象を本計画へ対応させる。
+計画の修正は直接行う。後続で委任を使う場合は、その時点のユーザー許可と適用ルールに従い、担当範囲とレビュー対象を本計画へ対応させる。運用記録は非公開の所定の場所へ保存し、計画の自己点検と独立レビューの完了状態を混同しない。
 
 ## 20. 各Phaseの完了条件
 
 | Phase | 作業 | 次へ進める条件 |
 |---|---|---|
 | 0 | 資料配置・実装計画 | 原文一致、今回の対象・禁止事項・状態・台帳・API・全必須テストが文書化済み。実装コードなし |
-| 1 | uv環境、依存lock、型、migration、Actor、Clock、テストfixture | 選んだPython／MCP SDKの版を記録。新DBが作れ外部キー・UNIQUE・整数変換のテストが通る。SDK stdio接続の互換性確認 |
+| 1 | uv環境、依存lock、型、migration 001（RuntimeClockを含む）、Actor、Clock、3タスクのfixture | 選んだPython／MCP SDKの版を記録。新DBが作れ外部キー・UNIQUE・整数変換のテストが通る。独立プロセスが同じ注入時刻を観測し再起動後も保持、時刻後退・mode不一致を拒否。SDK stdio接続の互換性確認 |
 | 2 | Root funding、Budget、Journal、PaymentOperation、MockWallet/Receipt | fund・reserve・return・pay・refundごとに保存則成立。二重操作・障害注入・応答消失からの復旧Integrationが通る |
 | 3 | JobVersion、Claim/Lease、heartbeat/expiry、Child policy、Parent終了 | 同時Claim・同時Child作成・上限・提出前失効・Parent失敗時Child保護が通る |
 | 4 | JSON提出、固定検証、承認、Dispute、tick、追加返金 | 有効提出後の直接返金拒否、条件固定、無効提出タイマーなし、A停止／固定裁定／無応答fallbackが通る |
-| 5 | CLIと8 MCP tools、共通エラー、権限付きget | 独立Actorのstdioから8 toolsを呼べる。CLIも同じ状態・金額を返す。transport側に別ロジックなし |
+| 5 | CLIと8 MCP tools、共通エラー、権限付きget | 独立Actorのstdioから8 toolsを呼べる。CLIも同じ状態・金額を返す。MCP・CLI・tickがDB共有Clockを使い、通常経路に時刻操作がない。transport側に別ロジックなし |
 | 6 | 全E2E・競合・再起動・再現README | E01〜E04、N01〜N14、X01〜X15が通る。各commitの会計と受取権を照合。クリーンDBから人間が手順を再現できる |
 
 現在はPhase 0のみ完了対象。表の後続チェックは計画であり、実装・テスト済みという意味ではない。
@@ -593,6 +642,8 @@ Phase 6 E2E・再起動・競合・再現手順
 
 **判定: YES**
 
-最初のPoCに必要な資金区分、終了後のChild保護、提出権、無応答、業務単位の冪等性、同時実行、4結果と異常系の検証方法を具体化した。Phase 1から着手できる計画である。
+**レビュー状態: 指摘計10件を修正済み。設計内容版（SHA-256: `b23a75959fe756f5ea48f3b8a15d843ba759f250088bdee22a621fb7cf553ca0`）は2026-09-06に独立Reviewerがpass判定し、本状態表示はレビュー後に追記。**
 
-これは計画の実装可能性に対する判定であり、実装済み・独立レビュー済み・ユーザーによる実装着手承認を意味しない。今回の依頼どおり、実装コードは書かず計画作成で止める。
+複数Childの固定カタログと上限競合fixture、全プロセス共有のテスト時計、有効提出後の返金拒否の呼び出しと期待エラーに加え、N08のParent／Child時刻関係、孫発注の検査優先順位、X02のtask_key、X02／X12のpolicyを具体化した。基本の資金・権利ルールとPoC対象範囲を維持しており、Phase 1から追加の重要仕様判断なしに着手できる計画である。
+
+独立レビューpassの対象は上記SHA-256の設計内容版であり、本状態表示はその後の管理情報として追記した。計画作成者の判定YESと独立レビューpassは、実装済みまたはユーザーによる実装着手承認を意味しない。今回の依頼は計画修正までであり、実装コード・依存導入・アプリテストは次の段階で扱う。

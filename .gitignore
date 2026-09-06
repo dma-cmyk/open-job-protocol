@@ -22,3 +22,6 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# ローカル専用のエージェント向け作業ガイド（アップロードしない）
+/CLAUDE.md
