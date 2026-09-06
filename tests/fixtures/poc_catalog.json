@@ -1,0 +1,28 @@
+{
+  "root": {
+    "task_key": "sum-v1",
+    "verifier": "sum-v1",
+    "input_values": [1, 2, 3, 4, 5],
+    "expected": {"sum": 15}
+  },
+  "catalog": [
+    {
+      "task_key": "part-1",
+      "input_values": [1, 2, 3],
+      "expected": {"sum": 6},
+      "budget_cap": "20.000000"
+    },
+    {
+      "task_key": "part-2",
+      "input_values": [4],
+      "expected": {"sum": 4},
+      "budget_cap": "20.000000"
+    },
+    {
+      "task_key": "part-3",
+      "input_values": [5],
+      "expected": {"sum": 5},
+      "budget_cap": "20.000000"
+    }
+  ]
+}
