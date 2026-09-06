@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -22,6 +23,44 @@ MIGRATIONS_PACKAGE = "ojp"
 BUSY_TIMEOUT_MS = 5_000
 DB_BUSY_RETRY_SECONDS = 5.0
 JOURNAL_MODE_RETRY_SECONDS = 5.0
+
+_TEST_SYNC_ENV = "OJP_MIGRATION_TEST_SYNC"
+_TEST_SYNC_TIMEOUT_SECONDS = 30.0
+
+
+def _test_sync_before_write_lock() -> None:
+    """テスト専用の同期フック。通常経路では環境変数が未設定のため即 return し、
+    待機・分岐・I/O を一切行わない。
+
+    有効化した場合に限り、適用状況の読み取り（SELECT）を終えて書込ロック取得
+    （BEGIN IMMEDIATE）の直前で、同一 ready_dir を共有する全プロセスの到着を
+    待つ。これにより同時初期化テストは「migration 状態読取後・BEGIN IMMEDIATE
+    前」という旧実装が壊れる箇所で全プロセスを揃えられる。旧実装（BEGIN 前に
+    読んだ適用状況で適用を決める版）ではこの位置に到達した時点で全員が未適用と
+    判断済みのため、全員が一斉に BEGIN IMMEDIATE して DDL/UNIQUE 競合で失敗する。
+    """
+    ready_dir = os.environ.get(_TEST_SYNC_ENV)
+    if not ready_dir:
+        return
+    token = f"{os.getpid()}.{time.monotonic_ns()}"
+    ready_path = os.path.join(ready_dir, token)
+    with open(ready_path, "w") as f:
+        f.write("ready")
+    expected = int(os.environ[_TEST_SYNC_ENV + "_COUNT"])
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    while True:
+        try:
+            arrived = sum(1 for e in os.scandir(ready_dir) if e.is_file())
+        except FileNotFoundError:
+            arrived = 0
+        if arrived >= expected:
+            return
+        if time.monotonic() > deadline:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"test sync barrier timed out after {_TEST_SYNC_TIMEOUT_SECONDS}s",
+            )
+        time.sleep(0.005)
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -40,6 +79,11 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
     既に WAL なら no-op。他プロセスが初期化 transaction を保持している間は
     busy handler が効かず database is locked になり得るため、有限時間の
     再試行で待つ（先行プロセスの初期化が終われば WAL へ切り替わる）。
+
+    メモリ DB のように WAL へ切り替えられない DB は、非 WAL のまま使わず
+    エラーにする。計画書 第16節はローカル DB への WAL 適用を要件としており、
+    切替不能な DB を黙って許容すると要件を満たさない接続が紛れ込むため。
+    いずれの失敗経路も有限時間で必ず抜ける（レビュー指摘D）。
     """
     deadline = time.monotonic() + JOURNAL_MODE_RETRY_SECONDS
     while True:
@@ -49,9 +93,32 @@ def _ensure_wal(conn: sqlite3.Connection) -> None:
         try:
             conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.OperationalError:
+            # ロック競合などの一時障害: 期限まで再試行し、超えたら再送出
             if time.monotonic() > deadline:
                 raise
             time.sleep(0.02)
+            continue
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if mode.lower() == "wal":
+            return
+        if mode.lower() == "memory":
+            # メモリ DB は WAL をサポートしない。例外も出さず永遠に
+            # 切り替わらないため、再試行せず即座に拒否する。
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "WAL journal mode is required but this database cannot use WAL"
+                " (journal_mode=memory); use a file-backed database",
+            )
+        # その他の非 WAL（delete 等）: ロック競合で切替が延期されている
+        # 可能性があるため期限まで再試行する。期限を超えても WAL 化
+        # できないなら非 WAL のまま進めずエラーにする。
+        if time.monotonic() > deadline:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"WAL journal mode is required but could not be enabled"
+                f" within {JOURNAL_MODE_RETRY_SECONDS}s (journal_mode={mode})",
+            )
+        time.sleep(0.02)
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -70,10 +137,13 @@ def migrate(
     """番号付き SQL migration を未適用分だけ適用する。
 
     未適用の migration があるときは各々独立した transaction で実行する。
-    clock_row を渡すと、未適用の migration 適用と同じ transaction で
-    runtime_clock 行を作成する（新規 DB の初期化では 001 の適用・Clock 行作成・
-    schema_migrations への適用記録が原子的に確定する）。途中で失敗したら
-    スキーマも Clock 行も残らない。
+    clock_row を渡すと、runtime_clock 行がまだ無い場合（＝新規 DB の初期化）
+    に限り、未適用の migration 適用と同じ transaction で runtime_clock 行を
+    作成する（新規 DB の初期化では 001 の適用・Clock 行作成・schema_migrations
+    への適用記録が原子的に確定する）。途中で失敗したらスキーマも Clock 行も
+    残らない。既存 DB に後続 migration（将来の 002 等）を適用するときは
+    runtime_clock 行は既に存在するため INSERT は走らず、二重作成されない
+    （レビュー指摘E）。
 
     適用状況は BEGIN IMMEDIATE 取得後に書込ロック内で再確認するため、
     複数プロセスが同じ新規 DB を同時に初期化しても後続は CREATE 競合せず、
@@ -84,6 +154,10 @@ def migrate(
     newly: list[str] = []
     for name in names:
         sql = _load_migration_sql(name)
+        # 通常経路では no-op（環境変数未設定）。同時初期化テストだけが
+        # ここで「migration 状態読取後・BEGIN IMMEDIATE 前」で全員を揃える
+        # （旧実装が壊れる箇所。レビュー指摘C）。
+        _test_sync_before_write_lock()
         with transaction(conn, immediate=True):
             if not _migrations_table_exists(conn):
                 conn.execute(
@@ -99,7 +173,10 @@ def migrate(
                 continue
             for statement in _split_statements(sql):
                 conn.execute(statement)
-            if clock_row is not None:
+            # Clock 行の作成は新規 DB 初期化時に 1 回だけ。001 適用直後は
+            # 必ず 0 行であり、後続 migration（将来の 002 等）の適用時には
+            # 既に 1 行存在するため INSERT は走らない。
+            if clock_row is not None and _runtime_clock_missing(conn):
                 mode, test_now_us = clock_row
                 conn.execute(
                     "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
@@ -119,6 +196,24 @@ def _migrations_table_exists(conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
     ).fetchone()
     return row is not None
+
+
+def _runtime_clock_missing(conn: sqlite3.Connection) -> bool:
+    """runtime_clock 行が未作成か。テーブル自体が無ければ「未作成」とみなす。
+
+    001 適用直後の同一 transaction 内ではテーブルは存在し 0 行、既存 DB での
+    後続 migration 適用時には 1 行存在する。テーブルが無い状況（001 より前の
+    migration が将来増えた場合等）では INSERT 自体が失敗するため呼ばれない想定。
+    """
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_clock'"
+    ).fetchone()
+    if table is None:
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM runtime_clock WHERE singleton_id = 1"
+    ).fetchone()
+    return row is None
 
 
 def _migration_names() -> list[str]:
