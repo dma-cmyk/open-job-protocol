@@ -38,28 +38,18 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def applied_migrations(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
-        "SELECT name FROM schema_migrations ORDER BY name"
-    ).fetchall()
-    return [r["name"] for r in rows]
-
-
 def migrate(conn: sqlite3.Connection) -> list[str]:
     """番号付き SQL migration を未適用分だけ適用する。
 
-    各 migration は独立した transaction で実行する。schema_migrations は
-    001 の前に作成するため、最初の migration 実行前に存在確認して作る。
+    各 migration は独立した transaction で実行する。適用状況は
+    BEGIN IMMEDIATE 取得後に書込ロック内で再確認するため、複数プロセスが
+    同じ新規 DB を同時に初期化しても後続は CREATE 競合せず、適用済みを
+    読むだけで済む。schema_migrations は 001 の前に作成するため、
+    最初の migration 実行前に存在確認して作る。
     """
-    applied: set[str] = set()
-    if _migrations_table_exists(conn):
-        applied = set(applied_migrations(conn))
-
     names = _migration_names()
     newly: list[str] = []
     for name in names:
-        if name in applied:
-            continue
         sql = _load_migration_sql(name)
         with transaction(conn, immediate=True):
             if not _migrations_table_exists(conn):
@@ -68,6 +58,12 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
                     " name TEXT PRIMARY KEY,"
                     " applied_at_us INTEGER NOT NULL CHECK (applied_at_us >= 0))"
                 )
+            # 書込ロック取得後に適用状況を再確認する（同時初期化の直列化）
+            already = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+            ).fetchone()
+            if already is not None:
+                continue
             for statement in _split_statements(sql):
                 conn.execute(statement)
             conn.execute(

@@ -8,10 +8,15 @@ from pydantic import ValidationError
 from ojp.domain import (
     Job,
     JobState,
+    JobVersion,
+    JournalEntry,
+    Lease,
+    PaymentOperation,
     SubcontractPolicy,
     TaskCatalogEntry,
     RootTaskDefinition,
     TERMINAL_JOB_STATES,
+    TimingPolicy,
 )
 from tests.conftest import default_subcontract_policy, load_poc_catalog
 
@@ -84,6 +89,49 @@ class TestTaskCatalogEntry:
             TaskCatalogEntry(
                 task_key="x", input_values=[1], expected={"sum": 1.5}, budget_cap_units=1
             )
+
+
+class TestStrictAmountUnits:
+    """金額型は True・float・文字列数値の曖昧な変換を拒否する（レビュー指摘4）。"""
+
+    def _base_kwargs(self) -> dict:
+        return dict(
+            id="v1", job_id="j1", version=1, title="t", asset="mock-USDC",
+            deadline_us=1, subcontract_policy=default_subcontract_policy(),
+            timing_policy=TimingPolicy(),
+        )
+
+    def test_job_version_budget_units_strict(self) -> None:
+        JobVersion(budget_units=1, **self._base_kwargs())
+        for bad in (True, 1.0, "1"):
+            with pytest.raises(ValidationError):
+                JobVersion(budget_units=bad, **self._base_kwargs())
+
+    def test_payment_operation_amount_units_strict(self) -> None:
+        base = dict(
+            operation_id="op1", business_key="bk", root_id="r1", job_id="j1",
+            source_account_id="a1", payee_id="w1", kind="payout", status="PENDING",
+        )
+        PaymentOperation(amount_units=1, **base)
+        for bad in (True, 1.0, "1"):
+            with pytest.raises(ValidationError):
+                PaymentOperation(amount_units=bad, **base)
+
+    def test_journal_entry_delta_units_strict(self) -> None:
+        JournalEntry(operation_id="op1", entry_no=0, account_id="a1", delta_units=-100)
+        for bad in (True, 1.0, "1"):
+            with pytest.raises(ValidationError):
+                JournalEntry(operation_id="op1", entry_no=0, account_id="a1", delta_units=bad)
+
+    def test_lease_generation_and_job_row_version_strict(self) -> None:
+        base = dict(
+            id="l1", job_id="j1", worker_id="w1", version_id="v1",
+            claimed_at_us=1, heartbeat_at_us=1, expires_at_us=2,
+        )
+        Lease(generation=1, **base)
+        for bad in (True, 1.0, "1"):
+            with pytest.raises(ValidationError):
+                Lease(generation=bad, **base)
 
 
 class TestPocCatalogFixture:

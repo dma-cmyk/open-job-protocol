@@ -170,6 +170,8 @@ class ClockMode(StrEnum):
 
 
 AmountUnits = Annotated[int, Field(ge=0, le=SQLITE_MAX_I64, strict=True)]
+PositiveAmountUnits = Annotated[int, Field(gt=0, le=SQLITE_MAX_I64, strict=True)]
+SignedAmountUnits = Annotated[int, Field(le=SQLITE_MAX_I64, ge=-SQLITE_MAX_I64, strict=True)]
 TimestampUs = Annotated[int, Field(ge=0, le=SQLITE_MAX_I64, strict=True)]
 StrictNonNegativeInt = Annotated[int, Field(ge=0, strict=True)]
 StrictInt = Annotated[int, Field(strict=True)]
@@ -298,7 +300,7 @@ class Job(_StrictModel):
     state: JobState
     version_id: str | None = None
     active_lease_id: str | None = None
-    row_version: Annotated[int, Field(ge=0)]
+    row_version: Annotated[int, Field(ge=0, strict=True)]
     created_at_us: TimestampUs
     task_key: str | None = None
     creator_lease_id: str | None = None
@@ -318,9 +320,9 @@ class JobVersion(_StrictModel):
 
     id: str
     job_id: str
-    version: Annotated[int, Field(ge=1)]
+    version: Annotated[int, Field(ge=1, strict=True)]
     title: str
-    budget_units: Annotated[int, Field(gt=0, le=SQLITE_MAX_I64)]
+    budget_units: PositiveAmountUnits
     asset: str = ASSET_MOCK_USDC
     deadline_us: TimestampUs
     subcontract_policy: SubcontractPolicy
@@ -333,7 +335,7 @@ class Lease(_StrictModel):
     job_id: str
     worker_id: str
     version_id: str
-    generation: Annotated[int, Field(ge=1)]
+    generation: Annotated[int, Field(ge=1, strict=True)]
     claimed_at_us: TimestampUs
     heartbeat_at_us: TimestampUs
     expires_at_us: TimestampUs
@@ -391,9 +393,9 @@ class JournalTransaction(_StrictModel):
 
 class JournalEntry(_StrictModel):
     operation_id: str
-    entry_no: Annotated[int, Field(ge=0)]
+    entry_no: Annotated[int, Field(ge=0, strict=True)]
     account_id: str
-    delta_units: int
+    delta_units: SignedAmountUnits
 
 
 class Operation(_StrictModel):
@@ -412,11 +414,11 @@ class PaymentOperation(_StrictModel):
     root_id: str
     job_id: str
     source_account_id: str
-    amount_units: Annotated[int, Field(gt=0, le=SQLITE_MAX_I64)]
+    amount_units: PositiveAmountUnits
     payee_id: str
     kind: PaymentKind
     status: PaymentStatus
-    attempt_count: Annotated[int, Field(ge=0)] = 0
+    attempt_count: Annotated[int, Field(ge=0, strict=True)] = 0
     next_retry_at_us: TimestampUs | None = None
     last_error: str | None = None
     receipt_id: str | None = None

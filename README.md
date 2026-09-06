@@ -40,7 +40,7 @@ uv run pytest
   ドメイン型・policy 不変条件、固定カタログ fixture
 - `tests/integration/`: 実ファイル SQLite での新規 DB 作成・外部キー・UNIQUE・
   非負制約・明示トランザクションの rollback/commit、実プロセス複数起動による
-  共有 Clock の観測・再起動後の保持・後退拒否・mode 不一致拒否、
+  共有 Clock の観測・再起動後の保持・後退拒否・mode 不一致拒否・同時初期化、
   MCP SDK 2.x の stdio 接続スモークテスト
 
 ## パッケージ構成
@@ -48,10 +48,11 @@ uv run pytest
 - `src/ojp/domain.py`: モデル型・状態・policy・不変条件・金額変換（第5節）
 - `src/ojp/db.py`: 接続PRAGMA（foreign_keys / WAL / synchronous=FULL / busy_timeout）、
   明示 BEGIN/COMMIT/ROLLBACK、番号付き SQL migration 実行（第16節）
-- `src/ojp/migrations/001_initial.sql`: 初期スキーマ。全参照に外部キー、金額に非負制約、
-  RuntimeClock 行（singleton_id=1）を含む
+- `src/ojp/migrations/001_initial.sql`: 初期スキーマ。全参照に外部キー、金額に非負制約。
+  runtime_clock テーブルを含む（行の作成は initialize_database が行う）
 - `src/ojp/clock.py`: 全プロセス共有 Clock。書込 transaction 内で1回だけ now を採取、
-  test mode は DB 保存時刻、harness 専用の時刻前進（後退拒否・同値 no-op）（第7節）
+  test mode は DB 保存時刻、harness 専用の時刻前進（後退拒否・同値 no-op）、
+  mode と初期時刻の原子的な初期化（第7節）
 - `src/ojp/mcp_server.py`: MCP stdio サーバー（Phase 1 は接続確認用の最小構成）
 - `tests/fixtures/poc_catalog.json`: 第11節の固定カタログ
   （Root: sum-v1 / Child: part-1..3、各予算上限 20.000000）
@@ -66,7 +67,9 @@ uv run python -m ojp.mcp_server
 
 - 書込処理は `BEGIN IMMEDIATE` 取得後に `runtime_clock` を読み、realtime なら UTC 実時刻、
   test mode なら保存済み `test_now_utc_us` をその transaction の now として1回だけ採取する
-- mode は DB 初期化時に固定し、既存 DB ではトリガーで変更不可。
+- mode は `runtime_clock` 行の作成時に一度だけ確定する。行の作成は
+  `clock.initialize_database` が入力検証後に単一 transaction の INSERT で原子的に行い、
+  作成済みの行は mode を UPDATE で変更できない（realtime → test も含め SQL トリガーで強制）。
   起動設定と DB の mode が異なれば `MODE_MISMATCH` で起動を拒否する
 - 時刻前進（`clock.set_test_now`）はテスト harness 専用。後退は `CLOCK_BACKWARD` で拒否、
   同じ時刻への設定は no-op。通常 CLI・MCP・Job API に時刻操作は存在しない

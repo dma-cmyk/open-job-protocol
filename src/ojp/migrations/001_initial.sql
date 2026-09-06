@@ -17,12 +17,12 @@ CREATE TABLE jobs (
     state            TEXT NOT NULL CHECK (state IN (
                          'DRAFT', 'OPEN', 'LEASED', 'SUBMITTED',
                          'DISPUTED', 'DONE', 'FAILED', 'EXPIRED')),
-    version_id       TEXT,
-    active_lease_id  TEXT,
+    version_id       TEXT REFERENCES job_versions (id),
+    active_lease_id  TEXT REFERENCES leases (id),
     row_version      INTEGER NOT NULL CHECK (row_version >= 0),
     created_at_us    INTEGER NOT NULL CHECK (created_at_us >= 0),
     task_key         TEXT,
-    creator_lease_id TEXT,
+    creator_lease_id TEXT REFERENCES leases (id),
     CHECK ((parent_id IS NULL) = (root_id = id)),
     CHECK (parent_id IS NULL OR parent_id = root_id)
 );
@@ -140,7 +140,7 @@ CREATE TABLE payment_operations (
     attempt_count     INTEGER NOT NULL CHECK (attempt_count >= 0) DEFAULT 0,
     next_retry_at_us  INTEGER CHECK (next_retry_at_us >= 0),
     last_error        TEXT,
-    receipt_id        TEXT UNIQUE
+    receipt_id        TEXT UNIQUE REFERENCES transfer_receipts (receipt_id)
 );
 
 CREATE TABLE mock_wallets (
@@ -191,26 +191,39 @@ CREATE TABLE events (
     at_us     INTEGER NOT NULL CHECK (at_us >= 0)
 );
 
--- DB 当たり1行。mode は DB 初期化時に固定し既存 DB では変更不可。
--- test のみ test_now_utc_us に固定 UTC 時刻（整数マイクロ秒）を保持する。
+-- DB 当たり1行。行の作成は initialize_database が入力検証後に単一 transaction で
+-- 行うため、migration には INSERT を含めない（mode・時刻の初期確定が原子的になる）。
 CREATE TABLE runtime_clock (
     singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     mode             TEXT NOT NULL CHECK (mode IN ('realtime', 'test')),
     test_now_utc_us  INTEGER CHECK (test_now_utc_us >= 0),
-    CHECK (mode <> 'test' OR test_now_utc_us IS NOT NULL)
+    CHECK (mode <> 'test' OR test_now_utc_us IS NOT NULL),
+    CHECK (mode <> 'realtime' OR test_now_utc_us IS NULL)
 );
 
-INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)
-VALUES (1, 'realtime', NULL);
-
--- mode は初期化時の1回（未使用の realtime → test）だけ変更できる。
+-- mode は行作成時に一度だけ確定し、以降の UPDATE では一切変更不可
+-- （realtime → test への変更も含む。通常 DB から test 時刻へ切り替える入口は
+--   計画第7節で「設けない」と定義されている）。
 CREATE TRIGGER runtime_clock_mode_immutable
 BEFORE UPDATE ON runtime_clock
 WHEN NEW.mode <> OLD.mode
-     AND NOT (OLD.mode = 'realtime' AND OLD.test_now_utc_us IS NULL
-              AND NEW.mode = 'test')
 BEGIN
     SELECT RAISE(ABORT, 'runtime_clock mode is immutable');
+END;
+
+-- singleton_id の書き換えで行を差し替えることも許さない。
+CREATE TRIGGER runtime_clock_row_immutable
+BEFORE UPDATE ON runtime_clock
+WHEN NEW.singleton_id <> OLD.singleton_id
+BEGIN
+    SELECT RAISE(ABORT, 'runtime_clock singleton_id is immutable');
+END;
+
+-- 行の削除も許さない。
+CREATE TRIGGER runtime_clock_no_delete
+BEFORE DELETE ON runtime_clock
+BEGIN
+    SELECT RAISE(ABORT, 'runtime_clock row cannot be deleted');
 END;
 
 -- realtime DB に固定時刻を保存しない。

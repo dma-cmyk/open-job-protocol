@@ -5,8 +5,8 @@
   1回だけ採取する
 - 読取処理も同じ DB snapshot の Clock を使い、プロセス単位で固定時刻を
   キャッシュしない
-- mode は DB 初期化時に固定し既存 DB では変更不可。起動設定と DB の mode が
-  違えば起動を拒否する
+- mode は runtime_clock 行の作成時に一度だけ確定し、以降は UPDATE で一切変更
+  できない（トリガーで強制）。起動設定と DB の mode が違えば起動を拒否する
 - 時刻前進（set_test_now）はテスト harness 専用で、後退は拒否、同じ時刻への
   設定は no-op。時刻更新 transaction に Job 処理を混在させない
 """
@@ -28,6 +28,33 @@ def utc_now_us() -> TimestampUs:
     return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
+def _validate_startup_args(
+    mode: ClockMode, test_now_us: TimestampUs | None
+) -> TimestampUs | None:
+    """起動設定を DB に触れる前に検証する。失敗しても DB には痕跡が残らない。"""
+    if not isinstance(mode, ClockMode):
+        raise OjpError(ErrorCode.INVALID_ARGUMENT, f"invalid clock mode: {mode!r}")
+    if mode == ClockMode.REALTIME:
+        if test_now_us is not None:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                "test_now_us must not be specified for realtime mode",
+            )
+        return None
+    if test_now_us is None:
+        raise OjpError(
+            ErrorCode.CLOCK_ERROR, "test mode requires an initial test_now_us"
+        )
+    if isinstance(test_now_us, bool) or not isinstance(test_now_us, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"test_now_us must be int, got {type(test_now_us).__name__}",
+        )
+    if test_now_us < 0:
+        raise OjpError(ErrorCode.INVALID_ARGUMENT, "test_now_us must be non-negative")
+    return test_now_us
+
+
 def initialize_database(
     db_path: str | Path,
     mode: ClockMode,
@@ -36,35 +63,62 @@ def initialize_database(
 ) -> sqlite3.Connection:
     """DB を作成（または既存 DB を開き）、Clock mode を検証して接続を返す。
 
-    - 新規 DB: migration を適用し、mode が test なら RuntimeClock を初期化する
+    - 入力検証は DB に触れる前に完了する
+    - migration 適用後に runtime_clock 行が無ければ、mode と初期時刻を
+      単一の INSERT（1 transaction）で原子的に確定する。途中停止しても
+      realtime 行だけが残ることがなく、正しい設定で再試行できる
     - 既存 DB: mode の変更はできず、起動設定と異なれば MODE_MISMATCH で拒否する
     """
+    validated_test_now = _validate_startup_args(mode, test_now_us)
     conn = db.connect(db_path)
     try:
-        newly = db.migrate(conn)
-        if newly and mode == ClockMode.TEST:
-            if test_now_us is None:
-                raise OjpError(
-                    ErrorCode.CLOCK_ERROR,
-                    "test mode requires an initial test_now_us",
-                )
-            with db.transaction(conn, immediate=True):
-                cursor = conn.execute(
-                    "UPDATE runtime_clock SET mode = 'test', test_now_utc_us = ? "
-                    "WHERE singleton_id = 1 AND mode = 'realtime' AND test_now_utc_us IS NULL",
-                    (int(test_now_us),),
-                )
-                if cursor.rowcount != 1:
-                    raise OjpError(
-                        ErrorCode.INVALID_STATE, "runtime_clock row is not initializable"
-                    )
-        # mode='test' に初期化した直後の DB は triggers により test_now_utc_us を
-        # NULL へ戻せない。起動検査の前に既存 DB なら mode を照合する。
+        db.migrate(conn)
+        _ensure_clock_row(conn, mode, validated_test_now)
         assert_mode(conn, mode)
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+def _ensure_clock_row(
+    conn: sqlite3.Connection, mode: ClockMode, test_now_us: TimestampUs | None
+) -> None:
+    """runtime_clock 行を、無ければ単一 transaction の INSERT で確定する。
+
+    複数プロセスが同時に初期化する場合は INSERT の PRIMARY KEY が並行を
+    直列化し、先行 commit が確定させる。後続は挿入競合を既存行の確認へ
+    変換する。
+    """
+    existing = conn.execute(
+        "SELECT mode, test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
+    ).fetchone()
+    if existing is not None:
+        return
+    try:
+        with db.transaction(conn, immediate=True):
+            # 書込ロック内で再確認する（同時初期化の直列化後）
+            row = conn.execute(
+                "SELECT mode, test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
+            ).fetchone()
+            if row is not None:
+                return
+            if mode == ClockMode.TEST:
+                conn.execute(
+                    "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
+                    " VALUES (1, 'test', ?)",
+                    (test_now_us,),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
+                    " VALUES (1, 'realtime', NULL)"
+                )
+    except sqlite3.IntegrityError as exc:
+        if "runtime_clock.singleton_id" in str(exc):
+            # 別プロセスが同時に初期化した。commit 済み行の mode は assert_mode で検証
+            return
+        raise
 
 
 def read_mode(conn: sqlite3.Connection) -> ClockMode:

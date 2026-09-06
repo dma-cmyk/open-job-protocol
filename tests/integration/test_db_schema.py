@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from ojp import db
+from ojp import clock, db
+from ojp.domain import ClockMode
 from tests.conftest import DbHandle
 
 
@@ -66,8 +67,39 @@ def insert_operation(conn: sqlite3.Connection, oid: str, actor: str = "p1") -> N
     )
 
 
+def insert_payment_operation(
+    conn: sqlite3.Connection,
+    oid: str,
+    *,
+    account: str = "acc1",
+    amount: int = 10,
+    jid: str = "j1",
+    payee: str = "w1",
+) -> None:
+    conn.execute(
+        "INSERT INTO payment_operations (operation_id, business_key, root_id, job_id,"
+        " source_account_id, amount_units, payee_id, kind, status)"
+        f" VALUES ('{oid}', 'bk:{oid}', '{jid}', '{jid}', '{account}', {amount},"
+        f" '{payee}', 'payout', 'PENDING')"
+    )
+
+
+def insert_account(
+    conn: sqlite3.Connection, aid: str, jid: str = "j1", amount: int = 100
+) -> None:
+    conn.execute(
+        "INSERT INTO budget_accounts (id, root_id, owner_job_id, bucket, amount_units)"
+        f" VALUES ('{aid}', '{jid}', '{jid}', 'available', {amount})"
+    )
+
+
 class TestNewDatabaseCreation:
-    def test_migrate_creates_schema_and_clock_row(self, tmp_path: Path) -> None:
+    def test_migrate_creates_schema_without_clock_row(self, tmp_path: Path) -> None:
+        """migration はスキーマだけを作り、runtime_clock 行は作らない。
+
+        行の作成は clock.initialize_database が入力検証後に単一 transaction で
+        行う（レビュー指摘2: 初期 mode・時刻の原子的確定）。
+        """
         path = tmp_path / "fresh.sqlite3"
         conn = db.connect(path)
         newly = db.migrate(conn)
@@ -87,15 +119,20 @@ class TestNewDatabaseCreation:
         ):
             assert expected in tables
 
-        clock_row = conn.execute(
-            "SELECT mode, test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
-        ).fetchone()
-        assert clock_row is not None
-        assert clock_row["mode"] == "realtime"
-        assert clock_row["test_now_utc_us"] is None
+        # migration だけでは Clock 行は作られない
+        assert (
+            conn.execute("SELECT COUNT(*) FROM runtime_clock").fetchone()[0] == 0
+        )
+        conn.close()
+
+        # 初期化で始めて行が作られる
+        conn2 = clock.initialize_database(path, ClockMode.REALTIME)
+        assert conn2.execute(
+            "SELECT mode FROM runtime_clock WHERE singleton_id = 1"
+        ).fetchone()["mode"] == "realtime"
 
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
+            conn2.execute(
                 "INSERT INTO runtime_clock (singleton_id, mode) VALUES (2, 'realtime')"
             )
 
@@ -155,20 +192,94 @@ class TestForeignKeys:
                 " VALUES ('c2', 'r1', 'c1', 'p1', 'DRAFT', 0, 1)"
             )
 
+    def test_job_version_ref_requires_existing_version(self, realtime_db: DbHandle) -> None:
+        """jobs.version_id は job_versions への参照制約を持つ（レビュー指摘1）。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE jobs SET version_id = 'ghost-version' WHERE id = 'j1'"
+            )
+
+    def test_job_active_lease_ref_requires_existing_lease(self, realtime_db: DbHandle) -> None:
+        """jobs.active_lease_id は leases への参照制約を持つ（レビュー指摘1）。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE jobs SET active_lease_id = 'ghost-lease' WHERE id = 'j1'"
+            )
+
+    def test_job_creator_lease_ref_requires_existing_lease(self, realtime_db: DbHandle) -> None:
+        """jobs.creator_lease_id は leases への参照制約を持つ（レビュー指摘1）。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
+                " row_version, created_at_us, task_key, creator_lease_id)"
+                " VALUES ('c1', 'j1', 'j1', 'p1', 'DRAFT', 0, 1, 'part-1', 'ghost-lease')"
+            )
+
+    def test_payment_receipt_ref_requires_existing_receipt(self, realtime_db: DbHandle) -> None:
+        """payment_operations.receipt_id は transfer_receipts への参照制約を持つ
+        （レビュー指摘1）。前提行（operation・account・payment）は正しく挿入する。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        insert_operation(conn, "op1")
+        insert_participant(conn, "w1")
+        insert_account(conn, "acc1", jid="j1")
+        insert_payment_operation(conn, "op1", account="acc1")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE payment_operations SET receipt_id = 'ghost-receipt'"
+                " WHERE operation_id = 'op1'"
+            )
+
 
 class TestUniqueConstraints:
     def test_one_active_lease_per_job(self, realtime_db: DbHandle) -> None:
+        """有効 Lease 一意性を部分 UNIQUE index 単独で検証する（レビュー指摘5）。
+
+        generation は重複させない: 2本目の挿入が UNIQUE(job_id, generation) ではなく
+        leases_one_active_per_job で拒否されることを確認するため。
+        """
         conn = realtime_db.conn
         insert_root_job(conn, "j1")
         insert_job_version(conn, "j1", "v1")
-        insert_lease(conn, "l1", "j1", "v1")
-        with pytest.raises(sqlite3.IntegrityError):
-            insert_lease(conn, "l2", "j1", "v1", worker="w2")
-
+        insert_lease(conn, "l1", "j1", "v1", worker="w1", generation=1)
+        # 前提検査: closed 済み Lease は部分 index の対象外なので、
+        # 同一 generation のまま closed にできる（UNIQUE(job_id, generation) は
+        # closed 済みにも適用されるため generation=2 を使う）
         conn.execute("UPDATE leases SET closed_reason = 'expired' WHERE id = 'l1'")
         insert_lease(conn, "l2", "j1", "v1", worker="w2", generation=2)
+
+        # l2 が有効（closed_reason IS NULL）のまま、別 generation の有効 Lease を
+        # 挿こうとすると部分 UNIQUE index だけに引っかかる
         with pytest.raises(sqlite3.IntegrityError):
-            insert_lease(conn, "l3", "j1", "v1", worker="w3", generation=2)
+            insert_lease(conn, "l3", "j1", "v1", worker="w3", generation=3)
+
+        # 拒否が UNIQUE(job_id, generation) ではなく部分 index であることの裏付け:
+        # 同じ generation=3 を closed Lease としては挿入できる
+        conn.execute(
+            "INSERT INTO leases (id, job_id, worker_id, version_id, generation,"
+            " claimed_at_us, heartbeat_at_us, expires_at_us, closed_reason)"
+            " VALUES ('l3', 'j1', 'w3', 'v1', 3, 1, 1, 2, 'expired')"
+        )
+
+    def test_active_lease_unique_allows_closed_history(self, realtime_db: DbHandle) -> None:
+        """closed Lease の履歴は何本でも残せる。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        insert_job_version(conn, "j1", "v1")
+        for gen in (1, 2, 3):
+            insert_participant(conn, f"w{gen}")
+            conn.execute(
+                "INSERT INTO leases (id, job_id, worker_id, version_id, generation,"
+                " claimed_at_us, heartbeat_at_us, expires_at_us, closed_reason)"
+                f" VALUES ('l{gen}', 'j1', 'w{gen}', 'v1', {gen}, 1, 1, 2, 'expired')"
+            )
+        insert_lease(conn, "l4", "j1", "v1", worker="w4", generation=4)
 
     def test_job_version_unique_per_job(self, realtime_db: DbHandle) -> None:
         conn = realtime_db.conn
@@ -303,16 +414,23 @@ class TestNonNegativeAndCheckConstraints:
             )
 
     def test_payment_amount_must_be_positive(self, realtime_db: DbHandle) -> None:
+        """正額制約を単独で検証する（レビュー指摘5）。
+
+        参照先（operation・account・participant）はすべて正しく挿入し、
+        amount_units = 0 だけを破る。外部キー違反ではなく CHECK 制約で拒否される
+        ことを確認する。
+        """
         conn = realtime_db.conn
         insert_root_job(conn, "j1")
         insert_operation(conn, "op1")
+        insert_operation(conn, "op2")
         insert_participant(conn, "w1")
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO payment_operations (operation_id, business_key, root_id, job_id,"
-                " source_account_id, amount_units, payee_id, kind, status)"
-                " VALUES ('op1', 'bk', 'j1', 'j1', 'acc1', 0, 'w1', 'payout', 'PENDING')"
-            )
+        insert_account(conn, "acc1", jid="j1")
+        # 前提検査: amount=10 なら挿入できる（参照はすべて有効）
+        insert_payment_operation(conn, "op1", account="acc1", amount=10)
+        # 同じ前提で amount=0 は CHECK (amount_units > 0) で拒否される
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed: amount_units"):
+            insert_payment_operation(conn, "op2", account="acc1", amount=0)
 
     def test_job_state_checked(self, realtime_db: DbHandle) -> None:
         conn = realtime_db.conn

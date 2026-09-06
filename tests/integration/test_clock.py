@@ -82,22 +82,32 @@ class TestSharedClockAcrossProcesses:
         assert len({output.split()[0] for output in outputs}) == 1
 
     def test_time_persists_after_all_processes_stop_and_restart(self, test_db: DbHandle) -> None:
-        """全プロセス停止・再起動後も固定時刻が保持される。"""
+        """全プロセス停止・再起動後も固定時刻が保持される。
+
+        初期化に使った test_db.conn も含めて全接続を閉じ切った状態で
+        DB を開き直し、時刻の保持と読取・書込での観測を確認する
+        （レビュー指摘5）。
+        """
         advanced = TEST_T0_US + 61_000_000
         result = run_observer(test_db.path, "test", "set", str(advanced))
         assert result.returncode == 0
         assert result.stdout.strip() == "True"
-        # subprocess.run の完了 = 上述プロセスは全て停止済み。
-        # 独立プロセス（test_db.conn 以外の新接続）から読み直して保持を確認する。
-        fresh = db.connect(test_db.path)
-        assert (
-            fresh.execute(
-                "SELECT test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
-            ).fetchone()["test_now_utc_us"]
-            == advanced
-        )
-        fresh.close()
+        # 初期化接続（test_db.conn）も含めて全接続を閉じる
+        test_db.conn.close()
 
+        # 全プロセス・全接続停止後の再起動: 新しい接続から固定時刻を確認
+        fresh = db.connect(test_db.path)
+        try:
+            assert (
+                fresh.execute(
+                    "SELECT test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
+                ).fetchone()["test_now_utc_us"]
+                == advanced
+            )
+        finally:
+            fresh.close()
+
+        # 独立プロセスでの再起動後の読取・書込観測
         after = run_observer(test_db.path, "test", "read")
         assert after.returncode == 0
         assert int(after.stdout.strip()) == advanced
@@ -170,7 +180,7 @@ class TestModeMismatchRejected:
         # rollback 後も mode は test のまま
         assert clock.read_mode(test_db.conn) == ClockMode.TEST
 
-    def test_fresh_realtime_db_cannot_become_test_via_sql(self, realtime_db: DbHandle) -> None:
+    def test_realtime_db_cannot_store_test_now(self, realtime_db: DbHandle) -> None:
         # realtime のまま test_now を保存することも拒否される
         with pytest.raises(sqlite3.IntegrityError):
             with db.transaction(realtime_db.conn, immediate=True):
