@@ -94,17 +94,23 @@ def insert_account(
 
 
 class TestNewDatabaseCreation:
-    def test_migrate_creates_schema_without_clock_row(self, tmp_path: Path) -> None:
-        """migration はスキーマだけを作り、runtime_clock 行は作らない。
+    def test_migrate_applies_schema_and_clock_row_atomically(self, tmp_path: Path) -> None:
+        """migration 001 と runtime_clock 行は同じ transaction で確定する。
 
-        行の作成は clock.initialize_database が入力検証後に単一 transaction で
-        行う（レビュー指摘2: 初期 mode・時刻の原子的確定）。
+        initialize_database に起動設定を渡すと、新規 DB では 001 の適用・
+        Clock 行作成・schema_migrations への適用記録が 1 つの transaction に
+        なる（レビュー指摘A）。migration 完了・履歴記録済みでも Clock 行が
+        0 件の DB は存在しない。
         """
         path = tmp_path / "fresh.sqlite3"
-        conn = db.connect(path)
-        newly = db.migrate(conn)
-        assert newly == ["001_initial.sql"]
-        assert db.migrate(conn) == []
+        conn = clock.initialize_database(path, ClockMode.REALTIME)
+        assert not conn.in_transaction
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM runtime_clock"
+        ).fetchone()[0] == 1
 
         tables = {
             r["name"]
@@ -119,17 +125,11 @@ class TestNewDatabaseCreation:
         ):
             assert expected in tables
 
-        # migration だけでは Clock 行は作られない
-        assert (
-            conn.execute("SELECT COUNT(*) FROM runtime_clock").fetchone()[0] == 0
-        )
-        conn.close()
-
-        # 初期化で始めて行が作られる
+        # 再初期化（既存 DB を開く）では何も適用しない
         conn2 = clock.initialize_database(path, ClockMode.REALTIME)
         assert conn2.execute(
-            "SELECT mode FROM runtime_clock WHERE singleton_id = 1"
-        ).fetchone()["mode"] == "realtime"
+            "SELECT COUNT(*) FROM runtime_clock"
+        ).fetchone()[0] == 1
 
         with pytest.raises(sqlite3.IntegrityError):
             conn2.execute(
@@ -147,6 +147,7 @@ class TestNewDatabaseCreation:
         conn = db.connect(tmp_path / "tx.sqlite3")
         db.migrate(conn)
         assert not conn.in_transaction
+        conn.close()
 
 
 class TestForeignKeys:

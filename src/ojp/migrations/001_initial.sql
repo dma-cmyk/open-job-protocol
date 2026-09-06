@@ -191,8 +191,12 @@ CREATE TABLE events (
     at_us     INTEGER NOT NULL CHECK (at_us >= 0)
 );
 
--- DB 当たり1行。行の作成は initialize_database が入力検証後に単一 transaction で
--- 行うため、migration には INSERT を含めない（mode・時刻の初期確定が原子的になる）。
+-- DB 当たり1行。行は migration 001 適用と同じ transaction で作られる
+-- （initialize_database が起動設定を受け取り、001 の適用・Clock 行作成・
+--   schema_migrations への適用記録を単一 transaction で確定する）。
+-- CHECK は mode と test_now_utc_us の組合せの整合だけを検証する。
+-- 行が無い状態は初期化の途中（migration 直後〜Clock 行確定前）や旧 DB であり、
+-- アプリ側は initialize_database を通して確定させる。
 CREATE TABLE runtime_clock (
     singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     mode             TEXT NOT NULL CHECK (mode IN ('realtime', 'test')),
@@ -224,6 +228,17 @@ CREATE TRIGGER runtime_clock_no_delete
 BEFORE DELETE ON runtime_clock
 BEGIN
     SELECT RAISE(ABORT, 'runtime_clock row cannot be deleted');
+END;
+
+-- 既存行があるときの INSERT を拒否する。INSERT OR REPLACE は
+-- recursive_triggers が無効だと削除トリガーを発火させず行を差し替えられる
+-- ため、差し替え（realtime -> test / test -> realtime の両方向）をここで塞ぐ。
+-- 正常な初期化は行が存在しないときの INSERT 1回だけなので影響を受けない。
+CREATE TRIGGER runtime_clock_no_replace
+BEFORE INSERT ON runtime_clock
+WHEN EXISTS (SELECT 1 FROM runtime_clock WHERE singleton_id = NEW.singleton_id)
+BEGIN
+    SELECT RAISE(ABORT, 'runtime_clock row already exists');
 END;
 
 -- realtime DB に固定時刻を保存しない。

@@ -21,13 +21,37 @@ MIGRATIONS_PACKAGE = "ojp"
 
 BUSY_TIMEOUT_MS = 5_000
 DB_BUSY_RETRY_SECONDS = 5.0
+JOURNAL_MODE_RETRY_SECONDS = 5.0
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = FULL")
+    # busy_timeout を最初に設定する: journal_mode の切替は書込ロックを
+    # 必要とし、busy handler が効かない経路で即座に database is locked に
+    # なることがあるため、以降の PRAGMA と初期化はこの待機の内側で行う
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    _ensure_wal(conn)
+    conn.execute("PRAGMA synchronous = FULL")
+
+
+def _ensure_wal(conn: sqlite3.Connection) -> None:
+    """journal_mode を WAL にする。
+
+    既に WAL なら no-op。他プロセスが初期化 transaction を保持している間は
+    busy handler が効かず database is locked になり得るため、有限時間の
+    再試行で待つ（先行プロセスの初期化が終われば WAL へ切り替わる）。
+    """
+    deadline = time.monotonic() + JOURNAL_MODE_RETRY_SECONDS
+    while True:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if mode.lower() == "wal":
+            return
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -38,13 +62,22 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def migrate(conn: sqlite3.Connection) -> list[str]:
+def migrate(
+    conn: sqlite3.Connection,
+    *,
+    clock_row: tuple[str, int | None] | None = None,
+) -> list[str]:
     """番号付き SQL migration を未適用分だけ適用する。
 
-    各 migration は独立した transaction で実行する。適用状況は
-    BEGIN IMMEDIATE 取得後に書込ロック内で再確認するため、複数プロセスが
-    同じ新規 DB を同時に初期化しても後続は CREATE 競合せず、適用済みを
-    読むだけで済む。schema_migrations は 001 の前に作成するため、
+    未適用の migration があるときは各々独立した transaction で実行する。
+    clock_row を渡すと、未適用の migration 適用と同じ transaction で
+    runtime_clock 行を作成する（新規 DB の初期化では 001 の適用・Clock 行作成・
+    schema_migrations への適用記録が原子的に確定する）。途中で失敗したら
+    スキーマも Clock 行も残らない。
+
+    適用状況は BEGIN IMMEDIATE 取得後に書込ロック内で再確認するため、
+    複数プロセスが同じ新規 DB を同時に初期化しても後続は CREATE 競合せず、
+    適用済みを読むだけで済む。schema_migrations は 001 の前に作成するため、
     最初の migration 実行前に存在確認して作る。
     """
     names = _migration_names()
@@ -66,6 +99,13 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
                 continue
             for statement in _split_statements(sql):
                 conn.execute(statement)
+            if clock_row is not None:
+                mode, test_now_us = clock_row
+                conn.execute(
+                    "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
+                    " VALUES (1, ?, ?)",
+                    (mode, test_now_us),
+                )
             conn.execute(
                 "INSERT INTO schema_migrations (name, applied_at_us) VALUES (?, ?)",
                 (name, int(time.time() * 1_000_000)),

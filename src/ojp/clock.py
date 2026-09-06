@@ -64,15 +64,22 @@ def initialize_database(
     """DB を作成（または既存 DB を開き）、Clock mode を検証して接続を返す。
 
     - 入力検証は DB に触れる前に完了する
-    - migration 適用後に runtime_clock 行が無ければ、mode と初期時刻を
-      単一の INSERT（1 transaction）で原子的に確定する。途中停止しても
-      realtime 行だけが残ることがなく、正しい設定で再試行できる
+    - 新規 DB では 001 の適用・runtime_clock 行の作成・schema_migrations への
+      適用記録を 1 つの transaction で確定する。途中で失敗したら DB には
+      スキーマも Clock 行も残らない（またはどちらも残らない状態から再試行できる）
     - 既存 DB: mode の変更はできず、起動設定と異なれば MODE_MISMATCH で拒否する
     """
     validated_test_now = _validate_startup_args(mode, test_now_us)
     conn = db.connect(db_path)
     try:
-        db.migrate(conn)
+        clock_row = (
+            (mode.value, validated_test_now)
+            if mode == ClockMode.TEST
+            else (mode.value, None)
+        )
+        # 新規 DB: migration 適用と同じ transaction で Clock 行まで作る。
+        # 既存 DB: 001 は適用済みのため clock_row は使われない
+        db.migrate(conn, clock_row=clock_row)
         _ensure_clock_row(conn, mode, validated_test_now)
         assert_mode(conn, mode)
     except BaseException:
@@ -115,7 +122,7 @@ def _ensure_clock_row(
                     " VALUES (1, 'realtime', NULL)"
                 )
     except sqlite3.IntegrityError as exc:
-        if "runtime_clock.singleton_id" in str(exc):
+        if "runtime_clock" in str(exc):
             # 別プロセスが同時に初期化した。commit 済み行の mode は assert_mode で検証
             return
         raise
