@@ -329,16 +329,14 @@ def fund_root(
         if actor_id != root_requester_id:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
-                "actor is not the root requester:"
-                f" actor={actor_id}, requester={root_requester_id}"
+                "actor is not the root requester"
                 " (Root作成・入金・Root承認はRoot Requester. 第5節)",
             )
         # 3. 申告 requester_id の一致（FORBIDDEN）
         if requester_id != root_requester_id:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
-                "requester_id does not match the root job's requester:"
-                f" got={requester_id}, expected={root_requester_id}"
+                "requester_id does not match the root job's requester"
                 " (原資は DB の jobs.requester_id から解決する)",
             )
         # 4. 公開予算の一致（FORBIDDEN）。権限検査後に公開状態を解決する
@@ -346,8 +344,7 @@ def fund_root(
         if expected_amount_units != budget_units:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
-                "expected_amount_units does not match the published budget:"
-                f" got={expected_amount_units}, expected={budget_units}"
+                "expected_amount_units does not match the published budget"
                 " (公開予算は DB の job_versions.budget_units が正本)",
             )
         # 5. asset が mock-USDC（INVALID_STATE）

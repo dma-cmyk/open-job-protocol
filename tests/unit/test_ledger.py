@@ -427,6 +427,8 @@ def test_fund_rejects_wrong_requester_and_amount(test_db):
             amount_units=ROOT_BUDGET_UNITS,
         )
     assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 拒否メッセージに Root Requester の正本の participant id を含まない
+    assert REQUESTER_ID not in exc_info.value.message
     # 公開予算と違う額を「全額入金」と申告しても FORBIDDEN
     with pytest.raises(OjpError) as exc_info:
         service.fund_root(
@@ -438,6 +440,8 @@ def test_fund_rejects_wrong_requester_and_amount(test_db):
             amount_units=ROOT_BUDGET_UNITS - 1,
         )
     assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 拒否メッセージに正本の公開予算額を含まない（権限のない相手へ予算を開示しない）
+    assert str(ROOT_BUDGET_UNITS) not in exc_info.value.message
     # いずれも何も動いていない（正本解決に失敗した fund は記録されない）
     assert _view(test_db).deposit_units == 0
     assert _wallet(test_db.conn, REQUESTER_ID) == ROOT_BUDGET_UNITS
@@ -470,6 +474,9 @@ def test_fund_rejects_actor_other_than_root_requester(test_db):
             amount_units=ROOT_BUDGET_UNITS,
         )
     assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 拒否メッセージは主体を特定できない一般表現で、
+    # Root Requester の participant id を含まない（権限のない相手へ所有者を開示しない）
+    assert REQUESTER_ID not in exc_info.value.message
     # 状態は一切変化しない
     assert _view(test_db).available_units == 0
     assert _wallet(test_db.conn, REQUESTER_ID) == ROOT_BUDGET_UNITS
