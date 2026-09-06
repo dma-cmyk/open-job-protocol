@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from ojp import ledger, service
-from ojp.domain import ErrorCode, OjpError
+from ojp.domain import ErrorCode, JobState, OjpError
 from tests.conftest import (
     AGENT_A_ID,
     AGENT_B_ID,
@@ -16,6 +16,7 @@ from tests.conftest import (
     REQUESTER_ID,
     ROOT_BUDGET_UNITS,
     SYSTEM_ID,
+    force_job_state,
     insert_child_job,
     insert_root_job,
     setup_ledger_demo_world,
@@ -101,6 +102,10 @@ def test_reserve_and_return_keep_conservation_and_non_negative(test_db):
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
     # Parent approval: available 90 -> parent_payout 90
+    # ※ Phase 4 の approve 経路が入るまでの暫定的な組み立てとして、Parent を
+    #   DONE にしてから予約する（S3 で reserve_parent_payout は Parent DONE
+    #   のときだけ許される。計画書 第8節の表）。
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
     service.reserve_parent_payout(
         test_db.conn,
         actor_id=REQUESTER_ID,
@@ -196,7 +201,11 @@ def test_negative_balance_move_is_rejected(test_db):
         expected_amount_units=ROOT_BUDGET_UNITS,
         amount_units=ROOT_BUDGET_UNITS,
     )
-    # available 100 を超える parent_payout 予約 101 は拒否される
+    # available 100 を超える parent_payout 予約 101 は拒否される。
+    # ※ Phase 4 の approve 経路が入るまでの暫定的な組み立てとして Parent を
+    #   DONE にする（S3 で reserve_parent_payout は Parent DONE のときだけ
+    #   許される。計画書 第8節の表）。
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
     with pytest.raises(OjpError) as exc_info:
         service.reserve_parent_payout(
             test_db.conn,
@@ -598,6 +607,10 @@ def test_zero_amount_reserve_is_normal_no_op(test_db):
     返すための Operation 記録自体は残る。
     """
     setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    # ※ Phase 4 の approve 経路が入るまでの暫定的な組み立てとして Parent を
+    #   DONE にする（S3 で reserve_parent_payout は Parent DONE のときだけ
+    #   許される。計画書 第8節の表）。
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
     result = service.reserve_parent_payout(
         test_db.conn,
         actor_id=REQUESTER_ID,

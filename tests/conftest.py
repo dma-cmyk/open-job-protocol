@@ -12,6 +12,7 @@ import pytest
 from ojp import clock, db, ledger
 from ojp.domain import (
     ClockMode,
+    JobState,
     ParticipantKind,
     RootTaskDefinition,
     SubcontractPolicy,
@@ -103,6 +104,18 @@ def insert_participant(
     )
 
 
+def insert_demo_participants(conn: sqlite3.Connection) -> None:
+    """Phase 3 のサービステスト用の固定 Actor 4 件（Requester/A/B/system）。
+
+    expire_due_leases 等の Lifecycle は operations.actor_id の FK 上 system
+    participant を必要とするため、demo init 相当の最小構成をここに置く。
+    """
+    insert_participant(conn, REQUESTER_ID, ParticipantKind.HUMAN)
+    insert_participant(conn, AGENT_A_ID, ParticipantKind.AGENT)
+    insert_participant(conn, AGENT_B_ID, ParticipantKind.AGENT)
+    insert_participant(conn, SYSTEM_ID, ParticipantKind.SYSTEM)
+
+
 def insert_root_job(
     conn: sqlite3.Connection,
     root_id: str,
@@ -149,6 +162,21 @@ def insert_child_job(
         " created_at_us, task_key) VALUES (?, ?, ?, ?, 'OPEN', 0, ?, 'part-1')",
         (child_id, root_id, root_id, requester_id, TEST_T0_US),
     )
+
+
+def force_job_state(conn: sqlite3.Connection, job_id: str, state: JobState) -> None:
+    """テスト専用の暫定的な組み立て: jobs.state を直接更新する。
+
+    Phase 4 の submit / approve / dispute 経路が入るまで、SUBMITTED /
+    DISPUTED / DONE を再現するために使う（Phase 4 実装後は本物の経路へ
+    置き換える）。Lease の closed_reason や active_lease_id、submissions 行は
+    呼出側の責任で調整する（この helper は jobs.state だけを更新する）。
+    """
+    with db.transaction(conn, immediate=True):
+        conn.execute(
+            "UPDATE jobs SET state = ?, row_version = row_version + 1 WHERE id = ?",
+            (state.value, job_id),
+        )
 
 
 def setup_ledger_demo_world(

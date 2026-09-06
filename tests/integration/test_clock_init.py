@@ -100,7 +100,7 @@ class TestInitializationAtomicity:
         try:
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
-            ).fetchone()[0] == 3  # 001 + 002 + 003
+            ).fetchone()[0] == 4  # 001 + 002 + 003 + 004
             assert tuple(
                 conn.execute(
                     "SELECT mode, test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
@@ -491,7 +491,7 @@ class TestConcurrentInitialization:
             assert clock.read_mode(conn) == ClockMode.TEST
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
-            ).fetchone()[0] == 3  # 001 + 002 + 003
+            ).fetchone()[0] == 4  # 001 + 002 + 003 + 004
             assert conn.execute(
                 "SELECT test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
             ).fetchone()["test_now_utc_us"] == TEST_T0_US
@@ -728,7 +728,7 @@ class TestConcurrentInitialization:
             assert clock.read_mode(conn) == ClockMode.TEST
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
-            ).fetchone()[0] == 3  # 001 + 002 + 003
+            ).fetchone()[0] == 4  # 001 + 002 + 003 + 004
             assert conn.execute(
                 "SELECT test_now_utc_us FROM runtime_clock WHERE singleton_id = 1"
             ).fetchone()["test_now_utc_us"] == TEST_T0_US
