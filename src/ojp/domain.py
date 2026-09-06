@@ -148,6 +148,15 @@ class PaymentStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
 
 
+class PaymentFailureKind(StrEnum):
+    """送金失敗の分類。本番アダプターの戻り値の型を固定するための契約であり、
+    Mock は再試行可能な一時障害しか発生させない（永続障害は last_error と
+    予約金として可視化され、返金への切替・Job FAILED へは落ちない）。"""
+
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
+
+
 class AcceptanceDecision(StrEnum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
@@ -431,11 +440,18 @@ class MockWallet(_StrictModel):
 
 
 class TransferReceipt(_StrictModel):
+    """送金の正本（計画書 第9節）。commit 後の応答消失時は Receipt が正本。
+
+    source_account_id（migration 003 で追加、NOT NULL）は Mock.transfer が
+    照合する 3 属性（金額・受取人・原資）の 1 つ。
+    """
+
     receipt_id: str
     operation_id: str
     amount_units: AmountUnits
     payee_id: str
     asset: str = ASSET_MOCK_USDC
+    source_account_id: str
 
 
 class Acceptance(_StrictModel):

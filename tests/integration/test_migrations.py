@@ -20,10 +20,10 @@ class TestClockRowCreatedOnce:
     def test_clock_row_not_duplicated_by_future_migration(
         self, test_db: DbHandle, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """将来 002 を追加した場合を模し、既存 DB への 002 適用で Clock 行の
+        """将来の migration（003 以降）を追加した場合を模し、既存 DB への後続適用で Clock 行の
         INSERT が走らないことを確認する。
 
-        ダミー migration（002_future.sql）をテスト内で一時的に差し込み、
+        ダミー migration（003_future.sql）をテスト内で一時的に差し込み、
         既存 test DB に対して migrate を実行する。修正前（clock_row INSERT が
         全未適用 migration のループ内にある実装）なら 2 回目の INSERT が走り、
         runtime_clock_no_replace トリガーで失敗する。
@@ -33,18 +33,20 @@ class TestClockRowCreatedOnce:
             "CREATE TABLE future_dummy (id TEXT PRIMARY KEY);\n"
         )
         monkeypatch.setattr(
-            db, "_migration_names", lambda: ["001_initial.sql", "002_future.sql"]
+            db,
+            "_migration_names",
+            lambda: ["001_initial.sql", "002_ledger_uniqueness.sql", "003_future.sql"],
         )
         monkeypatch.setattr(
             db,
             "_load_migration_sql",
-            lambda name: dummy_sql if name == "002_future.sql" else _real_load(name),
+            lambda name: dummy_sql if name == "003_future.sql" else _real_load(name),
         )
 
         newly = db.migrate(
             test_db.conn, clock_row=(ClockMode.TEST.value, TEST_T0_US)
         )
-        assert newly == ["002_future.sql"]
+        assert newly == ["003_future.sql"]
         assert (
             test_db.conn.execute(
                 "SELECT COUNT(*) FROM runtime_clock WHERE singleton_id = 1"
@@ -60,7 +62,7 @@ class TestClockRowCreatedOnce:
         # 002 の適用記録とダミーテーブルは残る
         assert (
             test_db.conn.execute(
-                "SELECT COUNT(*) FROM schema_migrations WHERE name = '002_future.sql'"
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = '003_future.sql'"
             ).fetchone()[0]
             == 1
         )

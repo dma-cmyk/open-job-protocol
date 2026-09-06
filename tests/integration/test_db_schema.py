@@ -107,7 +107,7 @@ class TestNewDatabaseCreation:
         assert not conn.in_transaction
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 3  # 001 + 002 + 003
         assert conn.execute(
             "SELECT COUNT(*) FROM runtime_clock"
         ).fetchone()[0] == 1
@@ -477,7 +477,11 @@ class TestTransactionBoundary:
         rows = realtime_db.conn.execute(
             "SELECT name FROM schema_migrations"
         ).fetchall()
-        assert [r["name"] for r in rows] == ["001_initial.sql"]
+        assert [r["name"] for r in rows] == [
+            "001_initial.sql",
+            "002_ledger_uniqueness.sql",
+            "003_receipt_source_account.sql",
+        ]
         stamp = realtime_db.conn.execute(
             "SELECT applied_at_us FROM schema_migrations"
         ).fetchone()["applied_at_us"]
