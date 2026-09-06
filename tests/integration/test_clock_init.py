@@ -4,6 +4,11 @@
 - 失敗（指定漏れ・不正値・migration 適用後の途中停止）後も正しい設定で再試行できる
 - 既存 DB の mode は SQL トリガーで本当に変更不可（realtime → test も不可）
 - 複数プロセスが同じ新規 DB へ同時に初期化を試みても競合しない
+
+同時初期化テストの同期（migration 状態読取後・BEGIN IMMEDIATE 前のバリア）は、
+本番コード側ではなくテスト側が実装する。子プロセスのスクリプトが ojp.db を
+import してから db._pre_write_lock_hook へ barrier 関数を代入し、本番コードは
+その None 判定 1 つだけを持つ（レビュー指摘C-1）。
 """
 
 from __future__ import annotations
@@ -305,39 +310,81 @@ class TestModeCannotBeReplaced:
             finally:
                 conn.close()
 
-CONCURRENT_INIT_SCRIPT = textwrap.dedent(
+# 同時初期化テスト用の barrier。本番コードに残さず、子プロセスのスクリプト内で
+# db._pre_write_lock_hook へ代入する（レビュー指摘C-1）。
+# 呼び出し位置は migrate() 内の「migration 状態読取後・BEGIN IMMEDIATE 前」であり、
+# 旧実装が壊れる箇所で全プロセスを揃える。timeout や I/O の失敗は専用の
+# SyncBarrierTimeoutError として親へ伝え、DDL 競合と区別できるようにする。
+_SYNC_BARRIER_SNIPPET = textwrap.dedent(
     """
-    import os, sys, time
-    from ojp import clock
-    from ojp.domain import ClockMode
+    class SyncBarrierTimeoutError(Exception):
+        pass
 
-    db_path, mode, test_now, ready_dir, go_path = (
-        sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-    )
+    def _make_sync_barrier(ready_dir, expected, timeout=30.0):
+        def barrier():
+            token = f"{os.getpid()}.{time.monotonic_ns()}"
+            with open(os.path.join(ready_dir, token), "w") as f:
+                f.write("ready")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    arrived = len(os.listdir(ready_dir))
+                except FileNotFoundError:
+                    arrived = 0
+                if arrived >= expected:
+                    return
+                if time.monotonic() > deadline:
+                    raise SyncBarrierTimeoutError(
+                        f"sync barrier timed out after {timeout}s"
+                        f" ({arrived}/{expected} arrived)"
+                    )
+                time.sleep(0.005)
+        return barrier
+    """
+)
 
-    # import と事前準備が済んだことを親へ通知する
-    ready_path = os.path.join(ready_dir, os.environ["OJP_CHILD_ID"])
-    with open(ready_path, "w") as f:
-        f.write("ready")
-    # 親が全子の ready を確認してから go を作るため、ここでの待機は
-    # 確実に初期化直前（ロック取得の直前）である
-    while not os.path.exists(go_path):
-        time.sleep(0.002)
+CONCURRENT_INIT_SCRIPT = (
+    _SYNC_BARRIER_SNIPPET
+    + textwrap.dedent(
+        """
+        import os, sys, time
+        from ojp import clock, db
+        from ojp.domain import ClockMode
 
-    try:
-        if mode == "test":
-            conn = clock.initialize_database(
-                db_path, ClockMode.TEST, test_now_us=int(test_now)
+        db_path, mode, test_now, ready_dir, go_path = (
+            sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+        )
+        sync_dir = sys.argv[6] if len(sys.argv) > 6 else ""
+        if sync_dir:
+            # BEGIN IMMEDIATE 直前のバリアをテスト側から注入する
+            db._pre_write_lock_hook = _make_sync_barrier(
+                sync_dir, int(os.environ["OJP_SYNC_COUNT"])
             )
-        else:
-            conn = clock.initialize_database(db_path, ClockMode.REALTIME)
-        conn.close()
-        print("OK")
-    except Exception as exc:
-        code = getattr(exc, "code", type(exc).__name__)
-        print(f"FAIL:{code}:{exc}", file=sys.stderr)
-        sys.exit(3)
-    """
+
+        # import と事前準備が済んだことを親へ通知する
+        ready_path = os.path.join(ready_dir, os.environ["OJP_CHILD_ID"])
+        with open(ready_path, "w") as f:
+            f.write("ready")
+        # 親が全子の ready を確認してから go を作るため、ここでの待機は
+        # 確実に初期化直前（ロック取得の直前）である
+        while not os.path.exists(go_path):
+            time.sleep(0.002)
+
+        try:
+            if mode == "test":
+                conn = clock.initialize_database(
+                    db_path, ClockMode.TEST, test_now_us=int(test_now)
+                )
+            else:
+                conn = clock.initialize_database(db_path, ClockMode.REALTIME)
+            conn.close()
+            print("OK")
+        except Exception as exc:
+            code = getattr(exc, "code", type(exc).__name__)
+            print(f"FAIL:{code}:{exc}", file=sys.stderr)
+            sys.exit(3)
+        """
+    )
 )
 
 
@@ -492,68 +539,62 @@ class TestConcurrentInitialization:
         count = 6
         sync_dir = tmp_path / "mig-sync"
         sync_dir.mkdir()
-        ready_dir = tmp_path / "ready"
-        ready_dir.mkdir()
-        go_path = tmp_path / "go"
-        go_path.touch()
 
         # 旧実装の initialize_database は、内部で db.migrate を呼ぶ。
         # 旧 migrate は BEGIN 前に applied を読むが、テスト同期フックを
         # 持たないため、テスト側で同じ「migration 状態読取後・BEGIN IMMEDIATE 前」
         # のバリアを再現する。
-        script = textwrap.dedent(
-            """
-            import os, sys, time
-            from ojp import clock, db
-            from ojp.domain import ClockMode
-            db_path, mode, test_now = sys.argv[1], sys.argv[2], sys.argv[3]
-            try:
-                conn = db.connect(db_path)
-                # 旧実装の migrate 本体（BEGIN 前に適用状況を読む）
-                applied = set()
-                if db._migrations_table_exists(conn):
-                    applied = set(db.applied_migrations(conn))
-                names = db._migration_names()
-                # バリア: migration 状態読取後・BEGIN IMMEDIATE 前
-                token = f"{os.getpid()}.{time.monotonic_ns()}"
-                open(os.path.join(os.environ["OJP_MIGRATION_TEST_SYNC"], token), "w").write("r")
-                expected = int(os.environ["OJP_MIGRATION_TEST_SYNC_COUNT"])
-                deadline = time.monotonic() + 30.0
-                while len(os.listdir(os.environ["OJP_MIGRATION_TEST_SYNC"])) < expected:
-                    if time.monotonic() > deadline:
-                        raise RuntimeError("sync timeout")
-                    time.sleep(0.005)
-                for name in names:
-                    if name in applied:
-                        continue
-                    sql = db._load_migration_sql(name)
-                    with db.transaction(conn, immediate=True):
-                        if not db._migrations_table_exists(conn):
+        script = (
+            _SYNC_BARRIER_SNIPPET
+            + textwrap.dedent(
+                """
+                import os, sys, time
+                from ojp import clock, db
+                from ojp.domain import ClockMode
+                db_path, mode, test_now, sync_dir = (
+                    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+                )
+                try:
+                    conn = db.connect(db_path)
+                    # 旧実装の migrate 本体（BEGIN 前に適用状況を読む）
+                    applied = set()
+                    if db._migrations_table_exists(conn):
+                        applied = set(db.applied_migrations(conn))
+                    names = db._migration_names()
+                    # バリア: migration 状態読取後・BEGIN IMMEDIATE 前
+                    _make_sync_barrier(sync_dir, int(os.environ["OJP_SYNC_COUNT"]))()
+                    for name in names:
+                        if name in applied:
+                            continue
+                        sql = db._load_migration_sql(name)
+                        with db.transaction(conn, immediate=True):
+                            if not db._migrations_table_exists(conn):
+                                conn.execute(
+                                    "CREATE TABLE schema_migrations ( name TEXT PRIMARY KEY,"
+                                    " applied_at_us INTEGER NOT NULL CHECK (applied_at_us >= 0))"
+                                )
+                            for stmt in db._split_statements(sql):
+                                conn.execute(stmt)
                             conn.execute(
-                                "CREATE TABLE schema_migrations ( name TEXT PRIMARY KEY,"
-                                " applied_at_us INTEGER NOT NULL CHECK (applied_at_us >= 0))"
+                                "INSERT INTO schema_migrations (name, applied_at_us) VALUES (?, ?)",
+                                (name, int(time.time() * 1_000_000)),
                             )
-                        for stmt in db._split_statements(sql):
-                            conn.execute(stmt)
-                        conn.execute(
-                            "INSERT INTO schema_migrations (name, applied_at_us) VALUES (?, ?)",
-                            (name, int(time.time() * 1_000_000)),
-                        )
-                # 旧実装は Clock 行を別 transaction で作る
-                row = conn.execute(
-                    "SELECT 1 FROM runtime_clock WHERE singleton_id = 1"
-                ).fetchone()
-                if row is None:
-                    with db.transaction(conn, immediate=True):
-                        conn.execute(
-                            "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
-                            " VALUES (1, 'test', ?)", (int(test_now),))
-                conn.close()
-                print("OK")
-            except Exception as exc:
-                print(f"FAIL:{type(exc).__name__}:{exc}", file=sys.stderr)
-                sys.exit(3)
-            """
+                    # 旧実装は Clock 行を別 transaction で作る
+                    row = conn.execute(
+                        "SELECT 1 FROM runtime_clock WHERE singleton_id = 1"
+                    ).fetchone()
+                    if row is None:
+                        with db.transaction(conn, immediate=True):
+                            conn.execute(
+                                "INSERT INTO runtime_clock (singleton_id, mode, test_now_utc_us)"
+                                " VALUES (1, 'test', ?)", (int(test_now),))
+                    conn.close()
+                    print("OK")
+                except Exception as exc:
+                    print(f"FAIL:{type(exc).__name__}:{exc}", file=sys.stderr)
+                    sys.exit(3)
+                """
+            )
         )
         procs: list[subprocess.Popen[str]] = []
         for i in range(count):
@@ -561,12 +602,14 @@ class TestConcurrentInitialization:
                 os.environ,
                 PYTHONPATH=str(tmp_path / "oldpkg"),
                 OJP_CHILD_ID=str(i),
-                OJP_MIGRATION_TEST_SYNC=str(sync_dir),
-                OJP_MIGRATION_TEST_SYNC_COUNT=str(count),
+                OJP_SYNC_COUNT=str(count),
             )
             procs.append(
                 subprocess.Popen(
-                    [sys.executable, "-c", script, str(path), "test", str(TEST_T0_US)],
+                    [
+                        sys.executable, "-c", script,
+                        str(path), "test", str(TEST_T0_US), str(sync_dir),
+                    ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -587,6 +630,19 @@ class TestConcurrentInitialization:
             f"old implementation should fail for multiple processes, got {results}"
         )
         assert len(ok) + len(failed) == count
+        # 失敗はすべて DDL/UNIQUE 競合（IntegrityError/OperationalError）である。
+        # SyncBarrierTimeoutError（バリア timeout）、ModuleNotFoundError（import
+        # 失敗）、Error（接続失敗）などの想定外の理由では合格しない（C-2）。
+        for rc, _out, err in failed:
+            assert rc == 3, f"unexpected exit code: {results}"
+            assert "SyncBarrierTimeoutError" not in err, results
+            assert (
+                "already exists" in err
+                or "UNIQUE constraint failed" in err
+                or "is locked" in err
+            ), f"old implementation must fail by DDL/UNIQUE race: {results}"
+        # 少なくとも 1 プロセスは migration を完走している（全滅ではない）
+        assert len(ok) >= 1, f"old implementation should have a winner: {results}"
 
     def test_concurrent_processes_mixed_modes(self, tmp_path: Path) -> None:
         """test 起動と realtime 起動が同時に同じ新規 DB を初期化しようとしても、
@@ -619,9 +675,10 @@ class TestConcurrentInitialization:
         """旧実装が壊れる箇所（migration 状態読取後・書込ロック取得前）の競合を
         確実に踏む同時初期化テスト（レビュー指摘C）。
 
-        migrate の BEGIN IMMEDIATE 直前（適用状況の読み取り後）に置いた
-        テスト専用フック（環境変数でのみ有効・通常経路は no-op）で、全子プロセスを
-        「migration 状態を読み終えたがまだ書込ロックを取っていない」状態で揃える。
+        migrate の BEGIN IMMEDIATE 直前（適用状況の読み取り後）に、子プロセスの
+        スクリプトが db._pre_write_lock_hook へ注入した barrier で、全子プロセスを
+        「migration 状態を読み終えたがまだ書込ロックを取っていない」状態で揃える
+        （barrier の実装はテスト側にあり、本番コードは None 判定 1 つだけを持つ）。
         現行実装はロック内で適用状況を再確認するため全員成功するが、旧実装
         （BEGIN 前に読んだ適用状況で適用を決める版）ではこの位置に到達した時点で
         全員が未適用と判断済みであり、全員が一斉に BEGIN IMMEDIATE して
@@ -634,21 +691,20 @@ class TestConcurrentInitialization:
         ready_dir = tmp_path / "ready-unused"
         ready_dir.mkdir()
         go_path = tmp_path / "go-unused"
-        go_path.touch()  # 子の ready/go 待機を即通過させ、ロック内同期だけを使う
+        go_path.touch()  # 子の ready/go 待機を即通過させ、ロック前同期だけを使う
         procs: list[subprocess.Popen[str]] = []
         for i in range(count):
             env = dict(
                 os.environ,
                 OJP_CHILD_ID=str(i),
-                OJP_MIGRATION_TEST_SYNC=str(sync_dir),
-                OJP_MIGRATION_TEST_SYNC_COUNT=str(count),
+                OJP_SYNC_COUNT=str(count),
             )
             procs.append(
                 subprocess.Popen(
                     [
                         sys.executable, "-c", CONCURRENT_INIT_SCRIPT,
                         str(path), "test", str(TEST_T0_US),
-                        str(ready_dir), str(go_path),
+                        str(ready_dir), str(go_path), str(sync_dir),
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

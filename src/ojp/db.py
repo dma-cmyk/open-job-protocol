@@ -8,10 +8,9 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -24,43 +23,11 @@ BUSY_TIMEOUT_MS = 5_000
 DB_BUSY_RETRY_SECONDS = 5.0
 JOURNAL_MODE_RETRY_SECONDS = 5.0
 
-_TEST_SYNC_ENV = "OJP_MIGRATION_TEST_SYNC"
-_TEST_SYNC_TIMEOUT_SECONDS = 30.0
-
-
-def _test_sync_before_write_lock() -> None:
-    """テスト専用の同期フック。通常経路では環境変数が未設定のため即 return し、
-    待機・分岐・I/O を一切行わない。
-
-    有効化した場合に限り、適用状況の読み取り（SELECT）を終えて書込ロック取得
-    （BEGIN IMMEDIATE）の直前で、同一 ready_dir を共有する全プロセスの到着を
-    待つ。これにより同時初期化テストは「migration 状態読取後・BEGIN IMMEDIATE
-    前」という旧実装が壊れる箇所で全プロセスを揃えられる。旧実装（BEGIN 前に
-    読んだ適用状況で適用を決める版）ではこの位置に到達した時点で全員が未適用と
-    判断済みのため、全員が一斉に BEGIN IMMEDIATE して DDL/UNIQUE 競合で失敗する。
-    """
-    ready_dir = os.environ.get(_TEST_SYNC_ENV)
-    if not ready_dir:
-        return
-    token = f"{os.getpid()}.{time.monotonic_ns()}"
-    ready_path = os.path.join(ready_dir, token)
-    with open(ready_path, "w") as f:
-        f.write("ready")
-    expected = int(os.environ[_TEST_SYNC_ENV + "_COUNT"])
-    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
-    while True:
-        try:
-            arrived = sum(1 for e in os.scandir(ready_dir) if e.is_file())
-        except FileNotFoundError:
-            arrived = 0
-        if arrived >= expected:
-            return
-        if time.monotonic() > deadline:
-            raise OjpError(
-                ErrorCode.INVALID_STATE,
-                f"test sync barrier timed out after {_TEST_SYNC_TIMEOUT_SECONDS}s",
-            )
-        time.sleep(0.005)
+# 同時初期化テストが注入する同期フックの seam。本番コードは環境変数・
+# ファイル I/O・待機を一切持たず、テスト（子プロセスのスクリプト）が
+# ojp.db を import してこの属性へ barrier 関数を代入する。通常経路では
+# None のままで、migrate() 内の None 判定 1 回以外のコストは発生しない。
+_pre_write_lock_hook: Callable[[], None] | None = None
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -154,10 +121,11 @@ def migrate(
     newly: list[str] = []
     for name in names:
         sql = _load_migration_sql(name)
-        # 通常経路では no-op（環境変数未設定）。同時初期化テストだけが
-        # ここで「migration 状態読取後・BEGIN IMMEDIATE 前」で全員を揃える
-        # （旧実装が壊れる箇所。レビュー指摘C）。
-        _test_sync_before_write_lock()
+        # 同時初期化テストがフックを注入している場合だけ、書込ロック取得
+        # （BEGIN IMMEDIATE）の直前で呼び出す。通常経路では None のため
+        # 分岐 1 つ以外のコストは発生しない（レビュー指摘C）。
+        if _pre_write_lock_hook is not None:
+            _pre_write_lock_hook()
         with transaction(conn, immediate=True):
             if not _migrations_table_exists(conn):
                 conn.execute(
