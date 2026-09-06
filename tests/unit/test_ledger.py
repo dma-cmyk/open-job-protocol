@@ -29,6 +29,14 @@ def _view(handle):
     return ledger.get_root_ledger_view(handle.conn, ROOT_ID)
 
 
+def _wallet(conn, participant_id):
+    row = conn.execute(
+        "SELECT balance_units FROM mock_wallets WHERE participant_id = ?",
+        (participant_id,),
+    ).fetchone()
+    return int(row["balance_units"])
+
+
 def test_fund_then_conservation_holds_with_zero_paid_refunded(test_db):
     """完了条件1: fund 後に D = available + locked + paid + refunded、全口座非負。"""
     setup_ledger_demo_world(test_db.conn, ROOT_ID)
@@ -328,6 +336,152 @@ def test_fund_does_not_move_between_roots(test_db):
     assert other_view.deposit_units == 0
     # 1 つ目の Root は不変
     assert _view(test_db).available_units == ROOT_BUDGET_UNITS
+
+
+# ---------------------------------------------------------------------------
+# fund_root の正本照合（呼出側の申告を信用しない）
+# ---------------------------------------------------------------------------
+
+
+def test_fund_rejects_child_job_target(test_db):
+    """Child を fund 対象にはできない（INVALID_TARGET）。
+
+    fund_root は対象 Job が Root（parent_id IS NULL かつ root_id = id）である
+    ことを DB で確認する。Child には available 口座が無く、入金先として
+    解決できない。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=CHILD_ID,
+            requester_id=AGENT_A_ID,
+            expected_amount_units=CHILD_BUDGET_UNITS,
+            amount_units=CHILD_BUDGET_UNITS,
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
+    assert _view(test_db).deposit_units == 0
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_fund_rejects_missing_version(test_db):
+    """公開 Version 行が無い Root は INVALID_STATE（jobs.version_id 未設定）。"""
+    from ojp import db as dbmod
+    from tests.conftest import insert_participant
+    from ojp.domain import ParticipantKind
+
+    with dbmod.transaction(test_db.conn, immediate=True):
+        insert_participant(test_db.conn, REQUESTER_ID, ParticipantKind.HUMAN)
+        # Version 行を作らず jobs 行だけを直接 INSERT する
+        test_db.conn.execute(
+            "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
+            " row_version, created_at_us) VALUES (?, ?, NULL, ?, 'DRAFT', 0, 0)",
+            (ROOT_ID, ROOT_ID, REQUESTER_ID),
+        )
+        ledger.seed_mock_wallet_for_demo(
+            test_db.conn,
+            participant_id=REQUESTER_ID,
+            asset="mock-USDC",
+            balance_units=ROOT_BUDGET_UNITS,
+        )
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            requester_id=REQUESTER_ID,
+            expected_amount_units=ROOT_BUDGET_UNITS,
+            amount_units=ROOT_BUDGET_UNITS,
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert _view(test_db).deposit_units == 0
+
+
+def test_fund_rejects_wrong_requester_and_amount(test_db):
+    """呼出側の申告（requester_id・expected_amount_units）が DB の正本と
+    違えば FORBIDDEN。呼出側の値を黙って採用しない。
+
+    - 「別 Actor の Wallet を原資にする」: jobs.requester_id と違う
+      requester_id は拒否される（SYSTEM の Wallet から引き落とせない）
+    - 「公開予算と違う額を全額入金とみなす」: job_versions.budget_units と
+      違う expected_amount_units は拒否される
+    いずれも Wallet・台帳・operations は一切動かない。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID, seed_workers=True)
+    ledger.seed_mock_wallet_for_demo(
+        test_db.conn,
+        participant_id=SYSTEM_ID,
+        asset="mock-USDC",
+        balance_units=ROOT_BUDGET_UNITS,
+    )
+    # 別 Actor の Wallet を原資にしようとする入力は FORBIDDEN
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            requester_id=SYSTEM_ID,  # jobs.requester_id と食い違う
+            expected_amount_units=ROOT_BUDGET_UNITS,
+            amount_units=ROOT_BUDGET_UNITS,
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 公開予算と違う額を「全額入金」と申告しても FORBIDDEN
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            requester_id=REQUESTER_ID,
+            expected_amount_units=ROOT_BUDGET_UNITS - 1,  # 公開予算と食い違う
+            amount_units=ROOT_BUDGET_UNITS - 1,
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # いずれも何も動いていない（正本解決に失敗した fund は記録されない）
+    assert _view(test_db).deposit_units == 0
+    assert _wallet(test_db.conn, REQUESTER_ID) == ROOT_BUDGET_UNITS
+    assert _wallet(test_db.conn, SYSTEM_ID) == ROOT_BUDGET_UNITS
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE kind = 'fund'"
+        ).fetchone()["c"]
+        == 0
+    )
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_fund_rejects_non_mock_usdc_asset(test_db):
+    """公開 Version の asset が mock-USDC 以外なら INVALID_STATE。"""
+    from ojp import db as dbmod
+    from tests.conftest import (
+        insert_participant,
+        insert_root_job as insert_root_with_version,
+    )
+    from ojp.domain import ParticipantKind
+
+    with dbmod.transaction(test_db.conn, immediate=True):
+        insert_participant(test_db.conn, REQUESTER_ID, ParticipantKind.HUMAN)
+        insert_root_with_version(
+            test_db.conn, ROOT_ID, requester_id=REQUESTER_ID, asset="other-asset"
+        )
+        ledger.seed_mock_wallet_for_demo(
+            test_db.conn,
+            participant_id=REQUESTER_ID,
+            asset="mock-USDC",
+            balance_units=ROOT_BUDGET_UNITS,
+        )
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            requester_id=REQUESTER_ID,
+            expected_amount_units=ROOT_BUDGET_UNITS,
+            amount_units=ROOT_BUDGET_UNITS,
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert _view(test_db).deposit_units == 0
 
 
 # ---------------------------------------------------------------------------

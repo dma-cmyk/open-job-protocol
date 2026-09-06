@@ -294,7 +294,16 @@ def fund_root(
 
     ドメイン側が決めるのは、正確な全額入金であること・seed 済み Requester
     Wallet が原資であること・business_key fund:{root_id} と operation_id の
-    冪等性。実行（Wallet 減額と Escrow available 増額の Journal 確定）は
+    冪等性。Requester・公開予算・asset は呼出側の申告を信用せず DB
+    （jobs / job_versions）から解決する:
+
+    - 対象 Job が Root（parent_id IS NULL かつ root_id = id）でなければ
+      INVALID_TARGET
+    - requester_id / expected_amount_units が DB の正本と違えば FORBIDDEN
+      （呼出側の値を黙って採用しない）
+    - asset は job_versions.asset が mock-USDC であることを要求する
+
+    実行（Wallet 減額と Escrow available 増額の Journal 確定）は
     EscrowPort.fund が呼出側の transaction 内で行う（計画書 第15節:
     「ドメインが『誰へ、いくら、何を根拠に』を決め、port が実行する」）。
     escrow を省略した場合は MockEscrow を使う（process_payments 等と同じ形）。
@@ -308,16 +317,36 @@ def fund_root(
     }
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        target = ledger.resolve_root_funding_target(c, root_id)
+        if requester_id != target.requester_id:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                "requester_id does not match the root job's requester:"
+                f" got={requester_id}, expected={target.requester_id}"
+                " (原資は DB の jobs.requester_id から解決する)",
+            )
+        if expected_amount_units != target.budget_units:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                "expected_amount_units does not match the published budget:"
+                f" got={expected_amount_units}, expected={target.budget_units}"
+                " (公開予算は DB の job_versions.budget_units が正本)",
+            )
+        if target.asset != ledger.ASSET_MOCK_USDC:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"unsupported asset in the published version: {target.asset!r}",
+            )
         return escrow_port.fund(
             c,
             op_id,
             ledger.FundPayload(
                 operation_id=op_id,
                 root_id=root_id,
-                requester_id=requester_id,
-                expected_amount_units=expected_amount_units,
+                requester_id=target.requester_id,
+                expected_amount_units=target.budget_units,
                 amount_units=amount_units,
-                asset="mock-USDC",
+                asset=target.asset,
                 business_key=f"fund:{root_id}",
             ),
         )
@@ -632,24 +661,51 @@ def reserve_parent_refund(
 # 共通 settlement 処理（計画書 第9節 1〜5）
 # ---------------------------------------------------------------------------
 
-# 送金失敗として記録する例外。OjpError（DB 制約のドメイン変換）と
-# ledger.PaymentFailedError（Escrow port の失敗）の両方を再試行可能な
-# 一時障害として扱う。MemoryError や KeyboardInterrupt 等は捕捉しない。
-_TRANSIENT_PAYMENT_ERRORS = (OjpError, ledger.PaymentFailedError)
-
-# 一時障害として記録せず呼出側へ伝播する OjpError の判定。
-# - realtime での failpoint 有効化（「test mode のみ」）は設定の誤用であり
-# - 予約と Receipt 正本の照合違反（does not match）はデータの矛盾であり
-# どちらも再試行で解消しないため、RETRYABLE へ記録しない。
-_NON_TRANSIENT_MARKERS = ("test mode", "does not match")
+# 送金失敗として記録する例外。OjpError（DB 制約のドメイン変換・Receipt 正本
+# との照合違反を含む）と ledger.PaymentFailedError（Escrow port の失敗）の
+# 両方を記録対象として扱う。MemoryError や KeyboardInterrupt 等は捕捉しない。
+# 失敗は種類にかかわらず記録される（計画書 第9節: 有限回で打ち切らず、
+# 失敗理由と予約金を可視化する）。
+_PAYMENT_FAILURE_ERRORS = (OjpError, ledger.PaymentFailedError)
 
 
-def _is_transient_payment_error(exc: BaseException) -> bool:
-    if isinstance(exc, ledger.PaymentFailedError):
-        return exc.kind == "retryable"
-    if isinstance(exc, OjpError):
-        return not any(marker in str(exc) for marker in _NON_TRANSIENT_MARKERS)
-    return False
+def _check_receipt_matches_reservation(
+    conn: sqlite3.Connection,
+    payment: Any,
+    receipt: ledger.TransferReceipt | None,
+) -> str | None:
+    """Receipt の存在と金額・受取人・原資の一致を照合する。
+
+    Receipt が正本という原則に反する状態（SUCCEEDED なのに Receipt が無い、
+    Receipt の 3 属性が予約と食い違う）を成功として返さないための検査。
+    違反があれば理由の文言を返し、無ければ None。
+    """
+    if receipt is None:
+        return (
+            f"payment {payment.operation_id} is {payment.status.value}"
+            " but the receipt (正本) is missing"
+        )
+    mismatches: list[str] = []
+    if receipt.amount_units != payment.amount_units:
+        mismatches.append(
+            f"amount_units: receipt={receipt.amount_units}"
+            f" reservation={payment.amount_units}"
+        )
+    if receipt.payee_id != payment.payee_id:
+        mismatches.append(
+            f"payee_id: receipt={receipt.payee_id} reservation={payment.payee_id}"
+        )
+    if receipt.source_account_id != payment.source_account_id:
+        mismatches.append(
+            "source_account_id: receipt="
+            f"{receipt.source_account_id} reservation={payment.source_account_id}"
+        )
+    if mismatches:
+        return (
+            "existing receipt does not match the reservation"
+            f" (operation_id={payment.operation_id}): " + "; ".join(mismatches)
+        )
+    return None
 
 
 def _payload_for_payment(payment: Any) -> ledger.TransferPayload:
@@ -681,9 +737,64 @@ def process_single_payment(
     - DB commit 前の障害は全体 rollback。commit 後の応答消失は Receipt が正本
     - 再試行で Job を FAILED にしない（有限回で打ち切らない。本モジュールは
       Job 状態を一切触らない）
-    - SUCCEEDED 済みの再実行は Receipt を照合して no-op
+    - SUCCEEDED 済みの再実行は Receipt の存在と金額・受取人・原資の一致を
+      必ず照合する（Receipt が正本）。欠落・不一致は成功として返さず、
+      理由を last_error に記録する（既に SUCCEEDED へ確定した整合状態は
+      後から書き換えず、運用者が内容を確認して是正する）
+    - 未確定の送金の失敗は種類にかかわらず attempt_count・last_error を
+      記録し、status=RETRYABLE・next_retry_at_us をバックオフで設定する
+      （返金への切替は行わない）
     """
     escrow_port = escrow if escrow is not None else ledger.MockEscrow()
+
+    def _record_failure(c: sqlite3.Connection, reason: str) -> CommandResult:
+        now = clock.now_for_write_transaction(c)
+        updated = ledger.mark_payment_retryable_in_tx(
+            c,
+            operation_id=operation_id,
+            error_message=reason,
+            now_us=now,
+        )
+        return CommandResult(
+            data={
+                "operation_id": operation_id,
+                "payment_status": updated.status.value,
+                "attempt_count": updated.attempt_count,
+                "next_retry_at_us": updated.next_retry_at_us,
+                "last_error": updated.last_error,
+            },
+            operation_id=operation_id,
+        )
+
+    def _record_integrity_violation(
+        c: sqlite3.Connection, payment: Any, reason: str
+    ) -> CommandResult:
+        """Receipt 正本との整合違反を last_error に記録して可視化する。
+
+        既に SUCCEEDED へ確定した整合状態は後から書き換えないため、
+        status は据え置いたまま、違反理由の記録（last_error）と件ごとの
+        結果への報告（consistency_error）だけを行う。成功としては返さない。
+        """
+        now = clock.now_for_write_transaction(c)
+        if payment.status == PaymentStatus.SUCCEEDED:
+            updated = ledger.record_payment_error_in_tx(
+                c, operation_id=operation_id, error_message=reason
+            )
+        else:
+            updated = ledger.mark_payment_retryable_in_tx(
+                c, operation_id=operation_id, error_message=reason, now_us=now
+            )
+        return CommandResult(
+            data={
+                "operation_id": operation_id,
+                "payment_status": updated.status.value,
+                "attempt_count": updated.attempt_count,
+                "next_retry_at_us": updated.next_retry_at_us,
+                "last_error": updated.last_error,
+                "consistency_error": True,
+            },
+            operation_id=operation_id,
+        )
 
     for attempt in range(DB_BUSY_MAX_ATTEMPTS):
         try:
@@ -702,13 +813,24 @@ def process_single_payment(
                     conn, ledger.failpoint_after_commit, "after_commit"
                 )
                 if payment.status == PaymentStatus.SUCCEEDED:
-                    # 冪等: 既存 Receipt を照合するだけ（Wallet・Journal は増えない）
+                    # 冪等: Receipt の存在と金額・受取人・原資の一致を必ず
+                    # 照合する（Receipt が正本。Wallet・Journal は増えない）。
+                    # 欠落・不一致は成功として返さず、理由を last_error に
+                    # 記録して可視化する（整合性エラーとして扱う）。
                     receipt = escrow_port.lookup(conn, operation_id)
+                    violation = _check_receipt_matches_reservation(
+                        conn, payment, receipt
+                    )
+                    if violation is not None:
+                        return _record_integrity_violation(
+                            conn, payment, violation
+                        )
+                    assert receipt is not None
                     return CommandResult(
                         data={
                             "operation_id": operation_id,
                             "payment_status": PaymentStatus.SUCCEEDED.value,
-                            "receipt_id": receipt.receipt_id if receipt else payment.receipt_id,
+                            "receipt_id": receipt.receipt_id,
                             "already_succeeded": True,
                         },
                         operation_id=operation_id,
@@ -718,30 +840,11 @@ def process_single_payment(
                     receipt = escrow_port.transfer(
                         conn, operation_id, _payload_for_payment(payment)
                     )
-                except _TRANSIENT_PAYMENT_ERRORS as exc:
-                    if not _is_transient_payment_error(exc):
-                        # 再試行で解消しない失敗（realtime での failpoint
-                        # 有効化、予約と Receipt 正本の照合違反）は RETRYABLE
-                        # へ記録せず、そのまま呼出側へ伝播する。予約は
-                        # locked に残り、last_error 更新も行わない。
-                        raise
-                    now_us = clock.now_for_write_transaction(conn)
-                    updated = ledger.mark_payment_retryable_in_tx(
-                        conn,
-                        operation_id=operation_id,
-                        error_message=str(exc),
-                        now_us=now_us,
-                    )
-                    return CommandResult(
-                        data={
-                            "operation_id": operation_id,
-                            "payment_status": updated.status.value,
-                            "attempt_count": updated.attempt_count,
-                            "next_retry_at_us": updated.next_retry_at_us,
-                            "last_error": updated.last_error,
-                        },
-                        operation_id=operation_id,
-                    )
+                except _PAYMENT_FAILURE_ERRORS as exc:
+                    # 失敗は種類にかかわらず記録する（Receipt 正本との照合
+                    # 違反を含む）。返金への切替・Job の FAILED 化は行わず、
+                    # 失敗理由と予約金を可視化する。
+                    return _record_failure(conn, str(exc))
                 updated = ledger.mark_payment_succeeded_in_tx(
                     conn, operation_id=operation_id, receipt_id=receipt.receipt_id
                 )
@@ -778,9 +881,11 @@ def process_payments(
     """共通 settlement 処理（計画書 第15節 Lifecycle: process_payments）。
 
     PENDING / RETRYABLE（期限到来分）を取得し、同じ operation_id で Escrow
-    port の transfer を呼ぶ。1 件ずつ独立した transaction で処理し、個別の
-    失敗が他の送金を巻き込まないようにする（失敗は RETRYABLE として記録
-    され、例外で呼出側へ伝播させない）。
+    port の transfer を呼ぶ。1 件ずつ独立した transaction で処理し、1 件の
+    失敗で他の PaymentOperation の処理を止めない。送金失敗は
+    process_single_payment 内で RETRYABLE として記録されて件ごとの結果へ
+    反映される。記録不能な予期せぬ失敗（RuntimeError 等）だけが
+    呼出側へ伝播する。
     """
     escrow_port = escrow if escrow is not None else ledger.MockEscrow()
     now_us = clock.now_for_read_snapshot(conn)
@@ -807,6 +912,8 @@ def retry_payment(
 
     金額・受取人・原資は PaymentOperation 作成時の固定値からしか取らない
     （payload を外部から受け取らない）。next_retry_at_us を無視して即時
-    再試行する手動経路であり、バックオフ自体は変えない。
+    再試行する手動経路であり、バックオフ自体は変えない。SUCCEEDED 済み
+    なら Receipt の存在と金額・受取人・原資の一致を照合する
+    （Receipt が正本。欠落・不一致は成功として返さない）。
     """
     return process_single_payment(conn, operation_id=operation_id, escrow=escrow)

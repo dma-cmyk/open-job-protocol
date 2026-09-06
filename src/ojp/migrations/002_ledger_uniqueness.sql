@@ -40,8 +40,9 @@ END;
 --    budget_accounts は root_id / owner_job_id の jobs への FK を要求する。
 --    Participant は Job ではないため、Wallet 台帳口座専用の deferred FK 代替
 --    トリガーで「通常口座は jobs 参照、Wallet 台帳口座は participants 参照」に
---    置き換える。FK は ON DELETE RESTRICT として残る（Job 削除は Phase 3 以降も
---    行わないため挙動は変わらない）。
+--    置き換える。INSERT だけでなく UPDATE も同じ規則で検査し、参照されている
+--    jobs / participants 行の削除は BEFORE DELETE トリガーで拒否する
+--    （001 の FK の ON DELETE 規則は変えない）。
 --
 --    安全性の根拠: この再作成は外部キーを有効なまま実行する。SQLite は
 --    transaction 中の PRAGMA foreign_keys を無視し（公式仕様）、migrate() は
@@ -109,6 +110,8 @@ CREATE UNIQUE INDEX budget_accounts_natural_unique
     );
 
 -- 通常口座: root_id は jobs（Root）、owner_job_id は jobs。即時検証のトリガー。
+-- INSERT だけでなく UPDATE も検査する（root_id / owner_job_id / source_key の
+-- 書き換えで通常口座と Wallet 台帳口座の区別が壊れないようにする）。
 CREATE TRIGGER budget_accounts_root_job_check
 BEFORE INSERT ON budget_accounts
 WHEN NEW.source_key IS NOT 'wallet-ledger'
@@ -117,8 +120,24 @@ BEGIN
     SELECT RAISE(ABORT, 'budget_accounts.root_id must reference jobs');
 END;
 
+CREATE TRIGGER budget_accounts_root_job_check_update
+BEFORE UPDATE ON budget_accounts
+WHEN NEW.source_key IS NOT 'wallet-ledger'
+   AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = NEW.root_id)
+BEGIN
+    SELECT RAISE(ABORT, 'budget_accounts.root_id must reference jobs');
+END;
+
 CREATE TRIGGER budget_accounts_owner_job_check
 BEFORE INSERT ON budget_accounts
+WHEN NEW.source_key IS NOT 'wallet-ledger'
+   AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = NEW.owner_job_id)
+BEGIN
+    SELECT RAISE(ABORT, 'budget_accounts.owner_job_id must reference jobs');
+END;
+
+CREATE TRIGGER budget_accounts_owner_job_check_update
+BEFORE UPDATE ON budget_accounts
 WHEN NEW.source_key IS NOT 'wallet-ledger'
    AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = NEW.owner_job_id)
 BEGIN
@@ -135,4 +154,43 @@ WHEN NEW.source_key IS 'wallet-ledger'
    )
 BEGIN
     SELECT RAISE(ABORT, 'wallet ledger account must reference participants');
+END;
+
+CREATE TRIGGER budget_accounts_wallet_participant_check_update
+BEFORE UPDATE ON budget_accounts
+WHEN NEW.source_key IS 'wallet-ledger'
+   AND NOT EXISTS (
+       SELECT 1 FROM participants
+       WHERE participants.id = NEW.root_id AND participants.id = NEW.owner_job_id
+   )
+BEGIN
+    SELECT RAISE(ABORT, 'wallet ledger account must reference participants');
+END;
+
+-- 参照されている jobs 行の削除を拒否する（FK 代替トリガーに ON DELETE の
+-- 効力は無いため、budget_accounts の孤児化を BEFORE DELETE で塞ぐ）。
+CREATE TRIGGER jobs_delete_blocked_by_budget_accounts
+BEFORE DELETE ON jobs
+WHEN EXISTS (
+    SELECT 1 FROM budget_accounts
+    WHERE budget_accounts.root_id = OLD.id
+       OR budget_accounts.owner_job_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'jobs row is referenced by budget_accounts');
+END;
+
+-- participants も同様（beneficiary_id の FK と Wallet 台帳口座の両方を守る）。
+CREATE TRIGGER participants_delete_blocked_by_budget_accounts
+BEFORE DELETE ON participants
+WHEN EXISTS (
+    SELECT 1 FROM budget_accounts
+    WHERE budget_accounts.beneficiary_id = OLD.id
+       OR (
+           budget_accounts.source_key IS 'wallet-ledger'
+           AND budget_accounts.root_id = OLD.id
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'participants row is referenced by budget_accounts');
 END;

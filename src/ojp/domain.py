@@ -148,15 +148,6 @@ class PaymentStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
 
 
-class PaymentFailureKind(StrEnum):
-    """送金失敗の分類。本番アダプターの戻り値の型を固定するための契約であり、
-    Mock は再試行可能な一時障害しか発生させない（永続障害は last_error と
-    予約金として可視化され、返金への切替・Job FAILED へは落ちない）。"""
-
-    RETRYABLE = "retryable"
-    PERMANENT = "permanent"
-
-
 class AcceptanceDecision(StrEnum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"

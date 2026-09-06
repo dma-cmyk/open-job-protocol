@@ -109,16 +109,30 @@ def insert_root_job(
     *,
     requester_id: str = REQUESTER_ID,
     budget_units: int = ROOT_BUDGET_UNITS,
+    asset: str = "mock-USDC",
 ) -> None:
-    """台帳テスト用の最小 Root 行を作る（Job 状態機械・JobVersion は Phase 3）。
+    """台帳テスト用の最小 Root 行と公開 Version 行を作る（`create_root` は Phase 3）。
 
     budget_accounts の FK を満たすための行であり、`create_root` コマンドの
-    実装ではない。requester_id と budget_units だけを台帳の引数に使う。
+    実装ではない。fund_root が正本として照合するため、budget_units / asset は
+    最小の job_versions 行（UNIQUE(job_id, version) の 1 版）として実際に
+    保存し、jobs.version_id をその行へ設定する。
     """
+    version_id = f"version:{root_id}:1"
     conn.execute(
         "INSERT INTO jobs (id, root_id, parent_id, requester_id, state, row_version,"
         " created_at_us) VALUES (?, ?, NULL, ?, 'DRAFT', 0, ?)",
         (root_id, root_id, requester_id, TEST_T0_US),
+    )
+    conn.execute(
+        "INSERT INTO job_versions (id, job_id, version, title, budget_units, asset,"
+        " subcontract_policy, task_catalog, timing_policy, deadline_us)"
+        " VALUES (?, ?, 1, ?, ?, ?, '{}', '[]', '{}', ?)",
+        (version_id, root_id, f"root {root_id}", budget_units, asset, TEST_T0_US),
+    )
+    conn.execute(
+        "UPDATE jobs SET version_id = ? WHERE id = ?",
+        (version_id, root_id),
     )
 
 

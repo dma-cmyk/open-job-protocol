@@ -396,6 +396,60 @@ def assert_ledger_invariants(conn: sqlite3.Connection, root_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Root funding の正本照合（計画書 第9節: Root fund は公開予算の全額入金）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RootFundingTarget:
+    """Root funding の正本情報。jobs / job_versions から導出した確定値。
+
+    引落し元の Requester・公開予算・asset は呼出側の申告ではなく DB から
+    解決し、fund の payload にはこの確定値だけを固定する。
+    """
+
+    requester_id: str
+    budget_units: int
+    asset: str
+
+
+def resolve_root_funding_target(
+    conn: sqlite3.Connection, root_id: str
+) -> RootFundingTarget:
+    """Root funding の対象を DB から解決する。
+
+    - 対象 Job が Root であること（parent_id IS NULL かつ root_id = id）を
+      確認する。Child への fund は INVALID_TARGET で拒否する
+    - 引落し元の Requester は jobs.requester_id から導出する
+    - 入金額・asset は job_versions の公開版（PoC は UNIQUE(job_id, version)
+      の 1 版）から導出する。Version 行が無ければ INVALID_STATE
+    """
+    row = conn.execute(
+        "SELECT j.requester_id AS requester_id,"
+        " v.budget_units AS budget_units, v.asset AS asset"
+        " FROM jobs j LEFT JOIN job_versions v ON v.id = j.version_id"
+        " WHERE j.id = ? AND j.parent_id IS NULL AND j.root_id = j.id",
+        (root_id,),
+    ).fetchone()
+    if row is None:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET,
+            f"fund target must be a root job (parent_id IS NULL, root_id = id):"
+            f" {root_id}",
+        )
+    if row["budget_units"] is None or row["asset"] is None:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            f"root job has no published version (jobs.version_id is unset): {root_id}",
+        )
+    return RootFundingTarget(
+        requester_id=str(row["requester_id"]),
+        budget_units=int(row["budget_units"]),
+        asset=str(row["asset"]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # MockWallet（seed はデモ準備専用。Job 資金操作の経路からは呼べない）
 # ---------------------------------------------------------------------------
 
@@ -884,6 +938,36 @@ def _update_payment_status(
         )
 
 
+def record_payment_error_in_tx(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str,
+    error_message: str,
+) -> PaymentOperation:
+    """失敗理由を last_error へ記録するだけ（status・attempt_count は据え置き）。
+
+    Receipt 正本との整合違反（SUCCEEDED だが Receipt が無い・3 属性が
+    食い違う）の可視化に使う。既に SUCCEEDED へ確定した整合状態は後から
+    書き換えないため、attempt_count・next_retry_at_us は変えず、運用者が
+    内容を確認して是正できるよう理由だけを残す。
+    """
+    payment = _get_payment_operation(conn, operation_id)
+    if payment is None:
+        raise OjpError(
+            ErrorCode.INVALID_STATE, f"payment operation not found: {operation_id}"
+        )
+    _update_payment_status(
+        conn,
+        operation_id,
+        status=payment.status,
+        next_retry_at_us=payment.next_retry_at_us,
+        last_error=error_message,
+    )
+    updated = _get_payment_operation(conn, operation_id)
+    assert updated is not None
+    return updated
+
+
 def mark_payment_retryable_in_tx(
     conn: sqlite3.Connection,
     *,
@@ -915,6 +999,53 @@ def mark_payment_retryable_in_tx(
     updated = _get_payment_operation(conn, operation_id)
     assert updated is not None
     return updated
+
+
+@dataclass(frozen=True)
+class PaymentFailureView:
+    """送金失敗の可視化ビュー（Phase 5 の `ojp ledger show` / `ojp payment retry`
+    が使う土台）。失敗理由・再試行状況と、未送金のまま予約に残っている
+    原資口座・金額（locked 予約金）を一緒に返す。"""
+
+    operation_id: str
+    status: PaymentStatus
+    attempt_count: int
+    last_error: str | None
+    next_retry_at_us: int | None
+    source_account_id: str
+    source_amount_units: int
+    amount_units: int
+    payee_id: str
+    kind: PaymentKind
+
+
+def get_payment_failure_view(
+    conn: sqlite3.Connection, operation_id: str
+) -> PaymentFailureView | None:
+    """PaymentOperation の失敗理由・再試行状況・locked 予約金を読み取る。
+
+    予約口座が settlement で消費されていても PaymentOperation の原資・金額は
+    作成時の固定値として返る（PaymentOperation が正本）。
+    """
+    payment = _get_payment_operation(conn, operation_id)
+    if payment is None:
+        return None
+    source_row = conn.execute(
+        "SELECT amount_units FROM budget_accounts WHERE id = ?",
+        (payment.source_account_id,),
+    ).fetchone()
+    return PaymentFailureView(
+        operation_id=payment.operation_id,
+        status=payment.status,
+        attempt_count=payment.attempt_count,
+        last_error=payment.last_error,
+        next_retry_at_us=payment.next_retry_at_us,
+        source_account_id=payment.source_account_id,
+        source_amount_units=int(source_row["amount_units"]) if source_row else 0,
+        amount_units=payment.amount_units,
+        payee_id=payment.payee_id,
+        kind=payment.kind,
+    )
 
 
 def mark_payment_succeeded_in_tx(
@@ -993,12 +1124,10 @@ class FundPayload:
 
 
 class PaymentFailedError(Exception):
-    """Escrow port からの送金失敗。kind で再試行可能性を表す（将来の本番
-    アダプター契約の型）。Mock は retryable 以外を発生させない。"""
-
-    def __init__(self, message: str, *, kind: str = "retryable") -> None:
-        super().__init__(message)
-        self.kind = kind
+    """Escrow port からの送金失敗。失敗は種類にかかわらず PaymentOperation に
+    記録され（attempt_count・last_error・RETRYABLE・バックオフ）、上限付き
+    バックオフで再試行される。永続障害は last_error と予約金として可視化
+    され、返金への切替・Job FAILED へは落ちない。"""
 
 
 class EscrowPort:

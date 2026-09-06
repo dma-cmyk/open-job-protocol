@@ -368,12 +368,52 @@ class TestUniqueConstraints:
             " VALUES ('op1', 'payout:j1', 'j1', 'j1', 'acc1', 10, 'w1', 'payout', 'PENDING')"
         )
         base = (
-            "INSERT INTO transfer_receipts (receipt_id, operation_id, amount_units, payee_id, asset)"
-            " VALUES (?, 'op1', 10, 'w1', 'mock-USDC')"
+            "INSERT INTO transfer_receipts (receipt_id, operation_id, amount_units,"
+            " payee_id, asset, source_account_id)"
+            " VALUES (?, 'op1', 10, 'w1', 'mock-USDC', 'acc1')"
         )
         conn.execute(base, ("r1",))
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(base, ("r2",))
+
+    def test_receipt_source_account_is_not_null_and_referenced(
+        self, realtime_db: DbHandle
+    ) -> None:
+        """transfer_receipts.source_account_id は NOT NULL で budget_accounts
+        への参照制約を持つ（原資を正本として保持する。003 の作り直し）。"""
+        conn = realtime_db.conn
+        insert_root_job(conn, "j1")
+        insert_operation(conn, "op1")
+        insert_participant(conn, "w1")
+        conn.execute(
+            "INSERT INTO budget_accounts (id, root_id, owner_job_id, bucket, amount_units)"
+            " VALUES ('acc1', 'j1', 'j1', 'available', 100)"
+        )
+        conn.execute(
+            "INSERT INTO payment_operations (operation_id, business_key, root_id, job_id,"
+            " source_account_id, amount_units, payee_id, kind, status)"
+            " VALUES ('op1', 'payout:j1', 'j1', 'j1', 'acc1', 10, 'w1', 'payout', 'PENDING')"
+        )
+        # NULL の Receipt は作れない（domain.TransferReceipt の型と一致）
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO transfer_receipts (receipt_id, operation_id, amount_units,"
+                " payee_id, asset, source_account_id)"
+                " VALUES ('r1', 'op1', 10, 'w1', 'mock-USDC', NULL)"
+            )
+        # 存在しない口座を原資にする Receipt も作れない（FK）
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO transfer_receipts (receipt_id, operation_id, amount_units,"
+                " payee_id, asset, source_account_id)"
+                " VALUES ('r1', 'op1', 10, 'w1', 'mock-USDC', 'ghost-account')"
+            )
+        # 正当な原資なら作れる
+        conn.execute(
+            "INSERT INTO transfer_receipts (receipt_id, operation_id, amount_units,"
+            " payee_id, asset, source_account_id)"
+            " VALUES ('r1', 'op1', 10, 'w1', 'mock-USDC', 'acc1')"
+        )
 
     def test_journal_entry_unique_within_operation(self, realtime_db: DbHandle) -> None:
         conn = realtime_db.conn

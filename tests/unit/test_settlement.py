@@ -82,7 +82,7 @@ PAYMENT_OP_ID = "payout:child-1:payment"
 
 
 class FlakyEscrow(ledger.MockEscrow):
-    """指定回数だけ retryable な失敗を投げ、その後は本物の Mock と同じ挙動。"""
+    """指定回数だけ失敗を投げ、その後は本物の Mock と同じ挙動。"""
 
     def __init__(self, fail_times: int) -> None:
         self.fail_times = fail_times
@@ -92,7 +92,7 @@ class FlakyEscrow(ledger.MockEscrow):
         self.calls += 1
         if self.calls <= self.fail_times:
             raise ledger.PaymentFailedError(
-                f"injected transient failure #{self.calls}", kind="retryable"
+                f"injected transfer failure #{self.calls}"
             )
         return super().transfer(conn, operation_id, payload)
 
@@ -207,35 +207,34 @@ def test_settlement_after_receipt_is_reconciled_without_double_count(test_db):
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
-def test_receipt_mismatch_with_reservation_is_rejected(test_db):
-    """Receipt の金額・受取人・原資が予約と食い違う場合は拒否される。
+def _inject_mismatched_receipt(handle, *, amount: int = 1) -> None:
+    """予約と食い違う既存 Receipt を直接 SQL で混入させる（異常事態の再現。
 
-    transfer_receipts.operation_id は UNIQUE なので、食い違い Receipt の
-    存在自体が異常事態。Mock.transfer は照合して拒否し、Wallet・Journal・
-    paid をさらに増やさない。
+    アプリの経路からは作れないため、台帳の防御を直接検証する。「金額の
+    食い違う Receipt だけが正本として存在する」状態を作る（Wallet の実
+    残高は動かさない。locked 残高と Receipt 集計は別の導出なので保存則は
+    保たれる）。
     """
-    _setup_funded_child(test_db)
-    _reserve_child_payout(test_db)
-    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    payment = ledger.get_payment_operation(handle.conn, PAYMENT_OP_ID)
     assert payment is not None
-
-    # 予約と食い違う既存 Receipt を直接 SQL で混入させる（異常事態の再現。
-    # アプリの経路からは作れないため、台帳の防御を直接検証する）。
     from ojp import db as dbmod
 
-    with dbmod.transaction(test_db.conn, immediate=True):
-        wallet_account = ledger._get_wallet_ledger_account(test_db.conn, AGENT_B_ID)
+    with dbmod.transaction(handle.conn, immediate=True):
+        # 保存則を壊さない形で混入するため、食い違い金額分の Wallet 裏付けを
+        # 整合する Journal で作る（locked は予約のまま動かさず、Wallet 台帳
+        # 口座と予約口座の間で付け替える。実残高・locked は変わらない）。
+        wallet_account = ledger._get_wallet_ledger_account(handle.conn, AGENT_B_ID)
         ledger.apply_journal(
-            test_db.conn,
+            handle.conn,
             operation_id="payout:fake-receipt-journal",
             reason="pay",
             now_us=TEST_T0_US,
             entries=[
-                (payment.source_account_id, -1),  # 予約と違う金額
-                (wallet_account.id, 1),
+                (payment.source_account_id, -amount),
+                (wallet_account.id, amount),
             ],
         )
-        test_db.conn.execute(
+        handle.conn.execute(
             "INSERT INTO transfer_receipts"
             " (receipt_id, operation_id, amount_units, payee_id, asset,"
             "  source_account_id)"
@@ -243,29 +242,74 @@ def test_receipt_mismatch_with_reservation_is_rejected(test_db):
             (
                 f"receipt:{PAYMENT_OP_ID}",
                 PAYMENT_OP_ID,
-                1,
+                amount,
                 AGENT_B_ID,
                 payment.source_account_id,
             ),
         )
-    wallet_before = _wallet(test_db.conn, AGENT_B_ID)
-    with pytest.raises(OjpError) as exc_info:
-        service.process_payments(test_db.conn)
-    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
-    assert "does not match" in exc_info.value.message
-    # 照合で拒否され、settlement は Wallet・Journal を増やしていない。
-    # 照合違反は「送金の一時障害」ではなく予約と正本の矛盾なので、失敗は
-    # RETRYABLE へ記録されず呼出側へ伝播する（永続障害として可視化される）。
-    assert _wallet(test_db.conn, AGENT_B_ID) == wallet_before
+
+
+def test_receipt_mismatch_with_reservation_is_recorded(test_db):
+    """Receipt の金額・受取人・原資が予約と食い違う場合、黙って成功にせず、
+    例外でバッチを落とすのでもなく、理由を last_error に記録して可視化する。
+
+    transfer_receipts.operation_id は UNIQUE なので、食い違い Receipt の
+    存在自体が異常事態。Mock.transfer は照合して拒否し、Wallet・Journal・
+    paid をさらに増やさない。失敗は RETRYABLE として記録され、予約は
+    locked に残る（返金への切替・Job FAILED 化は行わない）。
+    """
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    _inject_mismatched_receipt(test_db, amount=1)
+
+    results = service.process_payments(test_db.conn)
+    assert len(results) == 1
+    data = results[0].data
+    # 例外でバッチが落ちるのではなく、件ごとの結果として失敗が返る
+    assert data["payment_status"] == PaymentStatus.RETRYABLE.value
+    assert data["attempt_count"] == 1
+    assert "does not match" in data["last_error"]
+    assert data["next_retry_at_us"] is not None
+    # 照合で拒否され、settlement は Wallet・Journal を増やしていない
+    assert _wallet(test_db.conn, AGENT_B_ID) == 0
     assert _view(test_db).paid_units == 1  # 混入分だけ
-    # 予約は残り、PaymentOperation は終端へ落ちていない（未 SUCCEEDED のまま）
+    # 失敗理由と予約金が読み取れる（永続障害の可視化の土台）
+    failure = ledger.get_payment_failure_view(test_db.conn, PAYMENT_OP_ID)
+    assert failure is not None
+    assert failure.last_error is not None
+    assert "does not match" in failure.last_error
+    assert failure.attempt_count == 1
+    assert failure.source_amount_units == CHILD_BUDGET_UNITS - 1  # 予約の残り
+    # PaymentOperation は終端へ落ちていない（未 SUCCEEDED のまま）
     payment_after = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
     assert payment_after is not None
     assert payment_after.status != PaymentStatus.SUCCEEDED
-    assert payment_after.attempt_count == 0  # 送金失敗としては記録されない
     assert _view(test_db).locked_breakdown_units["child_payout"] == (
         CHILD_BUDGET_UNITS - 1
     )
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_retry_of_mismatched_receipt_records_again_without_success(test_db):
+    """食い違い Receipt が残る限り、再試行しても成功にはならず、試行のたびに
+    記録が積み上がる（黙って成功にしない）。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    _inject_mismatched_receipt(test_db, amount=1)
+
+    first = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    assert first.data["payment_status"] == PaymentStatus.RETRYABLE.value
+    assert first.data["attempt_count"] == 1
+    second = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    assert second.data["payment_status"] == PaymentStatus.RETRYABLE.value
+    assert second.data["attempt_count"] == 2
+    assert "does not match" in second.data["last_error"]
+    # SUCCEEDED へは収束せず、Wallet 実残高・Journal は増えない
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status != PaymentStatus.SUCCEEDED
+    assert _wallet(test_db.conn, AGENT_B_ID) == 0
+    assert _view(test_db).paid_units == 1  # 混入分だけ
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
@@ -580,24 +624,204 @@ class RejectingAssetEscrow(ledger.MockEscrow):
         return super().fund(conn, operation_id, bad)
 
 
-def test_permanent_payment_failure_is_not_retried(test_db):
-    """PaymentFailedError(kind='permanent') は将来の本番アダプター契約の型。
+def test_every_transfer_failure_is_recorded_regardless_of_kind(test_db):
+    """送金失敗は種類にかかわらず attempt_count・last_error を記録し、
+    status=RETRYABLE・next_retry_at_us をバックオフで設定する。
 
-    永続障害は再試行で解消しないため RETRYABLE へ記録せず呼出側へ伝播する
-    （予約は locked に残り可視化される）。Mock 自身は permanent を発生させない。
+    失敗種別の分岐は存在しない（計画書 第9節: 有限回で打ち切って返金へ
+    切り替えず、失敗理由と予約金を可視化する）。Mock 自身は永久障害を
+    発生させないが、port が失敗を返し続けても返金への切替・Job FAILED 化
+    は起きない。
     """
 
-    class PermanentFailEscrow(ledger.MockEscrow):
+    class AlwaysFailEscrow(ledger.MockEscrow):
         def transfer(self, conn, operation_id, payload):
-            raise ledger.PaymentFailedError("permanent failure", kind="permanent")
+            raise ledger.PaymentFailedError("escrow permanently unavailable")
 
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
-    with pytest.raises(ledger.PaymentFailedError):
-        service.process_payments(test_db.conn, escrow=PermanentFailEscrow())
+    results = service.process_payments(test_db.conn, escrow=AlwaysFailEscrow())
+    assert len(results) == 1
+    data = results[0].data
+    assert data["payment_status"] == PaymentStatus.RETRYABLE.value
+    assert data["attempt_count"] == 1
+    assert data["last_error"] == "escrow permanently unavailable"
+    assert data["next_retry_at_us"] == TEST_T0_US + SECOND
+    # 予約は locked に残り、返金への切替・終端への落下は起きない
     payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
     assert payment is not None
-    assert payment.status == PaymentStatus.PENDING  # RETRYABLE にすらならない
-    assert payment.attempt_count == 0
+    assert payment.status == PaymentStatus.RETRYABLE
     assert _view(test_db).locked_breakdown_units["child_payout"] == CHILD_BUDGET_UNITS
+    assert _view(test_db).paid_units == 0
+    # 失敗理由と予約金が読み取れる（永続障害の可視化の土台）
+    failure = ledger.get_payment_failure_view(test_db.conn, PAYMENT_OP_ID)
+    assert failure is not None
+    assert failure.last_error == "escrow permanently unavailable"
+    assert failure.amount_units == CHILD_BUDGET_UNITS
+    assert failure.source_amount_units == CHILD_BUDGET_UNITS
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_batch_continues_after_one_failure_and_records_reason(test_db):
+    """2 件の PaymentOperation のうち 1 件が失敗しても、process_payments は
+    他方の処理を止めない（他方は SUCCEEDED になる）。失敗側には last_error と
+    next_retry_at_us が残り、返金へは切り替わらない。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-1",
+    )
+    parent_payment_op_id = "payout:parent-1:payment"
+
+    class FailChildPayoutEscrow(ledger.MockEscrow):
+        """child payout（operation_id 昇順で先に処理される 1 件目）だけ失敗させる。"""
+
+        def transfer(self, conn, operation_id, payload):
+            if operation_id == PAYMENT_OP_ID:
+                raise ledger.PaymentFailedError("child payout rail unavailable")
+            return super().transfer(conn, operation_id, payload)
+
+    results = service.process_payments(
+        test_db.conn, escrow=FailChildPayoutEscrow()
+    )
+    assert len(results) == 2
+    by_id = {r.operation_id: r for r in results}
+    # 失敗側: RETRYABLE + last_error + next_retry_at_us が残る
+    failed = by_id[PAYMENT_OP_ID]
+    assert failed.data["payment_status"] == PaymentStatus.RETRYABLE.value
+    assert failed.data["last_error"] == "child payout rail unavailable"
+    assert failed.data["attempt_count"] == 1
+    assert failed.data["next_retry_at_us"] == TEST_T0_US + SECOND
+    # 成功側: 1 件の失敗に道連れにならず SUCCEEDED になる
+    succeeded = by_id[parent_payment_op_id]
+    assert succeeded.data["payment_status"] == PaymentStatus.SUCCEEDED.value
+    assert _wallet(test_db.conn, AGENT_A_ID) == (
+        ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    )
+    # 失敗側は返金へ切り替わらず locked 予約のまま
+    view = _view(test_db)
+    assert view.locked_breakdown_units["child_payout"] == CHILD_BUDGET_UNITS
+    assert view.paid_units == ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    assert view.refunded_units == 0
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+    # 障害が取り除かれれば失敗側も 1 回だけ送金される
+    from ojp import clock as clockmod
+
+    clockmod.set_test_now(test_db.conn, TEST_T0_US + SECOND)
+    retried = service.process_payments(test_db.conn)
+    assert len(retried) == 1
+    assert retried[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
+    assert _wallet(test_db.conn, AGENT_B_ID) == CHILD_BUDGET_UNITS
+    assert _view(test_db).paid_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+# ---------------------------------------------------------------------------
+# SUCCEEDED の再処理は Receipt の存在と 3 属性の一致を必ず照合する（Receipt 正本）
+# ---------------------------------------------------------------------------
+
+
+def test_succeeded_reprocess_fails_when_receipt_is_missing(test_db):
+    """SUCCEEDED だが Receipt が無い状態では、再処理は成功を返さない。
+
+    Receipt が正本という原則に反する状態を成功扱いせず、理由を last_error に
+    記録して整合性エラーとして扱う。既に SUCCEEDED へ確定した整合状態は
+    後から書き換えないため status は据え置き、成功（already_succeeded）は
+    返さない。
+    """
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    service.process_payments(test_db.conn)
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.SUCCEEDED
+
+    # Receipt（正本）を直接削除して「SUCCEEDED だが Receipt が無い」異常状態を
+    # 作る（アプリの経路からは作れないため、再処理の防御を直接検証する）。
+    # payment_operations.receipt_id の FK 参照を外してから削除する。
+    from ojp import db as dbmod
+
+    with dbmod.transaction(test_db.conn, immediate=True):
+        test_db.conn.execute(
+            "UPDATE payment_operations SET receipt_id = NULL WHERE operation_id = ?",
+            (PAYMENT_OP_ID,),
+        )
+        test_db.conn.execute(
+            "DELETE FROM transfer_receipts WHERE operation_id = ?", (PAYMENT_OP_ID,)
+        )
+
+    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    # 成功としては返さない（already_succeeded は返らず、整合性エラーが返る）
+    assert "already_succeeded" not in result.data
+    assert result.data["consistency_error"] is True
+    assert "missing" in result.data["last_error"]
+    # 既に SUCCEEDED へ確定した整合状態は書き換えない（status・attempt 据え置き）
+    payment_after = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment_after is not None
+    assert payment_after.status == PaymentStatus.SUCCEEDED
+    assert payment_after.attempt_count == 0
+    assert payment_after.last_error is not None
+    assert "missing" in payment_after.last_error
+    # 失敗理由が読み取れる
+    failure = ledger.get_payment_failure_view(test_db.conn, PAYMENT_OP_ID)
+    assert failure is not None
+    assert failure.last_error is not None
+    assert "missing" in failure.last_error
+
+
+def test_succeeded_reprocess_detects_receipt_amount_mismatch(test_db):
+    """SUCCEEDED の再処理で、Receipt の金額・受取人・原資が予約と食い違う
+    場合も成功として返さない。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    service.process_payments(test_db.conn)
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.SUCCEEDED
+
+    # Receipt の金額を直接書き換えて食い違い状態を作る
+    test_db.conn.execute(
+        "UPDATE transfer_receipts SET amount_units = amount_units - 1"
+        " WHERE operation_id = ?",
+        (PAYMENT_OP_ID,),
+    )
+    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    assert "already_succeeded" not in result.data
+    assert result.data["consistency_error"] is True
+    assert "does not match" in result.data["last_error"]
+    payment_after = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment_after is not None
+    assert payment_after.status == PaymentStatus.SUCCEEDED
+    assert payment_after.last_error is not None
+    assert "does not match" in payment_after.last_error
+
+
+def test_payment_failure_view_exposes_reason_and_locked_reservation(test_db):
+    """失敗理由と予約金が読み取れる問い合わせ（Phase 5 の `ojp ledger show` /
+    `ojp payment retry` が使う土台）: last_error / attempt_count /
+    next_retry_at_us / locked 残高を返す。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    escrow = FlakyEscrow(fail_times=1)
+    service.process_payments(test_db.conn, escrow=escrow)
+
+    failure = ledger.get_payment_failure_view(test_db.conn, PAYMENT_OP_ID)
+    assert failure is not None
+    assert failure.operation_id == PAYMENT_OP_ID
+    assert failure.status == PaymentStatus.RETRYABLE
+    assert failure.attempt_count == 1
+    assert failure.last_error == "injected transfer failure #1"
+    assert failure.next_retry_at_us == TEST_T0_US + SECOND
+    # locked 予約金: 原資口座・予約額・現在の原資残高
+    assert failure.amount_units == CHILD_BUDGET_UNITS
+    assert failure.source_amount_units == CHILD_BUDGET_UNITS
+    assert failure.payee_id == AGENT_B_ID
+    assert failure.kind.value == "payout"
+    # 存在しない operation は None
+    assert ledger.get_payment_failure_view(test_db.conn, "payout:ghost") is None
