@@ -363,55 +363,72 @@ def test_failpoint_after_receipt_restart_recovers_from_new_process(test_db):
 # ---------------------------------------------------------------------------
 
 
-def test_failpoints_are_rejected_in_realtime_mode(realtime_db):
-    """failpoint は realtime mode の DB では代入済みでも発火せず拒否される。
+def _assert_nothing_moved_for_rejection(conn):
+    """failpoint の前置拒否が「何も動かさない」ことを検証する。
 
-    通常経路（realtime）から障害注入を有効化できないことを、(a)(b)(c) の
-    各 seam と ledger._fire_failpoint のモード検査で確認する。
+    送金が行われていない（Receipt なし・pay の Journal 0 件・受取人
+    Wallet 0・locked 予約は減っていない）ことに加え、拒否が送金失敗として
+    記録もされていない（attempt_count は増えず PENDING のまま）ことを
+    確認する。
+    """
+    assert ledger.lookup_transfer_receipt(conn, PAYMENT_OP_ID) is None
+    assert _pay_journal_count(conn) == 0
+    assert _wallet(conn, AGENT_B_ID) == 0
+    payment = ledger.get_payment_operation(conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.attempt_count == 0
+    # locked 予約（child_payout 10）が減っていない
+    view = ledger.get_root_ledger_view(conn, ROOT_ID)
+    assert view.locked_breakdown_units["child_payout"] == CHILD_BUDGET_UNITS
+
+
+@pytest.mark.parametrize(
+    "seam",
+    [
+        "failpoint_before_commit",
+        "failpoint_after_commit",
+        "failpoint_after_receipt",
+    ],
+)
+def test_failpoints_are_rejected_in_realtime_mode(realtime_db, seam):
+    """failpoint は realtime mode の DB では何も動かさずに拒否される。
+
+    「failpoint は test mode の DB でのみ有効で、通常経路（realtime）から
+    触れない」という契約は、禁止エラーを返す前に Wallet・Journal・Receipt
+    が確定しないことを意味する。各 seam を単独で代入した場合に、
+    process_payments / retry_payment が "test mode" を含むエラーで拒否し、
+    送金が一切行われない（送金失敗としても記録されない）ことを、seam
+    ごとに独立した DB で検証する。
     """
     _setup_reserved_payout(realtime_db)
 
     def boom(name):
         raise RuntimeError(f"must not fire in realtime: {name}")
 
-    # (a) の seam: realtime では代入済みでも発火前に拒否される。
-    # この拒否（OjpError）も送金失敗として記録される契約（計画書 第9節
-    # 「失敗理由と予約金を可視化する」）であり、PaymentOperation は
-    # 終端へ落ちず locked 予約は残る。
-    ledger.failpoint_before_commit = boom
-    result = service.process_payments(realtime_db.conn)
-    assert len(result) == 1
-    assert result[0].data["payment_status"] == PaymentStatus.RETRYABLE.value
-    assert "test mode" in result[0].data["last_error"]
-    payment = ledger.get_payment_operation(realtime_db.conn, PAYMENT_OP_ID)
-    assert payment is not None
-    assert payment.status == PaymentStatus.RETRYABLE
-    assert payment.attempt_count == 1
-    assert payment.next_retry_at_us is not None
-    ledger.failpoint_before_commit = None
+    setattr(ledger, seam, boom)
 
-    # (b) の seam: この拒否は status 更新 transaction 内・failpoint 発火時点で
-    # 伝播する（発火自体の不許可であり送金試行の失敗ではないため、
-    # attempt_count は増えない）
-    ledger.failpoint_after_commit = boom
+    # process_payments 経路: T1 開始前に拒否され、送金は行われない
+    with pytest.raises(OjpError, match="test mode"):
+        service.process_payments(realtime_db.conn)
+    _assert_nothing_moved_for_rejection(realtime_db.conn)
+
+    # retry_payment 経路も同じ前置検査で拒否され、送金は行われない
     with pytest.raises(OjpError, match="test mode"):
         service.retry_payment(realtime_db.conn, operation_id=PAYMENT_OP_ID)
-    ledger.failpoint_after_commit = None
-    payment = ledger.get_payment_operation(realtime_db.conn, PAYMENT_OP_ID)
-    assert payment is not None
-    assert payment.attempt_count == 1
+    _assert_nothing_moved_for_rejection(realtime_db.conn)
 
-    # (c) の seam も同様に拒否され、記録として残る
-    ledger.failpoint_after_receipt = boom
-    rejected = service.retry_payment(realtime_db.conn, operation_id=PAYMENT_OP_ID)
-    assert rejected.data["payment_status"] == PaymentStatus.RETRYABLE.value
-    assert "test mode" in rejected.data["last_error"]
-    assert rejected.data["attempt_count"] == 2
-    ledger.failpoint_after_receipt = None
 
-    # 注入を外せば realtime でも通常通り 1 回だけ送金される
-    recovered = service.retry_payment(realtime_db.conn, operation_id=PAYMENT_OP_ID)
-    assert recovered.data["payment_status"] == PaymentStatus.SUCCEEDED.value
+def test_realtime_settles_normally_after_failpoints_cleared(realtime_db):
+    """failpoint を全て外した realtime は通常どおり 1 回だけ送金される。"""
+    _setup_reserved_payout(realtime_db)
+    assert ledger.failpoint_before_commit is None
+    assert ledger.failpoint_after_commit is None
+    assert ledger.failpoint_after_receipt is None
+
+    results = service.process_payments(realtime_db.conn)
+    assert len(results) == 1
+    assert results[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
     _assert_converged(realtime_db.conn)
 
 

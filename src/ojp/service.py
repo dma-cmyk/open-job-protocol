@@ -297,6 +297,10 @@ def fund_root(
     冪等性。Requester・公開予算・asset は呼出側の申告を信用せず DB
     （jobs / job_versions）から解決する:
 
+    検査の順序は Root 性 → Actor 権限 → 申告 requester_id → 公開予算 →
+    asset。権限のない Actor には Job の公開状態（Version の有無・公開予算）
+    を返さないため、公開状態の解決は権限検査の後に行う:
+
     - 対象 Job が Root（parent_id IS NULL かつ root_id = id）でなければ
       INVALID_TARGET
     - 権限: Root作成・入金・Root承認は Root Requester（第5節）。
@@ -319,32 +323,38 @@ def fund_root(
     }
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
-        target = ledger.resolve_root_funding_target(c, root_id)
-        if actor_id != target.requester_id:
+        # 1. Root 性（INVALID_TARGET）と Requester の解決。公開状態はまだ見ない
+        root_requester_id = ledger.resolve_root_job(c, root_id)
+        # 2. Actor 権限（FORBIDDEN）: 公開状態の解決より先に行う
+        if actor_id != root_requester_id:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
                 "actor is not the root requester:"
-                f" actor={actor_id}, requester={target.requester_id}"
+                f" actor={actor_id}, requester={root_requester_id}"
                 " (Root作成・入金・Root承認はRoot Requester. 第5節)",
             )
-        if requester_id != target.requester_id:
+        # 3. 申告 requester_id の一致（FORBIDDEN）
+        if requester_id != root_requester_id:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
                 "requester_id does not match the root job's requester:"
-                f" got={requester_id}, expected={target.requester_id}"
+                f" got={requester_id}, expected={root_requester_id}"
                 " (原資は DB の jobs.requester_id から解決する)",
             )
-        if expected_amount_units != target.budget_units:
+        # 4. 公開予算の一致（FORBIDDEN）。権限検査後に公開状態を解決する
+        budget_units, asset = ledger.resolve_root_published_budget(c, root_id)
+        if expected_amount_units != budget_units:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
                 "expected_amount_units does not match the published budget:"
-                f" got={expected_amount_units}, expected={target.budget_units}"
+                f" got={expected_amount_units}, expected={budget_units}"
                 " (公開予算は DB の job_versions.budget_units が正本)",
             )
-        if target.asset != ledger.ASSET_MOCK_USDC:
+        # 5. asset が mock-USDC（INVALID_STATE）
+        if asset != ledger.ASSET_MOCK_USDC:
             raise OjpError(
                 ErrorCode.INVALID_STATE,
-                f"unsupported asset in the published version: {target.asset!r}",
+                f"unsupported asset in the published version: {asset!r}",
             )
         return escrow_port.fund(
             c,
@@ -352,10 +362,10 @@ def fund_root(
             ledger.FundPayload(
                 operation_id=op_id,
                 root_id=root_id,
-                requester_id=target.requester_id,
-                expected_amount_units=target.budget_units,
+                requester_id=root_requester_id,
+                expected_amount_units=budget_units,
                 amount_units=amount_units,
-                asset=target.asset,
+                asset=asset,
                 business_key=f"fund:{root_id}",
             ),
         )
@@ -761,8 +771,14 @@ def process_single_payment(
     - 未確定の送金の失敗は種類にかかわらず attempt_count・last_error を
       記録し、status=RETRYABLE・next_retry_at_us をバックオフで設定する
       （返金への切替は行わない）
+    - failpoint（障害注入）が代入済みの場合は test mode の DB でのみ
+      進み、realtime では T1 を開始する前に何も動かさず拒否する
+      （第14節。送金失敗としては記録しない）
     """
     escrow_port = escrow if escrow is not None else ledger.MockEscrow()
+    # failpoint は test mode の DB でのみ有効。realtime で代入済みなら
+    # 台帳・Wallet・Receipt・PaymentOperation を一切変更する前に拒否する。
+    ledger.assert_failpoints_allowed(conn)
 
     def _record_failure(c: sqlite3.Connection, reason: str) -> CommandResult:
         now = clock.now_for_write_transaction(c)
@@ -866,15 +882,12 @@ def process_single_payment(
             # (c) Receipt 確定後・アプリの status 更新前の注入点。T1 の
             # commit 直後・T2 の前に発火させると、「Receipt は commit 済み・
             # PaymentOperation は未更新」の中断状態になる（再起動後の
-            # 収束の検証用）。realtime での発火の拒否（OjpError）は
-            # 送金失敗として記録する（旧: transfer 内の seam と同じ契約）。
-            try:
-                ledger._fire_failpoint(
-                    conn, ledger.failpoint_after_receipt, "after_receipt"
-                )
-            except OjpError as exc:
-                with db.transaction(conn, immediate=True):
-                    return _record_failure(conn, str(exc))
+            # 収束の検証用）。realtime での拒否は先頭の前置検査
+            # （assert_failpoints_allowed）が何も動かす前に行うため、ここで
+            # 発火するのは test mode の DB のみ。
+            ledger._fire_failpoint(
+                conn, ledger.failpoint_after_receipt, "after_receipt"
+            )
             # T2（status 更新）: 別の transaction で PaymentOperation を
             # SUCCEEDED ＋ receipt_id に更新する。
             with db.transaction(conn, immediate=True):

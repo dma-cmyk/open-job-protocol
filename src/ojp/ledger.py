@@ -413,22 +413,20 @@ class RootFundingTarget:
     asset: str
 
 
-def resolve_root_funding_target(
-    conn: sqlite3.Connection, root_id: str
-) -> RootFundingTarget:
-    """Root funding の対象を DB から解決する。
+def resolve_root_job(conn: sqlite3.Connection, root_id: str) -> str:
+    """Root 性と Requester を jobs から解決する（公開状態は見ない）。
 
-    - 対象 Job が Root であること（parent_id IS NULL かつ root_id = id）を
-      確認する。Child への fund は INVALID_TARGET で拒否する
-    - 引落し元の Requester は jobs.requester_id から導出する
-    - 入金額・asset は job_versions の公開版（PoC は UNIQUE(job_id, version)
-      の 1 版）から導出する。Version 行が無ければ INVALID_STATE
+    - 対象 Job が Root（parent_id IS NULL かつ root_id = id）でなければ
+      INVALID_TARGET
+    - 戻り値は引落し元の Requester（jobs.requester_id）
+
+    Actor 権限の検査（FORBIDDEN）が公開 Version の有無の検査（INVALID_STATE）
+    より先に来るように、公開状態の解決とは分離する。権限のない Actor に
+    Job の公開状態を漏らさないための順序。
     """
     row = conn.execute(
-        "SELECT j.requester_id AS requester_id,"
-        " v.budget_units AS budget_units, v.asset AS asset"
-        " FROM jobs j LEFT JOIN job_versions v ON v.id = j.version_id"
-        " WHERE j.id = ? AND j.parent_id IS NULL AND j.root_id = j.id",
+        "SELECT requester_id FROM jobs"
+        " WHERE id = ? AND parent_id IS NULL AND root_id = id",
         (root_id,),
     ).fetchone()
     if row is None:
@@ -437,15 +435,51 @@ def resolve_root_funding_target(
             f"fund target must be a root job (parent_id IS NULL, root_id = id):"
             f" {root_id}",
         )
-    if row["budget_units"] is None or row["asset"] is None:
+    return str(row["requester_id"])
+
+
+def resolve_root_published_budget(
+    conn: sqlite3.Connection, root_id: str
+) -> tuple[int, str]:
+    """公開 Version の予算・asset を job_versions から解決する。
+
+    Root 性・Requester の解決（resolve_root_job）と権限検査の後に呼ぶ。
+    Version 行が無ければ INVALID_STATE。
+    """
+    row = conn.execute(
+        "SELECT v.budget_units AS budget_units, v.asset AS asset"
+        " FROM jobs j JOIN job_versions v ON v.id = j.version_id"
+        " WHERE j.id = ?",
+        (root_id,),
+    ).fetchone()
+    if row is None:
         raise OjpError(
             ErrorCode.INVALID_STATE,
             f"root job has no published version (jobs.version_id is unset): {root_id}",
         )
+    return int(row["budget_units"]), str(row["asset"])
+
+
+def resolve_root_funding_target(
+    conn: sqlite3.Connection, root_id: str
+) -> RootFundingTarget:
+    """Root funding の対象を DB から解決する（2 段解決の薄いラッパー）。
+
+    - 対象 Job が Root であること（parent_id IS NULL かつ root_id = id）を
+      確認する。Child への fund は INVALID_TARGET で拒否する
+    - 引落し元の Requester は jobs.requester_id から導出する
+    - 入金額・asset は job_versions の公開版（PoC は UNIQUE(job_id, version)
+      の 1 版）から導出する。Version 行が無ければ INVALID_STATE
+
+    fund_root のように権限検査を先に行う経路は、resolve_root_job /
+    resolve_root_published_budget を直接呼んで順序を制御する。
+    """
+    requester_id = resolve_root_job(conn, root_id)
+    budget_units, asset = resolve_root_published_budget(conn, root_id)
     return RootFundingTarget(
-        requester_id=str(row["requester_id"]),
-        budget_units=int(row["budget_units"]),
-        asset=str(row["asset"]),
+        requester_id=requester_id,
+        budget_units=budget_units,
+        asset=asset,
     )
 
 
@@ -1191,6 +1225,33 @@ def _fire_failpoint(
             f"failpoint {name} is only available in test mode",
         )
     hook(name)
+
+
+def assert_failpoints_allowed(conn: sqlite3.Connection) -> None:
+    """failpoint が代入済みなら、test mode の DB でなければ拒否する。
+
+    settlement（process_single_payment）の先頭・台帳・Wallet・Receipt・
+    PaymentOperation を一切変更しない位置で呼ぶ前置検査。「failpoint は
+    test mode の DB でのみ有効で、通常経路（realtime）から触れない」という
+    契約は、何も動かさずに拒否することを意味する。発火点（_fire_failpoint）
+    側のモード検査は二重の防御として残す。
+    """
+    names = [
+        name
+        for name, hook in (
+            ("before_commit", failpoint_before_commit),
+            ("after_commit", failpoint_after_commit),
+            ("after_receipt", failpoint_after_receipt),
+        )
+        if hook is not None
+    ]
+    if not names:
+        return
+    if clock.read_mode(conn) != ClockMode.TEST:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            f"failpoint {names[0]} is only available in test mode",
+        )
 
 
 class MockEscrow(EscrowPort):

@@ -488,6 +488,63 @@ def test_fund_rejects_actor_other_than_root_requester(test_db):
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
+def test_fund_rejects_unauthorized_actor_before_version_state(test_db):
+    """公開 Version の無い Root に無権限の Actor が fund すると FORBIDDEN。
+
+    検査順序は Root 性 → Actor 権限 → 申告 requester_id → 公開予算 → asset。
+    権限のない Actor に公開状態（Version の有無）を漏らさないため、
+    「公開 Version なし × Root Requester ではない Actor」は INVALID_STATE
+    ではなく FORBIDDEN で拒否される。拒否後は available・Requester Wallet・
+    journal_transactions・operations のいずれも変化しない。
+    """
+    from ojp import db as dbmod
+    from tests.conftest import insert_participant
+    from ojp.domain import ParticipantKind
+
+    with dbmod.transaction(test_db.conn, immediate=True):
+        insert_participant(test_db.conn, REQUESTER_ID, ParticipantKind.HUMAN)
+        insert_participant(test_db.conn, AGENT_A_ID, ParticipantKind.AGENT)
+        # Version 行を作らず jobs 行だけを直接 INSERT する（公開状態なし）
+        test_db.conn.execute(
+            "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
+            " row_version, created_at_us) VALUES (?, ?, NULL, ?, 'DRAFT', 0, 0)",
+            (ROOT_ID, ROOT_ID, REQUESTER_ID),
+        )
+        ledger.seed_mock_wallet_for_demo(
+            test_db.conn,
+            participant_id=REQUESTER_ID,
+            asset="mock-USDC",
+            balance_units=ROOT_BUDGET_UNITS,
+        )
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=AGENT_A_ID,  # Root Requester ではない別 participant
+            root_id=ROOT_ID,
+            requester_id=REQUESTER_ID,  # 申告は正しい値
+            expected_amount_units=ROOT_BUDGET_UNITS,
+            amount_units=ROOT_BUDGET_UNITS,
+        )
+    # 公開 Version が無くても、Actor 権限の検査が先なので FORBIDDEN
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 状態は一切変化しない
+    assert _view(test_db).available_units == 0
+    assert _wallet(test_db.conn, REQUESTER_ID) == ROOT_BUDGET_UNITS
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM journal_transactions"
+        ).fetchone()["c"]
+        == 0
+    )
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations"
+        ).fetchone()["c"]
+        == 0
+    )
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
 def test_fund_rejects_non_mock_usdc_asset(test_db):
     """公開 Version の asset が mock-USDC 以外なら INVALID_STATE。"""
     from ojp import db as dbmod
