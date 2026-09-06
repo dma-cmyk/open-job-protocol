@@ -299,6 +299,8 @@ def fund_root(
 
     - 対象 Job が Root（parent_id IS NULL かつ root_id = id）でなければ
       INVALID_TARGET
+    - 権限: Root作成・入金・Root承認は Root Requester（第5節）。
+      actor_id が DB の jobs.requester_id と一致しなければ FORBIDDEN
     - requester_id / expected_amount_units が DB の正本と違えば FORBIDDEN
       （呼出側の値を黙って採用しない）
     - asset は job_versions.asset が mock-USDC であることを要求する
@@ -318,6 +320,13 @@ def fund_root(
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         target = ledger.resolve_root_funding_target(c, root_id)
+        if actor_id != target.requester_id:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                "actor is not the root requester:"
+                f" actor={actor_id}, requester={target.requester_id}"
+                " (Root作成・入金・Root承認はRoot Requester. 第5節)",
+            )
         if requester_id != target.requester_id:
             raise OjpError(
                 ErrorCode.FORBIDDEN,
@@ -729,12 +738,20 @@ def process_single_payment(
 ) -> CommandResult:
     """1 件の PaymentOperation を settlement する（共通処理の単位）。
 
+    transaction は 2 つに分ける（第9節 3〜5）:
+
+    - T1（transfer）: locked 減額・MockWallet 増額・paid/refunded・Journal・
+      Receipt を 1 つの DB transaction で確定して commit する
+    - T2（status 更新）: 別の transaction で PaymentOperation を
+      SUCCEEDED ＋ receipt_id に更新する
+
     - PENDING / RETRYABLE を取得し、同じ operation_id で Escrow port の
       transfer を呼ぶ（計画書 第9節 2）
     - Receipt が無いのに paid/refunded を増やさない（Mock が Receipt 正本）
     - 結果を記録する前に停止しても、再起動後に lookup で Receipt を照会して
       SUCCEEDED へ収束させる（第9節 4）
-    - DB commit 前の障害は全体 rollback。commit 後の応答消失は Receipt が正本
+    - DB commit 前の障害は T1 全体 rollback。commit 後の応答消失は
+      Receipt が正本
     - 再試行で Job を FAILED にしない（有限回で打ち切らない。本モジュールは
       Job 状態を一切触らない）
     - SUCCEEDED 済みの再実行は Receipt の存在と金額・受取人・原資の一致を
@@ -796,22 +813,23 @@ def process_single_payment(
             operation_id=operation_id,
         )
 
+    def _read_payment_or_raise() -> Any:
+        payment = ledger.get_payment_operation(conn, operation_id)
+        if payment is None:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"payment operation not found: {operation_id}",
+            )
+        return payment
+
     for attempt in range(DB_BUSY_MAX_ATTEMPTS):
         try:
+            # T1（transfer）: PaymentOperation を読み、Escrow port の
+            # transfer（locked 減額・Wallet 増額・Journal・Receipt）までを
+            # この transaction で確定して commit する。SUCCEEDED 済みの
+            # 照合分岐・失敗の記録もこの transaction 内で完結する。
             with db.transaction(conn, immediate=True):
-                payment = ledger.get_payment_operation(conn, operation_id)
-                if payment is None:
-                    raise OjpError(
-                        ErrorCode.INVALID_STATE,
-                        f"payment operation not found: {operation_id}",
-                    )
-                # (b) commit 後の応答消失の注入点。send 系を別 transaction で
-                # 確定させた直後・この status 更新 transaction の commit 前に
-                # 発火させると、「Receipt は commit 済み・PaymentOperation は
-                # 未更新」の中断状態になる（再起動後の収束の検証用）。
-                ledger._fire_failpoint(
-                    conn, ledger.failpoint_after_commit, "after_commit"
-                )
+                payment = _read_payment_or_raise()
                 if payment.status == PaymentStatus.SUCCEEDED:
                     # 冪等: Receipt の存在と金額・受取人・原資の一致を必ず
                     # 照合する（Receipt が正本。Wallet・Journal は増えない）。
@@ -845,6 +863,29 @@ def process_single_payment(
                     # 違反を含む）。返金への切替・Job の FAILED 化は行わず、
                     # 失敗理由と予約金を可視化する。
                     return _record_failure(conn, str(exc))
+            # (c) Receipt 確定後・アプリの status 更新前の注入点。T1 の
+            # commit 直後・T2 の前に発火させると、「Receipt は commit 済み・
+            # PaymentOperation は未更新」の中断状態になる（再起動後の
+            # 収束の検証用）。realtime での発火の拒否（OjpError）は
+            # 送金失敗として記録する（旧: transfer 内の seam と同じ契約）。
+            try:
+                ledger._fire_failpoint(
+                    conn, ledger.failpoint_after_receipt, "after_receipt"
+                )
+            except OjpError as exc:
+                with db.transaction(conn, immediate=True):
+                    return _record_failure(conn, str(exc))
+            # T2（status 更新）: 別の transaction で PaymentOperation を
+            # SUCCEEDED ＋ receipt_id に更新する。
+            with db.transaction(conn, immediate=True):
+                # (b) commit 後の応答消失の注入点。send 系（T1）を別
+                # transaction で確定させた直後・この status 更新 transaction
+                # の commit 前に発火させると、「Receipt は commit 済み・
+                # PaymentOperation は未更新」の中断状態になる（再起動後の
+                # 収束の検証用）。
+                ledger._fire_failpoint(
+                    conn, ledger.failpoint_after_commit, "after_commit"
+                )
                 updated = ledger.mark_payment_succeeded_in_tx(
                     conn, operation_id=operation_id, receipt_id=receipt.receipt_id
                 )

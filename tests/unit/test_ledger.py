@@ -451,6 +451,43 @@ def test_fund_rejects_wrong_requester_and_amount(test_db):
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
+def test_fund_rejects_actor_other_than_root_requester(test_db):
+    """Root Requester ではない別 Actor は fund を実行できない（FORBIDDEN）。
+
+    仕様（第5節）: Root作成・入金・Root承認は Root Requester。actor_id を
+    呼出側が申告するだけで、requester_id に正しい値を渡しても権限の
+    代替にはならない。拒否後は Root の available・Requester の Wallet・
+    Journal・operations のいずれも変化しない。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID, seed_workers=True)
+    with pytest.raises(OjpError) as exc_info:
+        service.fund_root(
+            test_db.conn,
+            actor_id=AGENT_A_ID,  # Root Requester ではない別 participant
+            root_id=ROOT_ID,
+            requester_id=REQUESTER_ID,  # 申告は正しい値
+            expected_amount_units=ROOT_BUDGET_UNITS,
+            amount_units=ROOT_BUDGET_UNITS,
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # 状態は一切変化しない
+    assert _view(test_db).available_units == 0
+    assert _wallet(test_db.conn, REQUESTER_ID) == ROOT_BUDGET_UNITS
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM journal_transactions"
+        ).fetchone()["c"]
+        == 0
+    )
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations"
+        ).fetchone()["c"]
+        == 0
+    )
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
 def test_fund_rejects_non_mock_usdc_asset(test_db):
     """公開 Version の asset が mock-USDC 以外なら INVALID_STATE。"""
     from ojp import db as dbmod

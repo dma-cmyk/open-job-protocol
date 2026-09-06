@@ -1374,11 +1374,6 @@ class MockEscrow(EscrowPort):
                     f" (operation_id={operation_id})",
                 ) from exc
             return raced
-        # (c) Receipt 確定後・アプリの status 更新前の停止の注入点。
-        # transfer を別 transaction（例: 別プロセスのサービス呼出し）で
-        # 呼んだ場合、Receipt はそこで commit 済みで、呼出側の status 更新は
-        # 未確定という中断状態を再現できる（応答消失・再起動後の収束の検証用）。
-        _fire_failpoint(conn, failpoint_after_receipt, "after_receipt")
         return TransferReceipt(
             receipt_id=receipt_id,
             operation_id=operation_id,

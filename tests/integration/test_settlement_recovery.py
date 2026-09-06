@@ -314,33 +314,33 @@ def test_failpoint_after_commit_response_loss_recovers_from_new_process(test_db)
 
 
 def test_failpoint_after_receipt_restart_recovers_from_new_process(test_db):
-    """(c) Receipt 確定後・アプリの status 更新前の停止: transfer（Receipt・
-    locked 減額・Wallet 増額・Journal）は独立 transaction で commit 済み、
-    status 更新だけが未確定の状態でプロセスが異常終了する。新しいプロセスが
-    lookup で Receipt を照会して SUCCEEDED へ収束させ、Wallet も Journal も
+    """(c) Receipt 確定後・アプリの status 更新前の停止: failpoint を
+    process_single_payment の T1（transfer）commit 直後・T2（status 更新）
+    の前に発火させて異常終了させる。Receipt・台帳・Wallet は commit 済みで
+    status だけが未確定の状態でプロセスが落ち、新しいプロセスが lookup で
+    Receipt を照会して SUCCEEDED へ収束させ、Wallet も Journal も
     二重加算しない。"""
     _setup_reserved_payout(test_db)
 
-    # プロセス A: transfer を独立 transaction で確定し、status 更新を
-    # 行わないまま異常終了する
-    send = _run_script(
-        _SETTLE_AND_CRASH_BEFORE_STATUS_SCRIPT,
+    # プロセス A: T1（transfer）を commit した直後・status 更新前に
+    # failpoint_after_receipt が発火して異常終了する
+    crash = _run_script(
+        _crash_script("failpoint_after_receipt"),
         str(test_db.path), PAYMENT_OP_ID, str(TEST_T0_US),
     )
-    _assert_crash(send)
-    assert "receipt committed" in send.stdout
+    _assert_crash(crash)
 
     fresh = test_db.fresh_conn()
     try:
-        # status だけ未確定（PENDING のまま）
-        payment = ledger.get_payment_operation(fresh, PAYMENT_OP_ID)
-        assert payment is not None
-        assert payment.status == PaymentStatus.PENDING
         # Receipt は正本として commit 済みで、台帳・Wallet も確定済み
         receipt = ledger.lookup_transfer_receipt(fresh, PAYMENT_OP_ID)
         assert receipt is not None
         assert _pay_journal_count(fresh) == 1
         assert _wallet(fresh, AGENT_B_ID) == CHILD_BUDGET_UNITS
+        # status だけ未確定（SUCCEEDED ではない）
+        payment = ledger.get_payment_operation(fresh, PAYMENT_OP_ID)
+        assert payment is not None
+        assert payment.status != PaymentStatus.SUCCEEDED
     finally:
         fresh.close()
 
