@@ -318,6 +318,9 @@ def test_double_approve_same_operation_id_replays(demo_db):
     acceptances, payments, receipts = _counts(demo_db, child_id)
     assert acceptances == 1
     assert payments == 1
+    # まだ決済していない段階なので Receipt は 0。決済後に Receipt が 1 件・
+    # B への支払いが 10 だけであることは
+    # tests/integration/test_approve_race.py で確認する
     assert receipts == 0
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
@@ -336,6 +339,9 @@ def test_double_approve_different_operation_id_reuses_payment(demo_db):
     acceptances, payments, receipts = _counts(demo_db, child_id)
     assert acceptances == 1
     assert payments == 1
+    # まだ決済していない段階なので Receipt は 0。決済後に Receipt が 1 件・
+    # B への支払いが 10 だけであることは
+    # tests/integration/test_approve_race.py で確認する
     assert receipts == 0
     # 資金・Wallet は二度目で不変
     assert _buckets(demo_db, root_id) == buckets_before

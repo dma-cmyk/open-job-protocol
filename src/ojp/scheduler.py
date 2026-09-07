@@ -8,8 +8,12 @@ sleep で待つ実装にしない）。
 
 独立プロセスから `python -m ojp.scheduler --root <project-root> --once --json`
 で実行でき、全プロセス停止後も期限は DB に残るため、再起動後の tick が
-過期限分を処理する。終了コードは第14節どおり: 成功 0、入力・権限・状態違反 2、
-一時障害 3。`--json` のとき stdout には単一 JSON だけを出す（ログを混ぜない）。
+過期限分を処理する。`--clock-mode`（既定 realtime）で期待する DB の Clock
+mode を指定し、DB の mode と違えば Lifecycle を 1 つも実行せず
+MODE_MISMATCH で起動を拒否する（計画書 第7節。test DB の利用には明示的な
+`--clock-mode test` が必要）。終了コードは第14節どおり: 成功 0、
+入力・権限・状態違反 2、一時障害 3。`--json` のとき stdout には単一 JSON
+だけを出す（ログを混ぜない）。
 """
 
 from __future__ import annotations
@@ -176,6 +180,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="結果を単一の JSON で stdout へ出力する",
     )
+    parser.add_argument(
+        "--clock-mode",
+        choices=[m.value for m in domain.ClockMode],
+        default=domain.ClockMode.REALTIME.value,
+        help="起動時に期待する DB の Clock mode（既定: %(default)s）。"
+        "起動設定と DB の mode が違えば MODE_MISMATCH で起動を拒否する"
+        "（計画書 第7節。test DB の利用には明示的な test 指定が必要）",
+    )
     return parser.parse_args(argv)
 
 
@@ -186,10 +198,11 @@ def main(argv: list[str] | None = None) -> int:
     db_path = _resolve_db_path(root)
     conn: sqlite3.Connection | None = None
     try:
-        # 既存 DB を開く（mode は DB に保存された値を使い、ここでは指定しない）
+        # 既存 DB を開き、起動設定と DB の Clock mode を照合する（計画書
+        # 第7節「起動設定と DB の mode が違えば起動を拒否する」）。不一致なら
+        # MODE_MISMATCH で起動を拒否し、Lifecycle を 1 つも実行しない
         conn = db.connect(db_path)
-        mode = clock.read_mode(conn)
-        del mode  # realtime / test どちらでも同じ tick_once を使う
+        clock.assert_mode(conn, domain.ClockMode(args.clock_mode))
         if args.once:
             result = tick_once(conn, actor_id=args.actor)
         else:

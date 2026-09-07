@@ -35,6 +35,8 @@ import pytest
 
 from ojp import clock, db, ledger, scheduler, service, verification
 from ojp.domain import (
+    ClockMode,
+    ErrorCode,
     JobState,
     PaymentStatus,
     TaskCatalogEntry,
@@ -231,22 +233,33 @@ def _payment(conn, business_key):
     ).fetchone()
 
 
-def _run_scheduler_once(root_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_scheduler_once(
+    root_dir: Path, *, clock_mode: str | None = "test"
+) -> subprocess.CompletedProcess[str]:
     """独立プロセスで python -m ojp.scheduler --root <path> --once --json。
 
     プロセス待機の timeout は OS の単調時計に依存する通常の subprocess
     timeout を使い、Job 期限を実時間 sleep で待たない（計画書 第7節）。
+
+    clock_mode は起動時に期待する DB の Clock mode（--clock-mode に渡す）。
+    このファイルの DB は test mode で作られているため既定は "test"
+    （第7節「test DB の利用には各プロセスで明示的な test mode 起動が必要」）。
+    None を渡すと --clock-mode を省略する（scheduler 側の既定 realtime の
+    動作を検証するため）。
     """
+    cmd = [
+        sys.executable,
+        "-m",
+        "ojp.scheduler",
+        "--root",
+        str(root_dir),
+        "--once",
+        "--json",
+    ]
+    if clock_mode is not None:
+        cmd += ["--clock-mode", clock_mode]
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "ojp.scheduler",
-            "--root",
-            str(root_dir),
-            "--once",
-            "--json",
-        ],
+        cmd,
         capture_output=True,
         text=True,
         check=False,
@@ -876,3 +889,163 @@ def test_child_approval_survives_parent_expiry(demo_db):
         == row["artifact_hash"]
     )
     assert json.loads(str(row["artifact_json"])) == {"sum": 6}
+
+
+# ---------------------------------------------------------------------------
+# Clock mode の起動照合（計画書 第7節「起動設定と DB の mode が違えば起動を
+# 拒否する」）
+#
+# 成功経路（test mode の DB に --clock-mode test で起動して正常に処理される）
+# は既存の test_subprocess_tick_once_json / test_overdue_processed_after_restart
+# / test_tick_keeps_submitted_between_lease_expiry_and_review_due が
+# _run_scheduler_once（--clock-mode test 付き）で検証している。
+# ---------------------------------------------------------------------------
+
+
+def _copy_db_to_project_root(src_path: Path, root_dir: Path) -> Path:
+    """DB ファイルを scheduler が解決する <root>/data/ojp.sqlite3 へ複製する。
+
+    呼出前に接続を閉じて WAL を checkpoint させること（既存テストと同じ手順）。
+    """
+    (root_dir / "data").mkdir(parents=True)
+    db_path = root_dir / "data" / "ojp.sqlite3"
+    db_path.write_bytes(Path(src_path).read_bytes())
+    return db_path
+
+
+def _state_snapshot(conn, root_id, child_id):
+    """起動拒否の前後比較用スナップショット（Job 状態・Acceptance・
+    PaymentOperation・Receipt・口座残高・Wallet）。"""
+    return {
+        "job_state": _job(conn, child_id)["state"],
+        "acceptances": conn.execute(
+            "SELECT COUNT(*) AS c FROM acceptances WHERE job_id = ?",
+            (child_id,),
+        ).fetchone()["c"],
+        "payments": conn.execute(
+            "SELECT COUNT(*) AS c FROM payment_operations WHERE root_id = ?",
+            (root_id,),
+        ).fetchone()["c"],
+        "receipts": conn.execute(
+            "SELECT COUNT(*) AS c FROM transfer_receipts"
+        ).fetchone()["c"],
+        "buckets": {
+            (r["owner_job_id"], r["bucket"], r["source_key"]): int(
+                r["amount_units"]
+            )
+            for r in conn.execute(
+                "SELECT owner_job_id, bucket, source_key, amount_units"
+                " FROM budget_accounts WHERE root_id = ?",
+                (root_id,),
+            )
+        },
+        "wallets": _wallets(conn),
+    }
+
+
+def test_tick_rejects_realtime_clock_mode_on_test_db(demo_db, tmp_path):
+    """計画書 第7節: test mode の DB に対して --clock-mode realtime で起動
+    すると、起動設定と DB の mode が違うため MODE_MISMATCH（終了コード 2）
+    で起動を拒否し、Lifecycle を 1 つも実行しない。
+
+    検収期限を越えた提出済み Child（一致する mode で起動すれば自動承認が
+    走る状態。成功経路は test_subprocess_tick_once_json が検証）を用意し、
+    拒否後に Job 状態・Acceptance・PaymentOperation・Receipt・口座残高・
+    Wallet が起動前から不変であることを新しい接続で確認する。
+    """
+    root_id, child_id, submission_id = _submitted_child(demo_db, suffix="mm-rt")
+    review_due_at = demo_db.conn.execute(
+        "SELECT review_due_at_us FROM submissions WHERE id = ?",
+        (submission_id,),
+    ).fetchone()["review_due_at_us"]
+    clock.set_test_now(demo_db.conn, review_due_at)
+    before = _state_snapshot(demo_db.conn, root_id, child_id)
+    # 前提: 期限を越えた提出済みで、一致 mode なら処理される状態
+    assert before["job_state"] == JobState.SUBMITTED.value
+    assert before["acceptances"] == 0
+    assert before["payments"] == 0
+
+    root_dir = tmp_path / "proj"
+    demo_db.conn.close()
+    db_path = _copy_db_to_project_root(demo_db.path, root_dir)
+
+    proc = _run_scheduler_once(root_dir, clock_mode="realtime")
+    assert proc.returncode == 2, proc.stderr
+    # stdout は単一 JSON（余計なログが混ざらない）
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    result = json.loads(lines[0])
+    assert result["error"]["code"] == ErrorCode.MODE_MISMATCH.value
+
+    # 期限処理は 1 件も実行されていない（起動前から不変）
+    conn = db.connect(db_path)
+    try:
+        after = _state_snapshot(conn, root_id, child_id)
+        assert after == before
+        assert after["job_state"] == JobState.SUBMITTED.value
+        ledger.assert_ledger_invariants(conn, root_id)
+    finally:
+        conn.close()
+
+
+def test_tick_rejects_test_clock_mode_on_realtime_db(tmp_path):
+    """計画書 第7節: realtime mode の DB に対して --clock-mode test で起動
+    すると、同じく MODE_MISMATCH（終了コード 2）で起動を拒否する。"""
+    rt_src = tmp_path / "ojp-realtime.sqlite3"
+    conn = clock.initialize_database(rt_src, ClockMode.REALTIME)
+    conn.close()
+    root_dir = tmp_path / "proj"
+    db_path = _copy_db_to_project_root(rt_src, root_dir)
+
+    proc = _run_scheduler_once(root_dir, clock_mode="test")
+    assert proc.returncode == 2, proc.stderr
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    result = json.loads(lines[0])
+    assert result["error"]["code"] == ErrorCode.MODE_MISMATCH.value
+
+    # 何も処理・記録されていない（空の DB のまま）
+    conn = db.connect(db_path)
+    try:
+        for table in (
+            "jobs",
+            "acceptances",
+            "payment_operations",
+            "transfer_receipts",
+        ):
+            assert (
+                conn.execute(
+                    f"SELECT COUNT(*) AS c FROM {table}"
+                ).fetchone()["c"]
+                == 0
+            )
+    finally:
+        conn.close()
+
+
+def test_tick_defaults_to_realtime_and_rejects_test_db(demo_db, tmp_path):
+    """計画書 第7節: --clock-mode を省略した場合は realtime として扱われ、
+    test mode の DB では MODE_MISMATCH（終了コード 2）で起動を拒否する
+    （明示しない限り test DB は使えない）。"""
+    root_id, child_id, submission_id = _submitted_child(demo_db, suffix="mm-om")
+    review_due_at = demo_db.conn.execute(
+        "SELECT review_due_at_us FROM submissions WHERE id = ?",
+        (submission_id,),
+    ).fetchone()["review_due_at_us"]
+    clock.set_test_now(demo_db.conn, review_due_at)
+    before = _state_snapshot(demo_db.conn, root_id, child_id)
+
+    root_dir = tmp_path / "proj"
+    demo_db.conn.close()
+    db_path = _copy_db_to_project_root(demo_db.path, root_dir)
+
+    proc = _run_scheduler_once(root_dir, clock_mode=None)
+    assert proc.returncode == 2, proc.stderr
+    result = json.loads(proc.stdout.strip())
+    assert result["error"]["code"] == ErrorCode.MODE_MISMATCH.value
+
+    conn = db.connect(db_path)
+    try:
+        assert _state_snapshot(conn, root_id, child_id) == before
+    finally:
+        conn.close()

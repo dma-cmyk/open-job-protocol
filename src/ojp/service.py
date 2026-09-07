@@ -3465,7 +3465,8 @@ def resolve_due_disputes(
                 # FAIL が異議の condition_id に起因するかは arbitrate が
                 # 保存データから導出した condition_matched を使う（呼出側で
                 # 文字列比較をしない。第12節「既存条件への FAIL が再現された
-                # 場合だけ FAILED」）。PASS 経路は帰属が無いため True。
+                # 場合だけ FAILED」）。PASS 経路は FAIL を再現していない
+                # ため帰属が無く False。
                 # FAIL でも原因 condition が特定できない（構造 FAIL）、
                 # または異議の condition_id と一致しない場合は False
                 # （異議は成立しなかったとして承認側へ収束する）
