@@ -57,6 +57,11 @@ _OPERATION_ID_KINDS = (
     "heartbeat",
     "expiry",
     "abandon",
+    "submit",
+    "approve",
+    "dispute",
+    "auto-approve",
+    "resolve",
 )
 
 

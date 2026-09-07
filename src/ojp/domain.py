@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -247,12 +247,22 @@ class SubcontractPolicy(_StrictModel):
 
 
 class TimingPolicy(_StrictModel):
-    """デモ既定値: Lease 60秒 / heartbeat 20秒 / 検収30秒 / 異議判定30秒。"""
+    """デモ既定値: Lease 60秒 / heartbeat 20秒 / 検収30秒 / 異議判定30秒。
+
+    unresponsive_arbiter_fallback は裁定無応答時の fallback 方針
+    （計画書 第12節「この fallback を JobVersion に事前記録する」）。
+    公開 Version の timing_policy 列へ保存され、resolve_due_disputes は
+    この保存値を読んで適用する。None（既定）は「記録が無い古い Job」と
+    同じ扱いで、fallback しない。
+    """
 
     lease_seconds: Annotated[int, Field(gt=0, strict=True)] = 60
     heartbeat_seconds: Annotated[int, Field(gt=0, strict=True)] = 20
     review_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
     dispute_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
+    unresponsive_arbiter_fallback: (
+        Literal["stored_pass"] | None
+    ) = "stored_pass"
 
 
 class ArtifactAccessPolicy(_StrictModel):
