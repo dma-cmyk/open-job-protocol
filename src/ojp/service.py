@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import clock, db, domain, ledger
+from . import clock, db, domain, ledger, verification
 from .domain import (
     Bucket,
     ErrorCode,
@@ -53,6 +53,11 @@ _KIND_PREFIXES = {
     "heartbeat": "heartbeat",
     "expiry": "expiry",
     "abandon": "abandon",
+    "submit": "submit",
+    "approve": "approve",
+    "dispute": "dispute",
+    "auto-approve": "auto-approve",
+    "resolve": "resolve",
 }
 
 
@@ -168,6 +173,54 @@ class CommandResult:
     data: dict[str, Any]
     operation_id: str
     replayed: bool = False
+
+
+def _reject_operation_id_reuse(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str | None,
+    actor_id: str,
+    kind: str,
+    payload: dict[str, Any],
+) -> None:
+    """既存 operations 行との照合を前置検査より先に確定する（計画書 第16節
+    「operation_id UNIQUE＋actor/kind/payload_hash照合。同ID別payloadや別
+    Actorでの再利用はIDEMPOTENCY_CONFLICT」）。
+
+    approve のような業務キー再利用（reuse_existing_payment）の前置検査を
+    持つコマンドでは、前置検査が _run_idempotent の照合より先に動くと、
+    同じ operation_id を別 Actor / 別 payload で再利用したとき所定の
+    IDEMPOTENCY_CONFLICT ではなく FORBIDDEN / INVALID_TARGET に化ける。
+    それを防ぐため、前置検査の先頭（ドメイン検査より前）で呼び、
+    operation_id 照合を常に最優先にする。
+
+    - operation_id が None（呼出側で未指定）なら何もしない
+      （_run_idempotent が新規採番するため照合対象が存在しない）
+    - operations に行が無ければ何もしない（新規の operation_id）
+    - actor_id / kind / payload_hash のいずれかが不一致なら
+      OjpError(IDEMPOTENCY_CONFLICT)。比較は _run_idempotent と同じ
+      （payload は _run_idempotent へ渡すものと同一の dict を渡し、
+      同じ _payload_hash(payload) で照合する）
+    - 一致する場合は何もしない（_run_idempotent の replay 経路に任せる）
+    """
+    if operation_id is None:
+        return
+    existing = conn.execute(
+        "SELECT actor_id, kind, payload_hash FROM operations"
+        " WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    if existing is None:
+        return
+    if (
+        existing["actor_id"] != actor_id
+        or existing["kind"] != kind
+        or existing["payload_hash"] != _payload_hash(payload)
+    ):
+        raise OjpError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "operation_id was already used with a different actor/kind/payload",
+        )
 
 
 def _run_idempotent(
@@ -954,6 +1007,14 @@ def heartbeat(
 # 呼出側から受け取る。
 
 
+def _is_system_actor(conn: sqlite3.Connection, actor_id: str) -> bool:
+    """Actor が DB に登録された system Participant かどうか（True/False）。"""
+    row = conn.execute(
+        "SELECT kind FROM participants WHERE id = ?", (actor_id,)
+    ).fetchone()
+    return row is not None and row["kind"] == domain.ParticipantKind.SYSTEM.value
+
+
 def _require_system_actor(conn: sqlite3.Connection, actor_id: str) -> None:
     """Lifecycle（expire_due_leases / reserve_refundable_balance）の呼出側が
     DB に登録された system Participant であることを検査する（計画書 第14節
@@ -965,10 +1026,7 @@ def _require_system_actor(conn: sqlite3.Connection, actor_id: str) -> None:
     両方で行う。対象収集後に Participant の kind が変更される可能性を
     残さないため、transaction 内でもう一度検証する。
     """
-    row = conn.execute(
-        "SELECT kind FROM participants WHERE id = ?", (actor_id,)
-    ).fetchone()
-    if row is None or row["kind"] != domain.ParticipantKind.SYSTEM.value:
+    if not _is_system_actor(conn, actor_id):
         raise OjpError(
             ErrorCode.FORBIDDEN,
             f"actor {actor_id!r} is not a registered system participant"
@@ -1277,7 +1335,11 @@ def _job_terminal_fund_effects(
 
     - Child（parent_id IS NOT NULL）: _child_terminal_fund_effects。
       Parent 生存中なら child_work → available、Parent 終端後なら
-      child_work → available → refund の追加返金を 1 transaction で確定する
+      child_work → available → refund の追加返金を 1 transaction で確定する。
+      Child が DONE で送金障害中（PENDING / RETRYABLE）なら失敗返却を
+      禁止する（第9節。_child_done_with_pending_payment による DB 導出を
+      含む。dispute FAIL 等の Phase 4 経路がこの禁止をすり抜けないように
+      この関数内で判定する）
     - Root: _reserve_terminal_refund_with_payment_in_tx（= 計画書 第15節
       Lifecycle reserve_refundable_balance の終端行）。未拘束 available だけを
       refund:{root_id}:terminal の返金予約へ移し PaymentOperation を確定する。
@@ -1286,6 +1348,18 @@ def _job_terminal_fund_effects(
       child_work / child_payout を一切変更しない
     """
     if job["parent_id"] is not None:
+        # Child が DONE で送金障害中は失敗返却を禁止する（第9節）。
+        # _child_terminal_fund_effects は同じ transaction 内の Parent 状態
+        # で Parent 生存中（return:{child_id}）と Parent 終端後
+        # （refund:{root_id}:child-return:{child_id}）の両方の原資を動かす
+        # ため、送金待ちの child_payout を誤って失敗側へ流さないように
+        # ここで拒否する
+        if _child_done_with_pending_payment(conn, str(job["id"])):
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "child is DONE with payment pending; failure return is"
+                " forbidden (計画書 第9節)",
+            )
         return _child_terminal_fund_effects(
             conn, job=job, actor_id=actor_id, operation_id=operation_id, now_us=now
         )
@@ -1545,6 +1619,13 @@ def abandon(
     Child の Worker B なら INVALID_STATE となる。いずれも Child を失敗へ
     変更できない。Requester の一方的 fail には使えない（FORBIDDEN）。
 
+    **存在しない Lease は Actor 検査より先に INVALID_TARGET**: 第14節の
+    「対象 Job の Lease に記録された Worker との Actor 一致」は Lease 行
+    （履歴を含む）から Actor を確認する手続きであるため、Lease 行が無けれ
+    ば「確認対象が存在しない」INVALID_TARGET が先になる（権限の有無を
+    Leap せず確認できた事実だけに基づいて判定する。N04 の A による
+    abandon CHILD --lease B_LEASE は Lease 行が存在するため FORBIDDEN）。
+
     成功時: Lease を closed_reason='abandoned' で閉じ、Job を FAILED にする。
     資金の後始末は失効処理と同じ規則（計画書 第8節の表。
     _job_terminal_fund_effects）: Root は未拘束 available を返金予約
@@ -1555,9 +1636,11 @@ def abandon(
     payload = {"job_id": job_id, "lease_id": lease_id}
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 0. Lease 行の存在（無ければ INVALID_TARGET。Actor 検査の材料に
+        #    なる Lease 行が無い場合は先に INVALID_TARGET）
+        lease_row = _get_lease_row(c, lease_id)
         # 1. Lease に記録された Worker との Actor 一致（FORBIDDEN）。
         #    提出後も Lease 履歴で Actor を確認する（第14節）
-        lease_row = _get_lease_row(c, lease_id)
         if lease_row["job_id"] != job_id:
             raise OjpError(
                 ErrorCode.INVALID_TARGET,
@@ -1779,6 +1862,9 @@ def create_child(
     Child の成功条件は Root 公開 Version の task_catalog の該当エントリから
     導出する（input_values → input_json、expected → conditions_json と
     conditions_hash、verifier_id/hash は Root 公開 Version から継承）。
+    timing_policy はカタログ entry に timing_policy があればその値（Root
+    Requester の事前許可。第8節の延長）、無ければ Root 公開版を継承する。
+    A が timing を引数で指定することはできない（すり替えを許さない）。
     成功条件・検証器・入力・受取人のすり替えは引数として受け付けない
     （第5節「MCP 引数に actor_id・payee_id を受け付けない」、第15節より
     MCP と CLI は同じ Application API を呼ぶ。X06 の期待結果は「拒否」であり
@@ -1969,10 +2055,12 @@ def create_child(
             )
         # --- Child Job・JobVersion の作成と資金拘束を同じ transaction で確定 ---
         # 固定するもの: 作成時の A（requester_id）、creator_lease_id = 現在の
-        # Parent Lease、Root policy（timing / artifact access は Root 公開版を
-        # 継承）、指定 task_key（第8節）。Child からの再委託は必ず拒否される
-        # ため、Child の JobVersion には無効化した policy と空のカタログを
-        # 保存する（スキーマの CHECK「Childのparent_idはRootのみ」と一致）
+        # Parent Lease、Root policy（artifact access は Root 公開版を継承、
+        # timing はカタログ entry の事前許可があればそれを使い、無ければ
+        # Root 公開版を継承）、指定 task_key（第8節）。Child からの再委託は
+        # 必ず拒否されるため、Child の JobVersion には無効化した policy と
+        # 空のカタログを保存する（スキーマの CHECK「Childのparent_idは
+        # Rootのみ」と一致）
         child_version_id = f"version:{child_id}:1"
         c.execute(
             "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
@@ -2001,6 +2089,17 @@ def create_child(
             max_children=0,
             max_depth=0,
         )
+        # Child の timing_policy: カタログ entry に timing_policy があれば
+        # それを使う（Root Requester の事前許可。第8節の延長）。無ければ
+        # 従来どおり Root 公開版の timing を継承する。A が引数で timing を
+        # 指定することはできない（すり替えを許さない。カタログの値だけを
+        # 使う）
+        if entry.timing_policy is not None:
+            child_timing_json = ledger.canonical_json_dumps(
+                entry.timing_policy.model_dump()
+            )
+        else:
+            child_timing_json = parent_version["timing_policy"]
         c.execute(
             "INSERT INTO job_versions (id, job_id, version, title, budget_units,"
             " asset, input_json, verifier_id, verifier_hash, conditions_json,"
@@ -2020,7 +2119,7 @@ def create_child(
                 child_conditions_hash,
                 ledger.canonical_json_dumps(child_policy.model_dump()),
                 "[]",
-                parent_version["timing_policy"],
+                child_timing_json,
                 parent_version["artifact_access_policy"],
                 deadline_us,
             ),
@@ -2062,6 +2161,1675 @@ def create_child(
         payload=payload,
         apply_effects=_apply,
     )
+
+
+# ---------------------------------------------------------------------------
+# Submit（計画書 第11節「有効な提出の境界」）
+# ---------------------------------------------------------------------------
+
+
+def submit(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    lease_id: str,
+    version_id: str,
+    artifact_json: str,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Worker の成果物提出（計画書 第11節「有効な提出の境界」5 手順）。
+
+    シグネチャは MCP の ojp_submit 引数（job_id, lease_id, version_id,
+    artifact_json。第13節）だけを持つ。expected / input_values / verifier_id /
+    payee_id / amount は受け付けない（A/B が提出と一緒に期待結果・テスト・
+    判定器を渡しても採用しない。第11節。create_child と同じ方針で、渡すと
+    TypeError になる）。generation もシグネチャに持たせず、lease_id で読んだ
+    leases 行の generation をそのまま require_active_lease へ渡す（呼出側に
+    世代を要求しない）。
+
+    apply_effects 内の 5 手順（この順序で行う）:
+
+    1. verification.assert_submission_failpoints_allowed を、何も書く前に呼ぶ
+    2. 権限・状態の検査（この順序。ここで失敗した場合は SubmissionAttempt
+       を残さない。提出権を持たない呼出だから）:
+       2-1. _get_job_row → 無ければ INVALID_TARGET
+       2-2. _get_lease_row で generation を読み、require_active_lease
+            （共通判定: 別 Job → INVALID_TARGET / 閉じた Lease →
+            LEASE_EXPIRED / generation → LEASE_EXPIRED / 別 Worker →
+            FORBIDDEN / 期限 → LEASE_EXPIRED）
+       2-3. Job が LEASED でなければ INVALID_STATE（SUBMITTED への二重提出・
+            終端 Job への提出の拒否）
+       2-4. version_id が jobs.version_id（公開版）と一致しなければ
+            INVALID_TARGET（古い Version の提出拒否）。Lease の version_id
+            とも一致すること
+       2-5. Root（parent_id IS NULL）が Child を 1 件以上持つ場合、全 Child
+            が DONE / FAILED / EXPIRED でなければ CHILDREN_UNRESOLVED
+            （第8節「Parent提出は全Childが判定上の終端状態になってから」）。
+            Child が DONE で送金待ち（PaymentOperation が PENDING/RETRYABLE）
+            でも Parent 提出は妨げない
+    3. 固定 JSON 検証: 公開 Version の input_json / conditions_json /
+       verifier_id / verifier_hash から verification.verify_artifact を呼ぶ
+       （期待値・入力・検証器の版は公開 Version 由来だけを使う）
+    4. PASS の場合: submissions に 1 行 INSERT（artifact_json は canonical
+       形式、review_due_at_us = now + review_window_seconds * 1_000_000）/
+       submission_attempts に outcome='PASS' の監査行 / jobs.state='SUBMITTED'・
+       active_lease_id=NULL / leases.closed_reason='submitted' / events に 1 行。
+       verification.failpoint_before_submission_commit は submissions と Job
+       更新を書いた直後・apply_effects から return する直前に発火する
+       （seam が例外を投げれば transaction 全体が rollback して保存失敗を
+       再現できる）
+    5. FAIL の場合: submission_attempts に outcome='FAIL'・reason=<理由コード>
+       を INSERT する。Job は LEASED のまま、Lease は開いたまま、submissions
+       は作らず、review_due_at も支払い予約も作らない。
+
+    **FAIL のエラー伝播**: apply_effects の中で例外を投げると Attempt 行も
+    rollback されてしまうため、apply_effects は FAIL 情報を結果 dict として
+    返し、_run_idempotent が commit した**後**に、submit 本体が
+    OjpError(VERIFICATION_FAILED, details={"reason": ..., "attempt_id": ...})
+    を投げる。これにより同じ operation_id での再送は _run_idempotent の
+    replay 経路で保存済み結果（outcome=FAIL）を読み、同じ VERIFICATION_FAILED
+    を決定的に再現する。
+
+    **business_key について**: submit は business_key=None とし、operation_id
+    の冪等性だけで重複提出を防ぐ。submit:{job_id} のような業務キーを付けると
+    FAIL 後の期限内修正再提出（同じ Lease・新しい operation_id）が business_key
+    衝突で作れなくなるためである。Job 当たり有効 Submission 1 件は、
+    submissions_one_valid_per_job UNIQUE index と手順 2-3 の LEASED 検査
+    （SUBMITTED 以外は拒否）で保証される。
+
+    検証器の版不整合・入力不備は verify_artifact が OjpError(
+    VERIFICATION_UNAVAILABLE) を投げる（Worker の検証 FAIL とは区別。
+    第11節）。この例外は submit の検証 FAIL 経路とは違い transaction ごと
+    rollback される（Attempt に残すべき「Worker の提出内容」の欠陥では
+    ないため）。
+
+    期限内の修正再提出（同じ Lease・新しい operation_id）は成功する。
+    JobVersion の変更は不可（手順 2-4 が拒否する）。
+    """
+    payload = {
+        "job_id": job_id,
+        "lease_id": lease_id,
+        "version_id": version_id,
+        "artifact_json": artifact_json,
+    }
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 1. failpoint seam は test mode の DB でのみ有効。何も書く前に検査
+        verification.assert_submission_failpoints_allowed(c)
+        # 2. 権限・状態の検査（ここで失敗した場合は Attempt を残さない）
+        job = _get_job_row(c, job_id)
+        lease_row = _get_lease_row(c, lease_id)
+        require_active_lease(
+            c, job_id, lease_id, int(lease_row["generation"]), actor_id, now
+        )
+        if job["state"] != JobState.LEASED.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job must be LEASED to submit (current state: {job['state']})."
+                " 有効提出後の二重提出・終端 Job への提出は拒否される",
+            )
+        if version_id != job["version_id"]:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                "version_id does not match the published version"
+                f" (published: {job['version_id']}, got: {version_id})."
+                " 古い Version の提出は拒否される",
+            )
+        if version_id != lease_row["version_id"]:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                "version_id does not match the lease's version"
+                f" (lease: {lease_row['version_id']}, got: {version_id})",
+            )
+        # 2-5. Parent 提出は全 Child が判定上の終端状態になってから
+        if job["parent_id"] is None:
+            unresolved = c.execute(
+                "SELECT id, state FROM jobs WHERE parent_id = ?"
+                " AND state NOT IN (?, ?, ?)",
+                (
+                    job_id,
+                    JobState.DONE.value,
+                    JobState.FAILED.value,
+                    JobState.EXPIRED.value,
+                ),
+            ).fetchall()
+            if unresolved:
+                raise OjpError(
+                    ErrorCode.CHILDREN_UNRESOLVED,
+                    f"job {job_id} has children not in a terminal state:"
+                    f" {[{'id': r['id'], 'state': r['state']} for r in unresolved]}."
+                    " Parent提出は全Childが判定上の終端状態になってから"
+                    "（第8節）。Child DONE の送金待ちは妨げない",
+                )
+        # 3. 固定 JSON 検証（期待値・入力・検証器の版は公開 Version 由来）
+        version_row = _get_job_version_row(c, version_id)
+        if (
+            version_row["input_json"] is None
+            or version_row["conditions_json"] is None
+            or version_row["verifier_id"] is None
+            or version_row["verifier_hash"] is None
+        ):
+            raise OjpError(
+                ErrorCode.VERIFICATION_UNAVAILABLE,
+                f"published version {version_id} lacks verification inputs"
+                " (input_json / conditions_json / verifier_id / verifier_hash)",
+            )
+        conditions_hash = hashlib.sha256(
+            version_row["conditions_json"].encode("utf-8")
+        ).hexdigest()
+        if version_row["conditions_hash"] is not None and (
+            conditions_hash != version_row["conditions_hash"]
+        ):
+            raise OjpError(
+                ErrorCode.VERIFICATION_UNAVAILABLE,
+                "published conditions_json does not match conditions_hash"
+                f" (version: {version_id})",
+            )
+        outcome = verification.verify_artifact(
+            raw_artifact=artifact_json,
+            input_values=json.loads(version_row["input_json"]),
+            expected=json.loads(version_row["conditions_json"]),
+            verifier_id=version_row["verifier_id"],
+            verifier_hash_value=version_row["verifier_hash"],
+        )
+        attempt_id = f"attempt:{op_id}"
+        if outcome.result == domain.VerificationResult.FAIL:
+            # 5. FAIL: Attempt だけ記録して LEASED のまま。apply_effects の
+            #    中で例外を投げると Attempt 行も rollback されるため、
+            #    結果を返して commit 後に submit 本体がエラーを投げる
+            c.execute(
+                "INSERT INTO submission_attempts (id, job_id, lease_id,"
+                " input_hash, outcome, reason, attempted_at_us)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    attempt_id,
+                    job_id,
+                    lease_id,
+                    outcome.input_hash,
+                    domain.VerificationResult.FAIL.value,
+                    outcome.reason,
+                    now,
+                ),
+            )
+            return {
+                "outcome": domain.VerificationResult.FAIL.value,
+                "reason": outcome.reason,
+                "attempt_id": attempt_id,
+                "job_state": JobState.LEASED.value,
+                "input_hash": outcome.input_hash,
+            }
+        # 4. PASS: submissions 1 行 + 監査用 attempt 1 行 + Job SUBMITTED 化
+        #    + Lease を submitted で閉じる + events 1 行
+        submission_id = f"submission:{op_id}"
+        timing, _deadline_us = _get_job_version_timing(c, version_id)
+        review_due_at_us = now + timing.review_window_seconds * 1_000_000
+        c.execute(
+            "INSERT INTO submissions (id, job_id, lease_id, version_id,"
+            " artifact_json, artifact_hash, verification_result,"
+            " verification_evidence, submitted_at_us, valid_at_us,"
+            " review_due_at_us)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                submission_id,
+                job_id,
+                lease_id,
+                version_id,
+                outcome.canonical_artifact,
+                outcome.artifact_hash,
+                domain.VerificationResult.PASS.value,
+                outcome.evidence,
+                now,
+                now,
+                review_due_at_us,
+            ),
+        )
+        c.execute(
+            "INSERT INTO submission_attempts (id, job_id, lease_id,"
+            " input_hash, outcome, reason, attempted_at_us)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                job_id,
+                lease_id,
+                outcome.input_hash,
+                domain.VerificationResult.PASS.value,
+                outcome.reason,
+                now,
+            ),
+        )
+        cursor = c.execute(
+            "UPDATE jobs SET state = ?, active_lease_id = NULL,"
+            " row_version = row_version + 1"
+            " WHERE id = ? AND state = ? AND active_lease_id = ?"
+            " AND row_version = ?",
+            (
+                JobState.SUBMITTED.value,
+                job_id,
+                JobState.LEASED.value,
+                lease_id,
+                int(job["row_version"]),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "job state changed concurrently during submit"
+                f" (job={job_id})",
+            )
+        c.execute(
+            "UPDATE leases SET closed_reason = ? WHERE id = ?"
+            " AND closed_reason IS NULL",
+            (LeaseClosedReason.SUBMITTED.value, lease_id),
+        )
+        c.execute(
+            "INSERT INTO events (root_id, job_id, actor_id, action, object_id,"
+            " at_us) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                job["root_id"],
+                job_id,
+                actor_id,
+                "submit",
+                submission_id,
+                now,
+            ),
+        )
+        # failpoint: submissions と Job 更新を書いた直後・return 直前に発火。
+        # seam が例外を投げれば transaction 全体が rollback する（保存失敗）
+        verification.fire_before_submission_commit(c)
+        return {
+            "submission_id": submission_id,
+            "artifact_hash": outcome.artifact_hash,
+            "verification": domain.VerificationResult.PASS.value,
+            "state": JobState.SUBMITTED.value,
+            "review_due_at": review_due_at_us,
+            "valid_at": now,
+            "attempt_id": attempt_id,
+        }
+
+    try:
+        result = _run_idempotent(
+            conn,
+            actor_id=actor_id,
+            kind="submit",
+            operation_id=operation_id,
+            business_key=None,
+            payload=payload,
+            apply_effects=_apply,
+        )
+    except OjpError:
+        raise
+    except sqlite3.OperationalError as exc:
+        if db.is_db_busy(exc):
+            # DB_BUSY は _run_idempotent の扱いを変えない（同一 operation_id
+            # での transaction 再試行・有限回で打ち切り）
+            raise
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            "storage failure while persisting the submission"
+            f" (sqlite error: {exc})",
+        ) from exc
+    except Exception as exc:
+        # 保存フェーズ（submissions・Job 更新・events の書込）で発生した
+        # 予期しない例外は再試行可能エラーへ正規化する（第11節「一時的
+        # DB 失敗は再試行可能エラーとして Worker の検証 FAIL と区別する」）。
+        # transaction は rollback 済み。生の例外を呼出側へ漏らさない
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            f"storage failure while persisting the submission: {exc!r}",
+        ) from exc
+    if result.data.get("outcome") == domain.VerificationResult.FAIL.value:
+        # commit 後に投げる。同じ operation_id の再送は replay 経路で
+        # 保存済み結果から同じ VERIFICATION_FAILED を再現する（決定的）
+        raise OjpError(
+            ErrorCode.VERIFICATION_FAILED,
+            f"artifact verification failed: {result.data['reason']}",
+            details={
+                "reason": result.data["reason"],
+                "attempt_id": result.data["attempt_id"],
+            },
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Approval / Dispute（計画書 第12節）
+# ---------------------------------------------------------------------------
+
+
+def _get_valid_submission_row(
+    conn: sqlite3.Connection, job_id: str, submission_id: str
+) -> sqlite3.Row:
+    """Job の保存済み有効 Submission 行を引く（無ければ INVALID_TARGET）。
+
+    「その Job の」Submission であることも検査する（別 Job の submission_id
+    渡しは INVALID_TARGET）。
+    """
+    row = conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (submission_id,)
+    ).fetchone()
+    if row is None or row["job_id"] != job_id:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET,
+            f"submission not found for job {job_id}: {submission_id}",
+        )
+    return row
+
+
+def _approve_effects(
+    conn: sqlite3.Connection,
+    *,
+    job: sqlite3.Row,
+    submission: sqlite3.Row,
+    actor_id: str,
+    decided_by: str,
+    reason: str | None,
+    operation_id: str,
+    now: int,
+) -> dict[str, Any]:
+    """approve / 自動承認 / 裁定 PASS で共有する効果の適用（1 transaction 内）。
+
+    - acceptances に decision='APPROVED'・decided_by・reason を 1 件
+    - jobs.state='DONE'・row_version+1・active_lease_id=NULL（条件付き UPDATE）
+    - Child は ledger.child_approval_in_tx ＋ payout:{child_id} の
+      PaymentOperation、Root は ledger.parent_approval_in_tx ＋
+      payout:{root_id}（受取人は submissions.lease_id の Worker）
+    - events に 1 行
+
+    Job の検収（DONE）と送金状態を分離する: DONE は送金結果に依存せず、
+    paid は process_payments が Receipt を確定したときだけ増える
+    （APPROVED / DONE だけでは paid を増やさない）。
+    """
+    job_id = str(job["id"])
+    root_id = str(job["root_id"])
+    # 受取人は当該 Lease の Worker（amount / payee を引数に持たない。第12節）
+    lease = conn.execute(
+        "SELECT worker_id FROM leases WHERE id = ?", (submission["lease_id"],)
+    ).fetchone()
+    if lease is None:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            f"lease not found for submission: {submission['lease_id']}",
+        )
+    payee_id = str(lease["worker_id"])
+    conn.execute(
+        "INSERT INTO acceptances (job_id, submission_id, decision, decided_by,"
+        " reason, decided_at_us) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            job_id,
+            submission["id"],
+            domain.AcceptanceDecision.APPROVED.value,
+            decided_by,
+            reason,
+            now,
+        ),
+    )
+    cursor = conn.execute(
+        "UPDATE jobs SET state = ?, active_lease_id = NULL,"
+        " row_version = row_version + 1"
+        " WHERE id = ? AND row_version = ?",
+        (JobState.DONE.value, job_id, int(job["row_version"])),
+    )
+    if cursor.rowcount != 1:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            "job state changed concurrently during approve"
+            f" (job={job_id})",
+        )
+    if job["parent_id"] is not None:
+        amount_units = _read_child_work_units(conn, job_id)
+        business_key = f"payout:{job_id}"
+        data = ledger.child_approval_in_tx(
+            conn,
+            root_id=root_id,
+            child_id=job_id,
+            amount_units=amount_units,
+            operation_id=operation_id,
+            now_us=now,
+        )
+        payment = _attach_payment_operation(
+            conn,
+            data=data,
+            operation_id=operation_id,
+            business_key=business_key,
+            root_id=root_id,
+            job_id=job_id,
+            payee_id=payee_id,
+            kind=PaymentKind.PAYOUT,
+        )
+    else:
+        amount_units = _read_available_units(conn, root_id)
+        business_key = f"payout:{root_id}"
+        data = ledger.parent_approval_in_tx(
+            conn,
+            root_id=root_id,
+            amount_units=amount_units,
+            operation_id=operation_id,
+            now_us=now,
+        )
+        payment = _attach_payment_operation(
+            conn,
+            data=data,
+            operation_id=operation_id,
+            business_key=business_key,
+            root_id=root_id,
+            job_id=root_id,
+            payee_id=payee_id,
+            kind=PaymentKind.PAYOUT,
+        )
+    conn.execute(
+        "INSERT INTO events (root_id, job_id, actor_id, action, object_id,"
+        " at_us) VALUES (?, ?, ?, ?, ?, ?)",
+        (root_id, job_id, actor_id, "approve", submission["id"], now),
+    )
+    return {
+        "job_id": job_id,
+        "submission_id": str(submission["id"]),
+        "state": JobState.DONE.value,
+        "decision": domain.AcceptanceDecision.APPROVED.value,
+        "decided_by": decided_by,
+        "amount_units": amount_units,
+        "payee_id": payee_id,
+        **payment,
+    }
+
+
+def approve(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    submission_id: str,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Requester の検収承認（計画書 第12節）。
+
+    シグネチャは amount / payee_id / payee を持たない（渡すと TypeError。
+    第12節「amount/payee を approve 引数に持たせず、受取人は当該 Lease の
+    Worker とする」）。受取人は submissions.lease_id から引いた
+    leases.worker_id。
+
+    検査順序（この順序で確定する）:
+
+    1. _get_job_row → 無ければ INVALID_TARGET
+    2. Job が SUBMITTED でなければ INVALID_STATE（DISPUTED・終端・LEASED
+       を拒否。approve と dispute の競合は、先に commit した有効遷移が
+       手順 2 の状態検査で勝つ）
+    3. submission_id がその Job の保存済み有効 Submission でなければ
+       INVALID_TARGET
+    4. actor_id がその Job の requester_id（Child なら作成時の A、Root なら
+       Root Requester）でなければ FORBIDDEN。非検収者・無関係 Actor・
+       Worker 本人・Root Requester による Child approve を拒否する
+    5. 保存済み Submission の verification_result が 'PASS'、version_id が
+       現在の公開版と一致、artifact_hash が保存 artifact_json の canonical
+       hash と一致することを必須にする。不一致は INVALID_STATE
+    6. now >= review_due_at_us の場合も承認自体は許可する（期限後は自動
+       承認と同じ結論になる。ただし有効な異議が既に記録されていれば
+       手順 2 の状態検査で DISPUTED として拒否される）
+
+    効果（1 transaction）: acceptances に APPROVED／jobs.state='DONE'／
+    Child なら child_work -X / child_payout +X ＋ payout:{child_id} の
+    PaymentOperation、Root なら available -X / parent_payout +X ＋
+    payout:{root_id}／events 1 行。送金は process_payments が別途処理する
+    （DONE は送金結果に依存しない）。
+
+    冪等性: 同一 operation_id の再送は _run_idempotent の replay。別
+    operation_id での二重 approve は business_key=payout:{...} の
+    既存 PaymentOperation を返す（Acceptance・PaymentOperation・Receipt は
+    それぞれ 1 件だけ。N05・第16節）。ただし業務キー再利用の経路でも
+    権限・対象・状態の前置検査（Job 存在・Submission 所属・requester_id・
+    既存 APPROVED Acceptance）は _run_idempotent の前に読取 transaction
+    で確定する（別 Actor・誤った submission_id は再利用経路でも拒否）。
+    """
+    payload = {
+        "job_id": job_id,
+        "submission_id": submission_id,
+    }
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 1. Job の存在
+        job = _get_job_row(c, job_id)
+        # 2. SUBMITTED でなければ INVALID_STATE
+        if job["state"] != JobState.SUBMITTED.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job must be SUBMITTED to approve (current state: {job['state']})."
+                " DISPUTED・終端・LEASED の approve は拒否される",
+            )
+        # 3. 有効 Submission
+        submission = _get_valid_submission_row(c, job_id, submission_id)
+        # 4. 検収者権限（Job の requester_id のみ）
+        if actor_id != job["requester_id"]:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not the requester of job {job_id}"
+                f" (requester: {job['requester_id']})."
+                " 検収はその Job の Requester のみ（第12節）",
+            )
+        # 5. 保存済み PASS・公開版一致・artifact_hash 一致
+        if submission["verification_result"] != domain.VerificationResult.PASS.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "stored submission is not a verified PASS"
+                f" (result: {submission['verification_result']})",
+            )
+        if job["version_id"] is None or submission["version_id"] != job["version_id"]:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "submission version does not match the published version"
+                f" (published: {job['version_id']},"
+                f" submission: {submission['version_id']})",
+            )
+        artifact_hash = hashlib.sha256(
+            str(submission["artifact_json"]).encode("utf-8")
+        ).hexdigest()
+        if artifact_hash != submission["artifact_hash"]:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "stored artifact_json does not match the stored artifact_hash"
+                f" (submission: {submission['id']})",
+            )
+        # 6. now >= review_due_at でも承認は許可（自動承認と同じ結論）
+        return _approve_effects(
+            c,
+            job=job,
+            submission=submission,
+            actor_id=actor_id,
+            decided_by=actor_id,
+            reason=None,
+            operation_id=op_id,
+            now=now,
+        )
+
+    # business_key は payout:{job_id}（Child も Root も同じ形。第16節の表）。
+    # Job が存在しない場合は _apply 内の _get_job_row が INVALID_TARGET を
+    # 投げるため、ここでは business_key=None のまま通す
+    job_row = conn.execute(
+        "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    business_key = f"payout:{job_id}" if job_row is not None else None
+
+    # 前置検査（読取 transaction）: _run_idempotent の reuse_existing_payment
+    # 経路（既存 payout:{job_id} があると apply_effects を呼ばずに既存結果を
+    # 返す）でも権限・状態・対象の検査がすり抜けないように、業務キー再利用の
+    # 可否を先に確定する（R2。N05 の再利用経路そのものは維持する）:
+    #   0. operation_id 照合（最優先。第16節）: 同じ operation_id を別
+    #      Actor / 別 payload（別 submission_id・別 job_id）で再利用した
+    #      場合は、ドメイン検査より先に IDEMPOTENCY_CONFLICT とする。
+    #      一致する再送は _run_idempotent の replay 経路に任せる
+    #   1. Job が無ければ INVALID_TARGET
+    #   2. submission_id がその Job の保存済み Submission でなければ
+    #      INVALID_TARGET
+    #   3. actor_id がその Job の requester_id でなければ FORBIDDEN
+    #   4. Job が SUBMITTED ならそのまま進む（通常の承認経路）
+    #   5. Job が SUBMITTED ではないが、その Job の acceptances 行が存在し
+    #      submission_id が一致し decision='APPROVED' なら、既存結果を返す
+    #      経路（業務キー再利用）へ進んでよい
+    #   6. それ以外（LEASED / DISPUTED / 終端で Acceptance が無い、または
+    #      Acceptance の submission_id が違う）は INVALID_STATE
+    with db.transaction(conn, immediate=False):
+        _reject_operation_id_reuse(
+            conn,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            kind="approve",
+            payload=payload,
+        )
+        job = _get_job_row(conn, job_id)
+        submission = conn.execute(
+            "SELECT job_id FROM submissions WHERE id = ?", (submission_id,)
+        ).fetchone()
+        if submission is None or submission["job_id"] != job_id:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"submission not found for job {job_id}: {submission_id}",
+            )
+        if actor_id != job["requester_id"]:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not the requester of job {job_id}"
+                f" (requester: {job['requester_id']})."
+                " 検収はその Job の Requester のみ（第12節）",
+            )
+        if job["state"] != JobState.SUBMITTED.value:
+            acceptance = conn.execute(
+                "SELECT submission_id, decision FROM acceptances"
+                " WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not (
+                acceptance is not None
+                and acceptance["submission_id"] == submission_id
+                and acceptance["decision"]
+                == domain.AcceptanceDecision.APPROVED.value
+            ):
+                raise OjpError(
+                    ErrorCode.INVALID_STATE,
+                    f"job must be SUBMITTED to approve"
+                    f" (current state: {job['state']})."
+                    " 既存の APPROVED Acceptance が無い状態での再利用も拒否される",
+                )
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="approve",
+        operation_id=operation_id,
+        business_key=business_key,
+        payload=payload,
+        apply_effects=_apply,
+        reuse_existing_payment=True,
+        payment_kind=PaymentKind.PAYOUT,
+    )
+
+
+# dispute で受理する固定の理由コード（計画書 第12節）。価格交渉・新条件・
+# 主観的な不満はこの集合に入れないことで受理しない。
+DISPUTE_REASON_CODES = frozenset({"CONDITION_MISMATCH", "ARTIFACT_INTEGRITY"})
+
+
+def _auto_approve_submission(
+    conn: sqlite3.Connection,
+    *,
+    submission_id: str,
+    actor_id: str,
+    now: int,
+) -> dict[str, Any]:
+    """1 件の Submission を自動承認する（呼出側の transaction 内で使う）。
+
+    approve_due_submissions と dispute の期限後経路が共有する効果の適用。
+    operation_id は auto-approve:{submission_id}（第16節）。Job が既に
+    SUBMITTED でなければ（承認済み・終端等）何もせず現在状態を返す。
+    acceptances.decided_by へは actor_id を記録する（system Actor からの
+    呼び出しでは system、dispute の期限後経路では異議を出した検収者。
+    認可は呼出側が済ませている: approve_due_submissions は
+    _require_system_actor、dispute は手順 4 の検収者検査）。
+    """
+    submission = conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (submission_id,)
+    ).fetchone()
+    if submission is None:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET, f"submission not found: {submission_id}"
+        )
+    job = _get_job_row(conn, str(submission["job_id"]))
+    if job["state"] != JobState.SUBMITTED.value:
+        return {"job_id": job["id"], "state": job["state"], "skipped": True}
+    operation_id = f"auto-approve:{submission_id}"
+    existing = conn.execute(
+        "SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)
+    ).fetchone()
+    if existing is not None:
+        # 既に自動承認の Operation がある（冪等）。Job は SUBMITTED では
+        # ないはずだが、状態検査を通ってきた場合はスキップとして返す
+        return {"job_id": job["id"], "state": job["state"], "skipped": True}
+    conn.execute(
+        "INSERT INTO operations (operation_id, actor_id, kind, payload_hash,"
+        " business_key, status, result, created_at_us)"
+        " VALUES (?, ?, 'auto-approve', ?, NULL, 'SUCCEEDED', NULL, ?)",
+        (
+            operation_id,
+            actor_id,
+            _payload_hash({"submission_id": submission_id, "auto": True}),
+            now,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO operations (operation_id, actor_id, kind, payload_hash,"
+        " business_key, status, result, created_at_us)"
+        " VALUES (?, ?, ?, ?, NULL, 'SUCCEEDED', NULL, ?)",
+        (
+            f"{operation_id}:payment",
+            actor_id,
+            PaymentKind.PAYOUT.value,
+            _payload_hash(
+                {
+                    "submission_id": submission_id,
+                    "auto": True,
+                    "derived": "payment",
+                }
+            ),
+            now,
+        ),
+    )
+    data = _approve_effects(
+        conn,
+        job=job,
+        submission=submission,
+        actor_id=actor_id,
+        decided_by=actor_id,
+        reason="auto-approved by review window expiry",
+        operation_id=operation_id,
+        now=now,
+    )
+    conn.execute(
+        "UPDATE operations SET result = ? WHERE operation_id = ?",
+        (
+            json.dumps(data, ensure_ascii=False, sort_keys=True),
+            operation_id,
+        ),
+    )
+    return data
+
+
+def dispute(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    submission_id: str,
+    condition_id: str,
+    reason_code: str,
+    evidence: str | None = None,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """検収期限内の異議（計画書 第12節）。
+
+    検査順序（この順序で確定する）:
+
+    1. _get_job_row → 無ければ INVALID_TARGET
+    2. Job が SUBMITTED でなければ INVALID_STATE
+    3. submission_id がその Job の有効 Submission でなければ INVALID_TARGET
+    4. actor_id がその Job の requester_id または Root の requester_id で
+       なければ FORBIDDEN（第5節「異議はそのJobのRequesterまたはRoot
+       Requesterが提出できる」。Worker 本人・無関係 Actor は拒否）
+    5. reason_code が固定の許可集合（CONDITION_MISMATCH /
+       ARTIFACT_INTEGRITY）に無ければ INVALID_ARGUMENT。価格交渉・新条件・
+       主観的な不満はこの制約で表現する
+    6. condition_id が公開 Version の conditions_json のキー（固定 condition）
+       でなければ INVALID_ARGUMENT
+    7. now >= review_due_at_us なら新規異議を拒否して自動承認処理へ進む
+       （第12節）: approve_due_submissions と同じ自動承認経路
+       （auto-approve:{submission_id}、冪等）を確定してから
+       OjpError(DISPUTE_WINDOW_CLOSED) を投げる（commit 後に本体が投げる。
+       自動承認が既に済んでいれば冪等に何もしない）
+    8. 既に有効な異議があれば INVALID_STATE（disputes.submission_id UNIQUE。
+       期限延長・再オープンなし）
+
+    効果（1 transaction）: disputes に status='OPEN'・opened_by=actor_id・
+    due_at_us = now + dispute_window_seconds * 1_000_000／jobs.state='DISPUTED'・
+    row_version+1／events 1 行。**資金は予約前の対象資金をそのまま保持する**
+    （口座残高・PaymentOperation を一切作らない・動かさない）。
+
+    approve と dispute が競合したら先に commit した有効遷移が勝つ
+    （BEGIN IMMEDIATE の直列化と手順 2 の状態検査で成立。プロセス内 Lock
+    に頼らない）。
+    """
+    payload = {
+        "job_id": job_id,
+        "submission_id": submission_id,
+        "condition_id": condition_id,
+        "reason_code": reason_code,
+        "evidence": evidence,
+    }
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 1. Job の存在
+        job = _get_job_row(c, job_id)
+        # 2. SUBMITTED でなければ INVALID_STATE
+        if job["state"] != JobState.SUBMITTED.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job must be SUBMITTED to dispute (current state: {job['state']})."
+                " 期限延長・再オープンなし。既に承認・異議・終端済みの Job への"
+                " 異議は拒否される",
+            )
+        # 3. 有効 Submission
+        submission = _get_valid_submission_row(c, job_id, submission_id)
+        # 4. 権限: その Job の Requester または Root Requester
+        root = _get_job_row(c, str(job["root_id"]))
+        allowed = {job["requester_id"], root["requester_id"]}
+        if actor_id not in allowed:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not the requester of job {job_id} nor the"
+                f" root requester ({sorted(allowed)})."
+                " 異議はそのJobのRequesterまたはRoot Requesterのみ（第5節）",
+            )
+        # 5. 固定の理由コード
+        if reason_code not in DISPUTE_REASON_CODES:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"reason_code must be one of {sorted(DISPUTE_REASON_CODES)}:"
+                f" {reason_code!r}. 価格交渉・新条件・主観的な不満は受理しない",
+            )
+        # 6. 固定 condition（公開 Version の期待 JSON のキー）
+        version_row = _get_job_version_row(c, str(job["version_id"]))
+        if version_row["conditions_json"] is None:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"published version has no conditions_json: {job['version_id']}",
+            )
+        conditions = json.loads(version_row["conditions_json"])
+        if condition_id not in conditions:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"condition_id must be a key of the published conditions"
+                f" ({sorted(conditions.keys())}): {condition_id!r}",
+            )
+        # 7. 期限後は新規異議を拒否して自動承認へ進む
+        if now >= int(submission["review_due_at_us"]):
+            # approve_due_submissions と同じ自動承認経路（auto-approve:{submission_id}、
+            # 冪等）。既に承認済みなら Job は SUBMITTED ではないため何もしない。
+            # 例外をここで投げると自動承認も rollback されるため、
+            # window_closed を結果として返し commit 後に本体が投げる
+            # （submit の VERIFICATION_FAILED と同じ伝播パターン）
+            _auto_approve_submission(
+                c, submission_id=str(submission["id"]), actor_id=actor_id, now=now
+            )
+            return {
+                "window_closed": True,
+                "job_id": job_id,
+                "submission_id": submission_id,
+                "review_due_at_us": int(submission["review_due_at_us"]),
+            }
+        # 8. 既に有効な異議があれば INVALID_STATE（最大 1 件・再オープンなし）
+        existing = c.execute(
+            "SELECT 1 FROM disputes WHERE submission_id = ?", (submission_id,)
+        ).fetchone()
+        if existing is not None:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"a dispute already exists for submission {submission_id}"
+                " (最大1件・期限延長・再オープンなし)",
+            )
+        timing, _deadline_us = _get_job_version_timing(c, str(job["version_id"]))
+        dispute_id = f"dispute:{op_id}"
+        due_at_us = now + timing.dispute_window_seconds * 1_000_000
+        c.execute(
+            "INSERT INTO disputes (id, job_id, submission_id, opened_by,"
+            " reason_code, condition_id, evidence, opened_at_us, due_at_us,"
+            " status, resolution)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                dispute_id,
+                job_id,
+                submission_id,
+                actor_id,
+                reason_code,
+                condition_id,
+                evidence,
+                now,
+                due_at_us,
+                domain.DisputeStatus.OPEN.value,
+            ),
+        )
+        cursor = c.execute(
+            "UPDATE jobs SET state = ?, row_version = row_version + 1"
+            " WHERE id = ? AND row_version = ?",
+            (JobState.DISPUTED.value, job_id, int(job["row_version"])),
+        )
+        if cursor.rowcount != 1:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "job state changed concurrently during dispute"
+                f" (job={job_id})",
+            )
+        c.execute(
+            "INSERT INTO events (root_id, job_id, actor_id, action, object_id,"
+            " at_us) VALUES (?, ?, ?, ?, ?, ?)",
+            (job["root_id"], job_id, actor_id, "dispute", dispute_id, now),
+        )
+        return {
+            "dispute_id": dispute_id,
+            "job_id": job_id,
+            "submission_id": submission_id,
+            "state": JobState.DISPUTED.value,
+            "due_at_us": due_at_us,
+        }
+
+    result = _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="dispute",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+    if result.data.get("window_closed"):
+        # commit 後に投げる（自動承認を残したまま）。同じ operation_id の
+        # 再送は replay 経路で保存済み結果から同じ DISPUTE_WINDOW_CLOSED を
+        # 再現する（決定的）
+        raise OjpError(
+            ErrorCode.DISPUTE_WINDOW_CLOSED,
+            "review window is closed: now="
+            f">= review_due_at={result.data['review_due_at_us']}."
+            " 期限後は自動承認される（第12節）",
+            details={
+                "review_due_at_us": int(result.data["review_due_at_us"]),
+                "submission_id": str(result.data["submission_id"]),
+            },
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: approve_due_submissions / resolve_due_disputes
+# （計画書 第12節・第15節）
+# ---------------------------------------------------------------------------
+
+
+def _collect_due_submissions(
+    conn: sqlite3.Connection, now: int
+) -> list[sqlite3.Row]:
+    """検収期限到来分の Submission を収集する（読み取りだけ）。
+
+    対象: Job が SUBMITTED かつ now >= review_due_at_us かつ disputes に
+    OPEN の異議が無い Submission（第12節「既に有効な異議が記録されていれば
+    承認タイマーは何もしない」）。
+    """
+    return conn.execute(
+        "SELECT s.* FROM submissions s JOIN jobs j ON j.id = s.job_id"
+        " WHERE j.state = ? AND s.review_due_at_us <= ?"
+        " AND NOT EXISTS (SELECT 1 FROM disputes d WHERE d.submission_id = s.id"
+        "                 AND d.status = 'OPEN')"
+        " ORDER BY s.id",
+        (JobState.SUBMITTED.value, now),
+    ).fetchall()
+
+
+def approve_due_submissions(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    escrow: ledger.EscrowPort | None = None,
+) -> list[CommandResult]:
+    """検収期限到来分の自動承認（計画書 第15節 Lifecycle: approve_due_submissions）。
+
+    tick から呼ばれる想定。Requester 無応答でも review_due_at を過ぎたら
+    保存済み PASS の提出を自動承認する（第12節・N11）。
+
+    - 対象: Job が SUBMITTED かつ now >= review_due_at_us かつ disputes に
+      OPEN の異議が無い Submission。有効な異議がある Submission は承認
+      タイマーの対象外（何もしない）
+    - 効果は _auto_approve_submission を使う（手動 approve と同じ Acceptance
+      ＋ DONE ＋ 支払い予約。operation_id=auto-approve:{submission_id}）。
+      手動 approve と自動 approve で Acceptance と支払い予約が 1 組だけ
+      になることは business_key=payout:{job_id} の一意性が保証する（N05）
+    - 認可は expire_due_leases と同じく _require_system_actor（対象の
+      収集前と各書込 transaction 内の両方で検査）
+    - 1 件ずつ独立した transaction（_run_idempotent 相当）で処理し、
+      now は各 transaction 内で 1 回だけ採取する。1 件の失敗で他の
+      対象を巻き込まない（例外は呼出側へ伝播するが、それまでに確定
+      した対象は残る）
+    """
+    del escrow  # 自動承認は Escrow port を使わない（送金は process_payments）
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
+    with db.transaction(conn, immediate=False):
+        preview_now = clock.now_for_read_snapshot(conn)
+        targets = _collect_due_submissions(conn, preview_now)
+    results: list[CommandResult] = []
+    for submission_row in targets:
+        submission_id = str(submission_row["id"])
+
+        def _apply(
+            c: sqlite3.Connection,
+            op_id: str,
+            now: int,
+            _submission_id: str = submission_id,
+        ) -> dict[str, Any]:
+            _require_system_actor(c, actor_id)
+            # auto-approve:{submission_id} の Operation 行は
+            # _auto_approve_submission の中で直接 INSERT するため、
+            # ここでは _run_idempotent を使わず transaction だけを所有する
+            return _auto_approve_submission(
+                c, submission_id=_submission_id, actor_id=actor_id, now=now
+            )
+
+        # operation_id は auto-approve:{submission_id} で固定（第16節）。
+        # _auto_approve_submission が Operation 行を直接 INSERT するため、
+        # _run_idempotent を使わず DB_BUSY 再試行付きの transaction を自前で
+        # 回す（expire_due_leases と同じ粒度）
+        data: dict[str, Any] | None = None
+        for attempt in range(DB_BUSY_MAX_ATTEMPTS):
+            try:
+                with db.transaction(conn, immediate=True):
+                    now_us = clock.now_for_write_transaction(conn)
+                    data = _auto_approve_submission(
+                        conn,
+                        submission_id=submission_id,
+                        actor_id=actor_id,
+                        now=now_us,
+                    )
+                break
+            except sqlite3.OperationalError as exc:
+                if db.is_db_busy(exc) and attempt < DB_BUSY_MAX_ATTEMPTS - 1:
+                    delay = min(
+                        DB_BUSY_BASE_DELAY_SECONDS * (2**attempt),
+                        DB_BUSY_MAX_DELAY_SECONDS,
+                    ) * (0.5 + random.random())
+                    time.sleep(delay)
+                    continue
+                raise OjpError(
+                    ErrorCode.DB_BUSY,
+                    f"database is busy after {attempt + 1} attempts",
+                ) from exc
+        assert data is not None
+        results.append(
+            CommandResult(
+                data=data,
+                operation_id=f"auto-approve:{submission_id}",
+            )
+        )
+    return results
+
+
+class _ResolveSkipped(Exception):
+    """resolve_due_disputes の書込 transaction 内で「この異議への書き込みを
+    やめて transaction 全体を rollback する」ことを呼出側へ伝える内部例外。
+
+    無応答のまま書込 transaction の now が due_at_us に達していなかった場合
+    （読取 snapshot と書込ロック取得後の時刻の間に裁定可否が変わる場合）に
+    使う。    operations 行も含めて rollback されるため DB は一切変更されない。
+    """
+
+
+def resolve_due_disputes(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    escrow: ledger.EscrowPort | None = None,
+) -> list[CommandResult]:
+    """OPEN の異議を固定判定器で裁定する（第15節 Lifecycle: resolve_due_disputes）。
+
+    tick から呼ばれる想定。各異議について verification.arbitrate を呼ぶ
+    （保存 JSON・submissions.version_id の Version の入力と期待値・
+    submissions.verification_evidence）。金額の一部裁定はしない
+    （PASS / FAIL の二値のみ）。
+
+    - PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約
+      （_approve_effects。operation_id は resolve:{dispute_id}）
+    - FAIL → FAILED ＋ Acceptance REJECTED ＋ _job_terminal_fund_effects
+      による返却／返金予約（返却・返金の計算をここで書き直さない）
+    - 判定器が応答しない（arbitrate が例外）場合:
+      書込 transaction の now < due_at_us の間は何もしない（異議 OPEN・
+      Job DISPUTED・資金不変。operations 行も残さない）。now >= due_at_us
+      （期限ちょうどを含む。失効側優先）になったら必ず保存済み PASS を
+      採用して自動承認する。全ての公開 Version が fallback を事前記録する
+      （TimingPolicy.unresponsive_arbiter_fallback='stored_pass'。第12節
+      「Requester/A の無応答で資金を永久凍結しない」。_approve_effects と
+      同じ効果。無応答 fallback も Acceptance と支払い予約を 1 組だけ作る）
+    - operation_id は resolve:{dispute_id}（第16節）。system 専用
+      （_require_system_actor）。同一 operation_id の再送は保存済み結果の
+      replay（actor/kind/payload_hash 照合。IDEMPOTENCY_CONFLICT）
+    - 裁定（arbitrate の呼び出し）は書込 transaction の外で行い、効果の
+      確定だけを transaction 内で行う。「無応答 fallback を適用するか /
+      何もせず OPEN のまま残すか」の期限判定は書込 transaction 内の now で
+      行う（第7節「書込ロックを取得した後のサーバー時刻で決め、期限
+      ちょうどは失効側を優先する」）。期限前に確定した場合は operations
+      行ごと rollback して DB を一切変更せず異議を OPEN のまま残し、結果へ
+      {"unresponsive": True, "skipped": True} を返して次の異議へ進む
+      （1 件分の失敗で他を巻き込まない）
+    - 裁定結果（PASS / FAIL / 無応答 fallback のすべて）は
+      disputes.resolution へ outcome / reason / evidence /
+      condition_id / verifier_id / verifier_hash / input_hash を含む
+      canonical JSON で保存する。FAIL の場合、acceptances.reason にも
+      理由コードを含める
+    """
+    del escrow  # 裁定は Escrow port を使わない（送金は process_payments）
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
+        # 裁定 seam は test mode の DB でのみ有効（代入済みなら realtime は
+        # 何も動かさず拒否）
+        verification.assert_arbiter_failpoints_allowed(conn)
+    with db.transaction(conn, immediate=False):
+        disputes = conn.execute(
+            "SELECT * FROM disputes WHERE status = ? ORDER BY id",
+            (domain.DisputeStatus.OPEN.value,),
+        ).fetchall()
+    results: list[CommandResult] = []
+    for dispute_row in disputes:
+        dispute_id = str(dispute_row["id"])
+        operation_id = f"resolve:{dispute_id}"
+        payload = {"dispute_id": dispute_id}
+        existing = conn.execute(
+            "SELECT actor_id, kind, payload_hash, status, result FROM operations"
+            " WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            # 同一 operation_id の再送（tick の再実行）は保存済み結果の replay
+            if (
+                existing["actor_id"] != actor_id
+                or existing["kind"] != "resolve"
+                or existing["payload_hash"] != _payload_hash(payload)
+            ):
+                raise OjpError(
+                    ErrorCode.IDEMPOTENCY_CONFLICT,
+                    "operation_id was already used with a different"
+                    " actor/kind/payload",
+                )
+            data = json.loads(existing["result"]) if existing["result"] else {}
+            results.append(
+                CommandResult(data=data, operation_id=operation_id, replayed=True)
+            )
+            continue
+
+        # 裁定（書込 transaction の外）。判定器の実行はここで行うが、
+        # 「無応答 fallback を適用するか / 何もせず OPEN のまま残すか」の
+        # 期限判定は _apply の中で書込 transaction の now で確定する
+        # （第7節: 書込ロックを取得した後のサーバー時刻で決める）
+        preview_now = clock.now_for_read_snapshot(conn)
+        verdict, outcome, condition_matched = _arbitrate_dispute_outcome(
+            conn, dispute_row, now_us=preview_now
+        )
+        if verdict == "unresponsive":
+            # 判定器が応答しない。fallback 適用の可否は書込 transaction 内の
+            # now で再判定するため、ここでは書込を試みる（期限前に確定した
+            # 場合は _apply が _ResolveSkipped を投げて transaction 全体を
+            # rollback する）
+            def _apply(
+                c: sqlite3.Connection,
+                op_id: str,
+                now: int,
+            ) -> dict[str, Any]:
+                _require_system_actor(c, actor_id)
+                dispute = c.execute(
+                    "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if (
+                    dispute is None
+                    or dispute["status"] != domain.DisputeStatus.OPEN.value
+                ):
+                    return {"dispute_id": dispute_id, "skipped": True}
+                # 期限の再判定は書込ロック取得後の now で行う（期限ちょうど
+                # は fallback 適用側＝失効側を優先する）
+                if now < int(dispute["due_at_us"]):
+                    # operations 行ごと rollback して何も書かない
+                    raise _ResolveSkipped(dispute_id)
+                job = _get_job_row(c, str(dispute["job_id"]))
+                submission = c.execute(
+                    "SELECT * FROM submissions WHERE id = ?",
+                    (dispute["submission_id"],),
+                ).fetchone()
+                if submission is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"dispute {dispute_id} references a missing submission:"
+                        f" {dispute['submission_id']}",
+                    )
+                if job["state"] != JobState.DISPUTED.value:
+                    return {"dispute_id": dispute_id, "skipped": True}
+                # 保存済み PASS への fallback（第12節。全 Version が事前記録）
+                version_row = _get_job_version_row(c, str(submission["version_id"]))
+                reason = (
+                    "dispute resolved by stored_pass fallback after"
+                    f" unresponsive arbiter ({dispute_id})"
+                )
+                payment_operation_id = f"{op_id}:payment"
+                _insert_operation(
+                    c,
+                    operation_id=payment_operation_id,
+                    actor_id=actor_id,
+                    kind=PaymentKind.PAYOUT.value,
+                    payload_hash=_payload_hash(
+                        {
+                            "derived_from": op_id,
+                            "business_key": f"payout:{job['id']}",
+                        }
+                    ),
+                    business_key=None,
+                    status=OperationStatus.SUCCEEDED,
+                    result=None,
+                    now_us=now,
+                )
+                data = _approve_effects(
+                    c,
+                    job=job,
+                    submission=submission,
+                    actor_id=actor_id,
+                    decided_by=actor_id,
+                    reason=reason,
+                    operation_id=op_id,
+                    now=now,
+                )
+                resolution = _dispute_resolution_fields(
+                    outcome="UNRESPONSIVE_ARBITER_STORED_PASS",
+                    reason="ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK",
+                    evidence=str(submission["verification_evidence"]),
+                    condition_id=str(dispute["condition_id"]),
+                    verifier_id=str(version_row["verifier_id"]),
+                    verifier_hash=str(version_row["verifier_hash"]),
+                    input_hash=_stored_evidence_input_hash(
+                        str(submission["verification_evidence"])
+                    ),
+                    arbitration=None,
+                    # 判定器が応答せず FAIL を再現していない経路。
+                    # condition_matched は「再現した FAIL が異議の
+                    # condition_id に起因するか」の意味なので False
+                    condition_matched=False,
+                )
+                c.execute(
+                    "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
+                    (
+                        domain.DisputeStatus.RESOLVED.value,
+                        resolution,
+                        dispute_id,
+                    ),
+                )
+                c.execute(
+                    "INSERT INTO events (root_id, job_id, actor_id, action,"
+                    " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job["root_id"],
+                        job["id"],
+                        actor_id,
+                        "resolve",
+                        dispute_id,
+                        now,
+                    ),
+                )
+                return {
+                    "dispute_id": dispute_id,
+                    "job_id": job["id"],
+                    "resolution": "UNRESPONSIVE_ARBITER_STORED_PASS",
+                    "approval": data,
+                }
+
+        else:
+
+            def _apply(
+                c: sqlite3.Connection,
+                op_id: str,
+                now: int,
+                _verdict: str = verdict,
+                _outcome: verification.VerificationOutcome | None = outcome,
+                _condition_matched: bool = condition_matched,
+            ) -> dict[str, Any]:
+                _require_system_actor(c, actor_id)
+                dispute = c.execute(
+                    "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if (
+                    dispute is None
+                    or dispute["status"] != domain.DisputeStatus.OPEN.value
+                ):
+                    # 既に別の tick で裁定済み（冪等）。何もしない
+                    return {"dispute_id": dispute_id, "skipped": True}
+                job = _get_job_row(c, str(dispute["job_id"]))
+                submission = c.execute(
+                    "SELECT * FROM submissions WHERE id = ?",
+                    (dispute["submission_id"],),
+                ).fetchone()
+                if submission is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"dispute {dispute_id} references a missing submission:"
+                        f" {dispute['submission_id']}",
+                    )
+                if job["state"] != JobState.DISPUTED.value:
+                    return {"dispute_id": dispute_id, "skipped": True}
+                version_row = _get_job_version_row(c, str(submission["version_id"]))
+                # FAIL が異議の condition_id に起因するかは arbitrate が
+                # 保存データから導出した condition_matched を使う（呼出側で
+                # 文字列比較をしない。第12節「既存条件への FAIL が再現された
+                # 場合だけ FAILED」）。PASS 経路は FAIL を再現していない
+                # ため帰属が無く False。
+                # FAIL でも原因 condition が特定できない（構造 FAIL）、
+                # または異議の condition_id と一致しない場合は False
+                # （異議は成立しなかったとして承認側へ収束する）
+                if _verdict == "PASS" or not _condition_matched:
+                    # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約。
+                    # FAIL が異議の condition_id に起因しない場合も同じ
+                    # 承認側へ収束する（資金を凍結しない。第12節「無応答で
+                    # 資金を永久凍結しない」と同じ方針）
+                    if _verdict == "PASS":
+                        reason = (
+                            f"dispute resolved by arbitration PASS ({dispute_id})"
+                        )
+                        outcome_label = "PASS"
+                        reason_code = _outcome.reason if _outcome is not None else "OK"
+                    else:
+                        # FAIL は再現したが異議の condition_id に起因しない
+                        # （構造 FAIL・別 condition 起因）。異議は成立しなかった
+                        reason_code = _outcome.reason if _outcome is not None else "OK"
+                        actual_failed = (
+                            _outcome.failed_condition_id
+                            if _outcome is not None
+                            else None
+                        )
+                        reason = (
+                            f"dispute not upheld ({dispute_id}): arbitration"
+                            f" reproduced FAIL but not on condition"
+                            f" {dispute['condition_id']!r} (reason:"
+                            f" {reason_code}, failed_condition_id:"
+                            f" {actual_failed!r}). 第12節「既存条件への FAIL が"
+                            " 再現された場合だけ FAILED」に起因しないため承認側へ収束"
+                        )
+                        outcome_label = "FAIL_NOT_ON_DISPUTED_CONDITION"
+                    payment_operation_id = f"{op_id}:payment"
+                    _insert_operation(
+                        c,
+                        operation_id=payment_operation_id,
+                        actor_id=actor_id,
+                        kind=PaymentKind.PAYOUT.value,
+                        payload_hash=_payload_hash(
+                            {
+                                "derived_from": op_id,
+                                "business_key": f"payout:{job['id']}",
+                            }
+                        ),
+                        business_key=None,
+                        status=OperationStatus.SUCCEEDED,
+                        result=None,
+                        now_us=now,
+                    )
+                    data = _approve_effects(
+                        c,
+                        job=job,
+                        submission=submission,
+                        actor_id=actor_id,
+                        decided_by=actor_id,
+                        reason=reason,
+                        operation_id=op_id,
+                        now=now,
+                    )
+                    resolution = _dispute_resolution_fields(
+                        outcome=outcome_label,
+                        reason=reason_code,
+                        evidence=(
+                            _outcome.evidence if _outcome is not None else None
+                        ),
+                        condition_id=str(dispute["condition_id"]),
+                        verifier_id=str(version_row["verifier_id"]),
+                        verifier_hash=str(version_row["verifier_hash"]),
+                        input_hash=(
+                            _outcome.input_hash if _outcome is not None else None
+                        ),
+                        arbitration=_outcome,
+                        condition_matched=_condition_matched,
+                    )
+                    c.execute(
+                        "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
+                        (
+                            domain.DisputeStatus.RESOLVED.value,
+                            resolution,
+                            dispute_id,
+                        ),
+                    )
+                    c.execute(
+                        "INSERT INTO events (root_id, job_id, actor_id, action,"
+                        " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            job["root_id"],
+                            job["id"],
+                            actor_id,
+                            "resolve",
+                            dispute_id,
+                            now,
+                        ),
+                    )
+                    return {
+                        "dispute_id": dispute_id,
+                        "job_id": job["id"],
+                        "resolution": outcome_label,
+                        "approval": data,
+                    }
+                # FAIL（異議の condition_id に起因する）→ FAILED ＋
+                # Acceptance REJECTED ＋ 返却／返金予約
+                c.execute(
+                    "INSERT INTO acceptances (job_id, submission_id, decision,"
+                    " decided_by, reason, decided_at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job["id"],
+                        submission["id"],
+                        domain.AcceptanceDecision.REJECTED.value,
+                        actor_id,
+                        f"dispute resolved by arbitration FAIL ({dispute_id}):"
+                        f" {_outcome.reason} on condition"
+                        f" {dispute['condition_id']!r}",
+                        now,
+                    ),
+                )
+                cursor = c.execute(
+                    "UPDATE jobs SET state = ?, active_lease_id = NULL,"
+                    " row_version = row_version + 1"
+                    " WHERE id = ? AND row_version = ?",
+                    (JobState.FAILED.value, job["id"], int(job["row_version"])),
+                )
+                if cursor.rowcount != 1:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        "job state changed concurrently during dispute resolution"
+                        f" (job={job['id']})",
+                    )
+                funds = _job_terminal_fund_effects(
+                    c,
+                    job=job,
+                    actor_id=actor_id,
+                    operation_id=f"{op_id}:funds",
+                    now=now,
+                )
+                resolution = _dispute_resolution_fields(
+                    outcome="FAIL",
+                    reason=_outcome.reason,
+                    evidence=_outcome.evidence,
+                    condition_id=str(dispute["condition_id"]),
+                    verifier_id=str(version_row["verifier_id"]),
+                    verifier_hash=str(version_row["verifier_hash"]),
+                    input_hash=_outcome.input_hash,
+                    arbitration=_outcome,
+                    condition_matched=True,
+                )
+                c.execute(
+                    "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
+                    (domain.DisputeStatus.RESOLVED.value, resolution, dispute_id),
+                )
+                c.execute(
+                    "INSERT INTO events (root_id, job_id, actor_id, action,"
+                    " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job["root_id"],
+                        job["id"],
+                        actor_id,
+                        "resolve",
+                        dispute_id,
+                        now,
+                    ),
+                )
+                return {
+                    "dispute_id": dispute_id,
+                    "job_id": job["id"],
+                    "resolution": "FAIL",
+                    "state": JobState.FAILED.value,
+                    "funds": funds,
+                }
+
+        data: dict[str, Any] | None = None
+        for attempt in range(DB_BUSY_MAX_ATTEMPTS):
+            try:
+                with db.transaction(conn, immediate=True):
+                    now_us = clock.now_for_write_transaction(conn)
+                    _insert_operation(
+                        conn,
+                        operation_id=operation_id,
+                        actor_id=actor_id,
+                        kind="resolve",
+                        payload_hash=_payload_hash(payload),
+                        business_key=None,
+                        status=OperationStatus.SUCCEEDED,
+                        result=None,
+                        now_us=now_us,
+                    )
+                    data = _apply(conn, operation_id, now_us)
+                    conn.execute(
+                        "UPDATE operations SET result = ? WHERE operation_id = ?",
+                        (
+                            json.dumps(data, ensure_ascii=False, sort_keys=True),
+                            operation_id,
+                        ),
+                    )
+                break
+            except _ResolveSkipped:
+                # 無応答のまま書込 transaction 内の now が期限前に確定した。
+                # operations 行を含めて transaction 全体が rollback 済みのため、
+                # DB は一切変更されていない。異議は OPEN のまま次へ進む
+                results.append(
+                    CommandResult(
+                        data={
+                            "dispute_id": dispute_id,
+                            "unresponsive": True,
+                            "skipped": True,
+                        },
+                        operation_id=operation_id,
+                    )
+                )
+                data = None
+                break
+            except sqlite3.OperationalError as exc:
+                if db.is_db_busy(exc) and attempt < DB_BUSY_MAX_ATTEMPTS - 1:
+                    delay = min(
+                        DB_BUSY_BASE_DELAY_SECONDS * (2**attempt),
+                        DB_BUSY_MAX_DELAY_SECONDS,
+                    ) * (0.5 + random.random())
+                    time.sleep(delay)
+                    continue
+                raise OjpError(
+                    ErrorCode.DB_BUSY,
+                    f"database is busy after {attempt + 1} attempts",
+                ) from exc
+        if data is None:
+            # _ResolveSkipped で処理済み（結果は results へ追加済み）
+            continue
+        results.append(CommandResult(data=data, operation_id=operation_id))
+    return results
+
+def _stored_evidence_input_hash(evidence_json: str) -> str | None:
+    """保存済み検証証跡（canonical JSON）から input_hash を取り出す。
+
+    無応答 fallback の resolution 記録に使う。parse 不能・欠落の場合は
+    None を返す（証跡は submissions.verification_evidence の全文を別途
+    保存しているため、この値が欠けても裁定の根拠は失われない）。
+    """
+    try:
+        evidence = json.loads(evidence_json)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    value = evidence.get("input_hash")
+    return value if isinstance(value, str) else None
+
+
+def _dispute_resolution_fields(
+    *,
+    outcome: str,
+    reason: str,
+    evidence: str | None,
+    condition_id: str,
+    verifier_id: str,
+    verifier_hash: str,
+    input_hash: str | None,
+    arbitration: verification.VerificationOutcome | None,
+    condition_matched: bool,
+) -> str:
+    """disputes.resolution へ保存する canonical JSON を組み立てる（第12節）。
+
+    PASS / FAIL / 無応答 fallback / FAIL 不成立の全経路で、異議の
+    condition_id に加えて、裁定の原因 condition（failed_condition_id）と
+    判明した期待値・実値（expected_value / actual_value）、FAIL が異議の
+    condition_id に起因するか（condition_matched）を記録する。第12節
+    「既存条件への FAIL が再現された場合だけ FAILED」の判定根拠を
+    resolution へ残す。condition_matched は「**再現した FAIL が**異議の
+    condition_id に起因するか」の意味であり、異議の condition が有効か
+    どうかではない。したがって FAIL を再現していない経路（PASS・無応答
+    fallback・FAIL 不成立）では False になる。arbitration が None
+    （無応答 fallback）の経路では判定器の証跡が無いため
+    failed_condition_id / expected_value / actual_value も None とする。
+    """
+    return ledger.canonical_json_dumps(
+        {
+            "outcome": outcome,
+            "reason": reason,
+            "evidence": evidence,
+            "condition_id": condition_id,
+            "verifier_id": verifier_id,
+            "verifier_hash": verifier_hash,
+            "input_hash": input_hash,
+            "failed_condition_id": (
+                arbitration.failed_condition_id if arbitration is not None else None
+            ),
+            "expected_value": (
+                arbitration.expected_value if arbitration is not None else None
+            ),
+            "actual_value": (
+                arbitration.actual_value if arbitration is not None else None
+            ),
+            "condition_matched": condition_matched,
+        }
+    )
+
+
+def _arbitrate_dispute_outcome(
+    conn: sqlite3.Connection, dispute_row: sqlite3.Row, *, now_us: int
+) -> tuple[str, verification.VerificationOutcome | None, bool]:
+    """1 件の異議を裁定して (verdict, VerificationOutcome, condition_matched)
+    を返す（書込は行わない）。
+
+    戻り値:
+    - ("PASS", outcome, False) / ("FAIL", outcome, condition_matched):
+      判定器が応答した場合。outcome は裁定の証跡（reason / evidence /
+      input_hash を含む。resolution への保存に使う）。condition_matched
+      は arbitrate が outcome から導出した「再現した FAIL が異議対象の
+      condition_id に起因するか」の評価結果（PASS は FAIL を再現して
+      いないので False）
+    - ("unresponsive", None, False): 判定器が応答しない場合。保存済み
+      PASS への fallback を適用するかどうかは呼出側が書込 transaction
+      内の now で再判定する（第7節: 書込ロック取得後のサーバー時刻で
+      決める）
+
+    arbitrate の例外（failpoint_arbiter_unresponsive seam・
+    VERIFICATION_UNAVAILABLE）は「判定器が応答しない」扱いにする。書込
+    transaction の外で呼ぶため、例外で DB は一切変更されない。
+    now_us は読取 snapshot の時刻（応答があった場合の裁定実行の時刻参照）。
+    condition_matched は arbitrate が返す outcome.condition_matched を
+    そのまま採用する（呼出側が文字列比較で帰属を再評価しない。第12節
+    「既存条件への FAIL が再現された場合だけ FAILED」の判定根拠）。
+    """
+    submission = conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (dispute_row["submission_id"],)
+    ).fetchone()
+    if submission is None:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            f"dispute {dispute_row['id']} references a missing submission:"
+            f" {dispute_row['submission_id']}",
+        )
+    version_row = _get_job_version_row(conn, str(submission["version_id"]))
+    if (
+        version_row["input_json"] is None
+        or version_row["conditions_json"] is None
+        or version_row["verifier_id"] is None
+        or version_row["verifier_hash"] is None
+    ):
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            "published version lacks verification inputs for arbitration"
+            f" (version: {submission['version_id']})",
+        )
+    try:
+        outcome = verification.arbitrate(
+            stored_artifact_json=str(submission["artifact_json"]),
+            input_values=json.loads(version_row["input_json"]),
+            expected=json.loads(version_row["conditions_json"]),
+            verifier_id=version_row["verifier_id"],
+            verifier_hash_value=version_row["verifier_hash"],
+            original_evidence=str(submission["verification_evidence"]),
+            condition_id=str(dispute_row["condition_id"]),
+        )
+    except Exception:
+        # 判定器が応答しない。fallback 適用の可否（now >= due_at_us）は
+        # 呼出側が書込 transaction 内の now で再判定する
+        del now_us
+        return "unresponsive", None, False
+    if outcome.result == domain.VerificationResult.PASS.value:
+        # PASS は FAIL を再現していないので帰属は無い（condition_matched は
+        # 「再現した FAIL が異議の condition_id に起因するか」の意味であり、
+        # 「異議の condition が有効か」ではない）
+        return "PASS", outcome, False
+    return "FAIL", outcome, outcome.condition_matched
 
 
 # ---------------------------------------------------------------------------
@@ -2466,6 +4234,139 @@ def reserve_parent_refund(
         payment_kind=(
             PaymentKind.REFUND if payee_id is not None and not zero_no_op else None
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Root Requester / system による返金コマンド（計画書 第14節 `ojp job refund`）
+# ---------------------------------------------------------------------------
+
+
+def refund(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    operation_id: str | None = None,
+    escrow: ledger.EscrowPort | None = None,
+) -> CommandResult:
+    """確定済みの返金予約だけを処理するコマンド（計画書 第14節
+    `ojp job refund ROOT`「確定済み返金予約だけを再処理。有効提出からの
+    直接返金は拒否」・第6節「Root返金コマンドは既に確定した返金予約を
+    処理するだけで、Jobの判定を変更できない」）。
+
+    検査順序（計画書 第14節。この順序どおりに固定する）:
+
+    1. 対象 Job から Root を解決する（jobs.root_id）。Job が無ければ
+       INVALID_TARGET
+    2. **Actor 権限を先に検査する**: Root Requester または system 以外は
+       FORBIDDEN（対象が Child であっても、権限が無ければ INVALID_TARGET
+       より先に FORBIDDEN を返す）
+    3. 権限があっても**対象が Child なら INVALID_TARGET**（返金対象は
+       Root のみ）
+    4. Root の返金予約（payment_operations の kind='refund'）が 1 件も
+       なければ INVALID_STATE。**新しい返金予約は作らない**
+       （reserve_refundable_balance は呼ばない）
+    5. 確定済みの返金予約（business_key が refund:{root_id}:terminal および
+       refund:{root_id}:child-return:{child_id}）だけを処理する。
+       **送金済み（SUCCEEDED）なら既存結果を返す**（新しい送金を作らない・
+       金額と受取人を変更しない）
+    6. Lifecycle で返金可能額が 0 のときに予約を作らない規則とは区別する
+       （残高 0 で予約が存在するなら、その予約の処理結果を返す）
+
+    - **Job の判定を変更できない**: jobs.state を一切更新しない（第6節）
+    - 送金処理は既存の process_single_payment を再利用する（自前の送金・
+      Receipt 処理を書かない）。process_single_payment が transaction を
+      所有するため、権限・対象・予約の検査だけを _run_idempotent の
+      transaction で確定し、各予約の送金処理はその commit 後に行う
+    - 権限: Root Requester または system（第14節「refundはRoot Requester
+      またはsystem」）。jobs.requester_id と participants.kind から解決する
+    - escrow は process_single_payment へそのまま渡す（省略時は MockEscrow）
+    - 冪等性: 同一 operation_id の再送は _run_idempotent の replay
+      （保存済みの予約一覧に対して同じ処理を再実行する。各予約の送金は
+      Receipt が正本のため二重にならない）。返金予約ごとの業務効果
+      （business_key）は予約作成側が担うため、このコマンドの Operation は
+      business_key を持たない
+    """
+    escrow_port = escrow if escrow is not None else ledger.MockEscrow()
+    payload = {"job_id": job_id}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 1. 対象 Job から Root を解決する。Job が無ければ INVALID_TARGET
+        job = _get_job_row(c, job_id)
+        root_id = str(job["root_id"])
+        root = _get_job_row(c, root_id)
+        # 2. Actor 権限を先に検査する（対象が Child でも INVALID_TARGET より
+        #    先に FORBIDDEN）。権限は Root Requester または system のみ
+        if actor_id != root["requester_id"] and not _is_system_actor(c, actor_id):
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id!r} is neither the root requester"
+                f" ({root['requester_id']!r}) nor a system participant"
+                " (refund は Root Requester または system のみ。第14節)",
+            )
+        # 3. 権限があっても対象が Child なら INVALID_TARGET（返金対象は
+        #    Root のみ）
+        if job["parent_id"] is not None:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"refund target must be the root job (返金対象は Root のみ):"
+                f" {job_id} (root: {root_id})",
+            )
+        # 4. Root の返金予約が 1 件もなければ INVALID_STATE。
+        #    新しい返金予約は作らない（reserve_refundable_balance を呼ばない）
+        reservations = c.execute(
+            "SELECT * FROM payment_operations WHERE root_id = ? AND kind = ?"
+            " ORDER BY operation_id",
+            (root_id, PaymentKind.REFUND.value),
+        ).fetchall()
+        if not reservations:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"root {root_id} has no refund reservations to process"
+                " (返金予約なし。refund は確定済み予約の再処理だけを行い、"
+                " 新しい返金予約は作らない. 第14節)",
+            )
+        # 5. 確定済みの返金予約（refund:{root_id}:terminal と
+        #    refund:{root_id}:child-return:{child_id}）だけを処理対象として
+        #    列挙する。送金自体はこの transaction の commit 後に
+        #    process_single_payment が行う（金額と受取人は PaymentOperation
+        #    作成時の固定値からしか取らない）
+        return {
+            "root_id": root_id,
+            "job_id": job_id,
+            "refund_operation_ids": [
+                str(reservation["operation_id"]) for reservation in reservations
+            ],
+        }
+
+    result = _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="refund",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+    # 5.（続き）各予約の送金処理。送金済み（SUCCEEDED）なら既存結果を返す
+    #    （新しい送金を作らない・金額と受取人を変更しない）。6. 残高 0 で
+    #    予約が存在する場合も、その予約の処理結果を返す（予約を作らないのは
+    #    予約作成側の規則。ここは処理のみ）
+    processed = [
+        process_single_payment(
+            conn, operation_id=payment_operation_id, escrow=escrow_port
+        ).data
+        for payment_operation_id in result.data["refund_operation_ids"]
+    ]
+    data = {
+        "root_id": result.data["root_id"],
+        "job_id": result.data["job_id"],
+        "refund_count": len(processed),
+        "refunds": processed,
+    }
+    return CommandResult(
+        data=data, operation_id=result.operation_id, replayed=result.replayed
     )
 
 

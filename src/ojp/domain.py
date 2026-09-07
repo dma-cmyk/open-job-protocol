@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 UNIT_SCALE = 1_000_000
 SQLITE_MAX_I64 = 9_223_372_036_854_775_807
@@ -247,12 +247,36 @@ class SubcontractPolicy(_StrictModel):
 
 
 class TimingPolicy(_StrictModel):
-    """デモ既定値: Lease 60秒 / heartbeat 20秒 / 検収30秒 / 異議判定30秒。"""
+    """デモ既定値: Lease 60秒 / heartbeat 20秒 / 検収30秒 / 異議判定30秒。
+
+    unresponsive_arbiter_fallback は裁定無応答時の fallback 方針
+    （計画書 第12節「この fallback を JobVersion に事前記録する」）。
+    公開 Version の timing_policy 列へ保存され、resolve_due_disputes は
+    この保存値を読んで適用する。全ての公開 Version が fallback を
+    事前記録する（Requester/A の無応答で資金を永久凍結しない）。
+    保存済み timing_policy JSON に当該キーが無い場合（後方互換）は
+    "stored_pass" として扱う。
+    """
 
     lease_seconds: Annotated[int, Field(gt=0, strict=True)] = 60
     heartbeat_seconds: Annotated[int, Field(gt=0, strict=True)] = 20
     review_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
     dispute_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
+    unresponsive_arbiter_fallback: Literal["stored_pass"] = "stored_pass"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_missing_fallback_to_stored_pass(cls, data: Any) -> Any:
+        """キー欠落（古い DB の timing_policy）を "stored_pass" として扱う。
+
+        None や他の値は後方互換のため None→"stored_pass" だけ受け入れ、
+        それ以外の文字列は Literal 検証で拒否する。
+        """
+        if isinstance(data, dict) and "unresponsive_arbiter_fallback" not in data:
+            return {**data, "unresponsive_arbiter_fallback": "stored_pass"}
+        if isinstance(data, dict) and data.get("unresponsive_arbiter_fallback") is None:
+            return {**data, "unresponsive_arbiter_fallback": "stored_pass"}
+        return data
 
 
 class ArtifactAccessPolicy(_StrictModel):
@@ -292,12 +316,22 @@ def _validate_expected(v: dict[str, int]) -> dict[str, int]:
 
 
 class TaskCatalogEntry(_StrictModel):
-    """Root 公開Versionに固定される Child タスクのカタログ要素。"""
+    """Root 公開Versionに固定される Child タスクのカタログ要素。
+
+    timing_policy を指定した entry は、その task_key の Child にだけ
+    カタログの timing を事前許可として与える（第8節「Root Requester は
+    Root 公開時に使用可能な客観的 Child タスクのカタログと予算上限を
+    許可する」の延長。都度承認ではなく事前許可）。未指定（None）なら
+    Child は Root 公開版の timing_policy を継承する（従来どおり）。
+    作成時に A（Parent Worker）が timing を指定することはできない
+    （すり替えを許さない。カタログの値だけを使う）。
+    """
 
     task_key: str = Field(min_length=1)
     input_values: list[StrictInt]
     expected: dict[str, StrictInt]
     budget_cap_units: Annotated[int, Field(gt=0, le=SQLITE_MAX_I64, strict=True)]
+    timing_policy: TimingPolicy | None = None
 
     @field_validator("input_values")
     @classmethod
