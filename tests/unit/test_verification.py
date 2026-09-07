@@ -308,3 +308,108 @@ def test_pass_uses_computed_sum_from_published_inputs():
     # evidence は同じ入力に対して常に同じ値（決定的・時刻非依存）
     again = _verify('{"sum":6}', input_values=[1, 2, 3], expected={"sum": 6})
     assert json.loads(again.evidence) == evidence
+
+
+# ---------------------------------------------------------------------------
+# R1: FAIL の原因 condition（failed_condition_id / expected_value /
+# actual_value）の特定（計画書 第12節「既存条件への FAIL が再現された
+# 場合だけ FAILED」の検証基盤）
+# ---------------------------------------------------------------------------
+
+
+def test_value_mismatch_identifies_failed_condition():
+    """値不一致の FAIL は原因キー・期待値（計算合計）・実値を特定する。"""
+    outcome = _verify('{"sum":5}', input_values=[1, 2, 3], expected={"sum": 6})
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_VALUE_MISMATCH"
+    assert outcome.failed_condition_id == "sum"
+    assert outcome.expected_value == 6
+    assert outcome.actual_value == 5
+
+
+def test_value_mismatch_on_auxiliary_key_uses_published_expected():
+    """補助キー（"sum" 以外）の値不一致は公開 expected の固定値を期待値と
+    する（合計の計算根拠を持つのは "sum" だけ）。"""
+    outcome = _verify(
+        '{"sum":6,"pad":1}',
+        input_values=[1, 2, 3],
+        expected={"sum": 6, "pad": 0},
+    )
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_VALUE_MISMATCH"
+    assert outcome.failed_condition_id == "pad"
+    assert outcome.expected_value == 0
+    assert outcome.actual_value == 1
+
+
+def test_type_invalid_identifies_failed_condition():
+    """型違反（bool は受理しない）の FAIL も原因キー・期待値・実値を特定。"""
+    outcome = _verify('{"sum":true}')
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_TYPE_INVALID"
+    assert outcome.failed_condition_id == "sum"
+    assert outcome.expected_value == 6
+    assert outcome.actual_value is True
+
+
+def test_key_missing_identifies_missing_condition():
+    """不足キーの FAIL は「判定に使った最初のキー」（不足キーの sorted()
+    昇順の先頭）を原因キーとし、公開 expected の期待値を入れる
+    （成果物側にキーが無いため実値は None）。"""
+    outcome = _verify("{}", expected={"sum": 6, "pad": 0})
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_KEY_MISMATCH"
+    # 不足キー {"pad","sum"} の昇順先頭は "pad"
+    assert outcome.failed_condition_id == "pad"
+    assert outcome.expected_value == 0
+    assert outcome.actual_value is None
+
+
+def test_key_mismatch_extra_key_is_deterministic():
+    """過剰キーの FAIL は過剰キーの sorted() 昇順の先頭を原因キーとし、
+    実値（成果物側の値）を入れる（公開 Version に存在しない condition の
+    ため期待値は None）。不足・過剰が混在する場合は不足側を優先する。"""
+    outcome = _verify('{"sum":6,"b":1,"a":2}')
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_KEY_MISMATCH"
+    # 過剰キー {"a","b"} の昇順先頭は "a"
+    assert outcome.failed_condition_id == "a"
+    assert outcome.expected_value is None
+    assert outcome.actual_value == 2
+    # 不足と過剰が混在する場合は不足側（昇順先頭）を優先する
+    outcome = _verify('{"zzz":0}', expected={"sum": 6, "pad": 0})
+    assert outcome.reason == "ARTIFACT_KEY_MISMATCH"
+    assert outcome.failed_condition_id == "pad"
+    assert outcome.expected_value == 0
+    assert outcome.actual_value is None
+
+
+@pytest.mark.parametrize(
+    "raw_artifact, reason",
+    [
+        ('{"sum":6,"pad":"' + "x" * (1048576 - 12) + '"}', "ARTIFACT_TOO_LARGE"),
+        ("{not json", "ARTIFACT_NOT_JSON"),
+        ('{"sum":NaN}', "ARTIFACT_NOT_FINITE"),
+        ('{"sum":6,"sum":6}', "ARTIFACT_DUPLICATE_KEY"),
+        ('{"a":' * 9 + "1" + "}" * 9, "ARTIFACT_TOO_DEEP"),
+        ("[1,2,3]", "ARTIFACT_NOT_OBJECT"),
+    ],
+)
+def test_structural_fails_have_no_failed_condition(raw_artifact, reason):
+    """成果物全体の構造に関する FAIL は特定の condition に起因しない
+    （failed_condition_id / expected_value / actual_value は None）。"""
+    outcome = _verify(raw_artifact)
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == reason
+    assert outcome.failed_condition_id is None
+    assert outcome.expected_value is None
+    assert outcome.actual_value is None
+
+
+def test_pass_has_no_failed_condition():
+    """PASS では failed_condition_id 系はすべて None。"""
+    outcome = _verify('{"sum":6}')
+    assert outcome.result == VerificationResult.PASS
+    assert outcome.failed_condition_id is None
+    assert outcome.expected_value is None
+    assert outcome.actual_value is None

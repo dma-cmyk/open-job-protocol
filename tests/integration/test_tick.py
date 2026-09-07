@@ -9,14 +9,19 @@
 - 独立プロセス（python -m ojp.scheduler --root <path> --once --json）から
   実行して同じ結果になり、stdout が単一 JSON
 - 全プロセス停止後も期限は DB に残り、再起動時に過期限分を処理する（X10）
-- N08: 有効提出後、lease_expires_at < now < review_due_at で tick を 1 回
-  実行しても SUBMITTED 維持・Acceptance・PaymentOperation 0 件・残高不変。
-  その後 review_due_at まで進めると自動承認（N11）
+- N08: 専用 timing fixture（Root Lease 300秒・Child Lease 60秒・
+  review_window 120秒。カタログ entry の timing_policy で Child にだけ
+  別 timing を事前許可する）で有効提出後、
+  `child_expires_at < now < child_review_due_at < root_lease_expires_at`
+  を確認してから tick を 1 回実行しても SUBMITTED 維持・Acceptance・
+  PaymentOperation 0 件・残高不変。その後 review_due_at まで進めると
+  自動承認（N11）
 - N09: Child の Worker B が提出した後に Parent（Root）を失効させても、
   Child の期限承認で B への支払い予約と送金が成立する
 
-create_child は timing を Root 公開版から継承するため、Root と Child は
-同じ timing である前提でテストを組む（job_versions を直接 UPDATE しない）。
+カタログ entry に timing_policy を持たない Root では、従来どおり Child が
+Root 公開版の timing を継承する（後方互換。job_versions を直接 UPDATE
+しない）。
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from ojp import clock, db, ledger, scheduler, service, verification
 from ojp.domain import (
     JobState,
     PaymentStatus,
+    TaskCatalogEntry,
     TimingPolicy,
 )
 from tests.conftest import (
@@ -50,14 +56,53 @@ DEADLINE_US = TEST_T0_US + 86_400_000_000  # t0 + 1日
 TEN = 10_000_000
 REVIEW_WINDOW_US = 30_000_000  # TimingPolicy 既定の検収待ち30秒
 
-# Lease 30秒・検収 120秒: 有効提出（t0+1秒）で review_due_at = t0+121秒と
-# なり、旧 Lease 期限（t0+30秒）だけを先に越えられる（N08）
-N08_TIMING = TimingPolicy(
+# N09 用: Lease 30秒・検収 120秒（N08 とは別 fixture。Root / Child で同じ
+# timing を継承する従来構成で、Parent 失効後の Child 継続を検証する）
+N09_TIMING = TimingPolicy(
     lease_seconds=30,
     heartbeat_seconds=20,
     review_window_seconds=120,
     dispute_window_seconds=30,
 )
+
+# N08 専用 timing fixture（計画書 第18節「N08の専用時刻fixture」）:
+# Root JobVersion は Lease 300秒（Root deadline は t0+300秒 より後）、
+# カタログの part-1 entry は Lease 60秒・review_window 120秒を Child の
+# timing として事前許可する。これにより A の Root Lease は t0+300秒、
+# B の Child Lease は t0+60秒、t0+1秒の有効提出で
+# review_due_at = t0+121秒となり、
+# child_expires_at < tick < child_review_due_at < root_lease_expires_at
+# の窓を作れる
+N08_ROOT_TIMING = TimingPolicy(
+    lease_seconds=300,
+    heartbeat_seconds=20,
+    review_window_seconds=30,
+    dispute_window_seconds=30,
+)
+N08_CHILD_TIMING = TimingPolicy(
+    lease_seconds=60,
+    heartbeat_seconds=20,
+    review_window_seconds=120,
+    dispute_window_seconds=30,
+)
+
+
+def _n08_catalog() -> tuple:
+    """N08 専用カタログ: part-1 entry にだけ Child 用 timing を事前許可する。"""
+    _root_def, base = load_poc_catalog()
+    catalog = [
+        TaskCatalogEntry(
+            task_key=entry.task_key,
+            input_values=entry.input_values,
+            expected=entry.expected,
+            budget_cap_units=entry.budget_cap_units,
+            timing_policy=(
+                N08_CHILD_TIMING if entry.task_key == "part-1" else None
+            ),
+        )
+        for entry in base
+    ]
+    return _root_def, catalog
 
 
 @pytest.fixture
@@ -86,10 +131,14 @@ def demo_db(test_db):
     return test_db
 
 
-def _leased_root(demo_db, *, suffix="r1", timing=None):
+def _leased_root(demo_db, *, suffix="r1", timing=None, catalog=None):
     """create_root → fund_root → A が Claim 済みの Root を返す
-    （(root_id, version_id, lease_id)）。"""
-    _root_def, catalog = load_poc_catalog()
+    （(root_id, version_id, lease_id)）。catalog を渡すと既定の PoC
+    カタログの代わりにそれを使う（N08 専用カタログ等）。"""
+    if catalog is None:
+        _root_def, catalog = load_poc_catalog()
+    else:
+        _root_def, _ = load_poc_catalog()
     created = service.create_root(
         demo_db.conn,
         actor_id=REQUESTER_ID,
@@ -448,41 +497,89 @@ def test_overdue_processed_after_restart(demo_db, tmp_path):
 
 
 def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
-    """N08: lease_expires_at < now < review_due_at で tick を 1 回実行 →
-    Child は SUBMITTED 維持・Acceptance・PaymentOperation（Child 分）0 件・
-    全口座残高・Wallet・PaymentOperation・Acceptance が提出直後の
-    スナップショットから 1 行単位で不変。窓の中では資金を動かす操作を
-    一切行わない。
+    """N08（計画書 第18節「N08の専用時刻fixture」）: Root Lease 300秒・
+    カタログの part-1 entry に Child 用 timing（Lease 60秒・
+    review_window 120秒）を事前許可し、共有 Clock を t0 に固定したまま
+    A が Root を Claim・Child を作成、B も Child を Claim する。B は
+    t0+1秒で有効提出（review_due_at = t0+121秒）。harness は Clock を
+    t0+61秒へ進め、
+    `child_expires_at < now < child_review_due_at < root_lease_expires_at`
+    を確認してから独立 tick を 1 回実行する。
 
-    注意: create_child は timing を Root 公開版から継承するため、Child だけ
-    別の Lease 長 / review_window を持つ構成は作れない（計画書のN08専用
-    fixture では Root Lease 300秒・Child Lease 60秒・review 120秒）。
-    そのためこのテストでは Root も同じ timing（Lease 30秒・review 120秒）
-    を持つ前提で組み、窓の中で Root が失効して返金送金が動くと残高不変の
-    検証にならないため、窓に入る前に A が Root の heartbeat を 1 回だけ
-    行って Root Lease を延ばす（heartbeat は資金を動かさない操作）。
-    この Root/Child の timing 分離ができない点は計画書との差分として
-    報告する。
+    tick 後も Child は SUBMITTED 維持・Acceptance・PaymentOperation
+    （Child 分）0 件・全口座残高・Wallet・PaymentOperation・Acceptance が
+    提出直後のスナップショットから 1 行単位で不変。Lease の
+    expires_at_us は監査値として t0+60秒のまま、closed_reason は
+    'submitted' のまま、expiry による Event や新 Lease は作られない。
+    窓の中では資金を動かす操作を一切行わない。
     """
-    root_id, child_id, submission_id = _submitted_child(
-        demo_db, suffix="n08", timing=N08_TIMING
+    _root_def, n08_catalog = _n08_catalog()
+    root_id, root_version_id, root_lease_id = _leased_root(
+        demo_db, suffix="n08-r", timing=N08_ROOT_TIMING, catalog=n08_catalog
     )
+    # A の Root Lease は t0+300秒（Root の timing は Lease 300秒）
+    root_lease = demo_db.conn.execute(
+        "SELECT * FROM leases WHERE id = ?", (root_lease_id,)
+    ).fetchone()
+    root_lease_expires_at = int(root_lease["expires_at_us"])
+    assert root_lease_expires_at == TEST_T0_US + 300_000_000
+
+    # 共有 Clock は t0 のまま A が Child を作成し、B が Claim する
+    created = service.create_child(
+        demo_db.conn,
+        actor_id=AGENT_A_ID,
+        parent_job_id=root_id,
+        lease_id=root_lease_id,
+        task_key="part-1",
+        budget_units=TEN,
+        deadline_us=DEADLINE_US,
+        operation_id="create:n08",
+    )
+    child_id = created.data["child_id"]
+    # Child の JobVersion にはカタログの timing（Lease 60秒・review 120秒）
+    # が保存される（Root 公開版の timing 継承ではない）
+    child_version = demo_db.conn.execute(
+        "SELECT timing_policy FROM job_versions WHERE id = ?",
+        (created.data["version_id"],),
+    ).fetchone()
+    assert TimingPolicy.model_validate_json(
+        child_version["timing_policy"]
+    ) == N08_CHILD_TIMING
+    claimed = service.claim(
+        demo_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        expected_version_id=created.data["version_id"],
+        operation_id="claim:n08-b",
+    )
+    del root_version_id
+
+    # B は共有 Clock の t0+1秒で有効提出する
+    clock.set_test_now(demo_db.conn, TEST_T0_US + 1_000_000)
+    submitted = service.submit(
+        demo_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=claimed.data["lease_id"],
+        version_id=created.data["version_id"],
+        artifact_json='{"sum": 6}',
+        operation_id="submit:n08",
+    )
+    submission_id = submitted.data["submission_id"]
     review_due_at = demo_db.conn.execute(
         "SELECT review_due_at_us FROM submissions WHERE id = ?",
         (submission_id,),
     ).fetchone()["review_due_at_us"]
-    # t0+1秒提出・Lease 30秒・review 120秒 → review_due_at = t0+121秒
-    assert review_due_at == TEST_T0_US + 1_000_000 + 120_000_000
+    # t0+1秒提出・review 120秒 → review_due_at = t0+121秒
+    assert review_due_at == TEST_T0_US + 121_000_000
     lease = demo_db.conn.execute(
         "SELECT * FROM leases WHERE job_id = ?", (child_id,)
     ).fetchone()
-    assert lease["expires_at_us"] == TEST_T0_US + 30_000_000
+    child_expires_at = int(lease["expires_at_us"])
+    # B の Child Lease は t0+60秒（カタログの Child timing は Lease 60秒）
+    assert child_expires_at == TEST_T0_US + 60_000_000
 
-    # 旧 Lease 期限（t0+30秒）より後・review_due_at より前へ進める。
-    # 窓の中で Root が失効して返金送金が動くと残高不変の検証にならない
-    # ため、窓に入る前に A が Root の heartbeat を 1 回だけ行って Root
-    # Lease を延ばす（heartbeat は資金を動かさない操作。送金待ちを残さ
-    # ない構成）。
+    # 提出直後のスナップショット（送金待ちを残さない構成）
     wallets_after_submit = _wallets(demo_db.conn)
     buckets_after_submit = {
         (r["owner_job_id"], r["bucket"], r["source_key"]): int(r["amount_units"])
@@ -506,27 +603,11 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
         "SELECT COUNT(*) AS c FROM events WHERE job_id = ?", (child_id,)
     ).fetchone()["c"]
 
-    # Root Lease を延ばす（t0+29秒。heartbeat は資金を動かさない）。
-    # これで窓の中の tick が Root を失効させず、返金予約・返金送金も
-    # 起こらない
-    clock.set_test_now(demo_db.conn, TEST_T0_US + 29_000_000)
-    root_lease = demo_db.conn.execute(
-        "SELECT * FROM leases WHERE job_id = ? AND closed_reason IS NULL",
-        (root_id,),
-    ).fetchone()
-    assert root_lease is not None
-    service.heartbeat(
-        demo_db.conn,
-        actor_id=AGENT_A_ID,
-        job_id=root_id,
-        lease_id=root_lease["id"],
-        generation=int(root_lease["generation"]),
-        operation_id="heartbeat:n08-root",
-    )
-
-    # 窓（t0+45秒）: lease_expires_at < now < review_due_at
-    now = TEST_T0_US + 45_000_000
-    assert lease["expires_at_us"] < now < review_due_at
+    # harness は共有 Clock を t0+61秒へ進め、計画書の時刻関係
+    # （child_expires_at < now < child_review_due_at < root_lease_expires_at）
+    # を確認してから独立 tick を 1 回実行する
+    now = TEST_T0_US + 61_000_000
+    assert child_expires_at < now < review_due_at < root_lease_expires_at
     clock.set_test_now(demo_db.conn, now)
 
     result = scheduler.tick_once(demo_db.conn, actor_id=SYSTEM_ID)
@@ -552,11 +633,11 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
             ).fetchone()["c"]
             == 0
         )
-        # Lease は監査値のまま・'submitted' で閉じたまま
+        # Lease は監査値のまま（t0+60秒）・'submitted' で閉じたまま
         fresh_lease = conn.execute(
             "SELECT * FROM leases WHERE job_id = ?", (child_id,)
         ).fetchone()
-        assert fresh_lease["expires_at_us"] == TEST_T0_US + 30_000_000
+        assert fresh_lease["expires_at_us"] == child_expires_at
         assert fresh_lease["closed_reason"] == "submitted"
         # Child への新しい Lease や expiry Event は作られない
         assert (
@@ -614,6 +695,40 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
     assert _wallets(demo_db.conn)[AGENT_B_ID] == TEN
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
+
+def test_child_without_catalog_timing_inherits_root_timing(demo_db):
+    """後方互換: カタログ entry に timing_policy を持たない従来の Root では、
+    Child は Root 公開版の timing を継承する（Child の JobVersion の
+    timing_policy が Root と一致する）。"""
+    custom_root_timing = TimingPolicy(
+        lease_seconds=90,
+        heartbeat_seconds=20,
+        review_window_seconds=45,
+        dispute_window_seconds=30,
+    )
+    root_id, _root_v, root_lease_id = _leased_root(
+        demo_db, suffix="inherit-r", timing=custom_root_timing
+    )
+    created = service.create_child(
+        demo_db.conn,
+        actor_id=AGENT_A_ID,
+        parent_job_id=root_id,
+        lease_id=root_lease_id,
+        task_key="part-1",
+        budget_units=TEN,
+        deadline_us=DEADLINE_US,
+        operation_id="create:inherit",
+    )
+    child_version = demo_db.conn.execute(
+        "SELECT timing_policy FROM job_versions WHERE id = ?",
+        (created.data["version_id"],),
+    ).fetchone()
+    assert TimingPolicy.model_validate_json(
+        child_version["timing_policy"]
+    ) == custom_root_timing
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
 # ---------------------------------------------------------------------------
 # N09: Parent 失効後も Child の期限処理が独立に継続
 # ---------------------------------------------------------------------------
@@ -632,7 +747,7 @@ def test_child_approval_survives_parent_expiry(demo_db):
     できることも確認する。
     """
     root_id, child_version_id, root_lease = _leased_root(
-        demo_db, suffix="n09-r", timing=N08_TIMING
+        demo_db, suffix="n09-r", timing=N09_TIMING
     )
     created_child = service.create_child(
         demo_db.conn,

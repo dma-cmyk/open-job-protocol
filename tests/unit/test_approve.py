@@ -537,6 +537,101 @@ def test_post_approval_same_submission_new_operation_id_reuses(demo_db):
 
 
 # ---------------------------------------------------------------------------
+# R2: operation_id 照合は前置検査より最優先（IDEMPOTENCY_CONFLICT）
+# ---------------------------------------------------------------------------
+
+
+def test_operation_id_reuse_with_different_actor_is_idempotency_conflict(demo_db):
+    """成功した approve と**同じ operation_id** を別 Actor で再利用すると、
+    前置検査の FORBIDDEN ではなく IDEMPOTENCY_CONFLICT（計画書 第16節）。
+    拒否後も Acceptance・PaymentOperation・残高は不変。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    _approve(demo_db, child_id, submission_id, "approve:reuse-a")
+    buckets_before = _buckets(demo_db, root_id)
+    wallets_before = _wallets(demo_db)
+    with pytest.raises(OjpError) as exc_info:
+        _approve(
+            demo_db, child_id, submission_id, "approve:reuse-a",
+            actor_id=REQUESTER_ID,
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    assert _buckets(demo_db, root_id) == buckets_before
+    assert _wallets(demo_db) == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_operation_id_reuse_with_different_submission_is_idempotency_conflict(
+    demo_db,
+):
+    """同じ operation_id ・同じ Actor でも **別 submission_id**（別 payload）
+    なら前置検査の INVALID_TARGET ではなく IDEMPOTENCY_CONFLICT。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    _root_b, _child_b, _vb, submission_b = _submitted_child(
+        demo_db, suffix="reuse-b"
+    )
+    _approve(demo_db, child_id, submission_id, "approve:reuse-sub")
+    with pytest.raises(OjpError) as exc_info:
+        _approve(
+            demo_db, child_id, submission_b, "approve:reuse-sub",
+            actor_id=AGENT_A_ID,
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_operation_id_reuse_with_different_job_is_idempotency_conflict(demo_db):
+    """同じ operation_id ・同じ Actor でも **別 job_id**（別 payload）なら
+    IDEMPOTENCY_CONFLICT（FORBIDDEN / INVALID_TARGET ではない）。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    root_b, child_b, _vb, _sb = _submitted_child(demo_db, suffix="reuse-job")
+    _approve(demo_db, child_id, submission_id, "approve:reuse-job")
+    # child_b の submission（同じ Requester A）で payload だけが違う再利用
+    other_submission = demo_db.conn.execute(
+        "SELECT id FROM submissions WHERE job_id = ?", (child_b,)
+    ).fetchone()["id"]
+    with pytest.raises(OjpError) as exc_info:
+        _approve(
+            demo_db, child_b, other_submission, "approve:reuse-job",
+            actor_id=AGENT_A_ID,
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+    ledger.assert_ledger_invariants(demo_db.conn, root_b)
+
+
+def test_operation_id_reuse_same_payload_replays(demo_db):
+    """同じ operation_id ＋ 同じ payload の再送は IDEMPOTENCY_CONFLICT では
+    なく replay（既存結果。replayed=True）。前置検査の順序変更で replay
+    経路が壊れていないことも固定する。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    first = _approve(demo_db, child_id, submission_id, "approve:reuse-same")
+    buckets_before = _buckets(demo_db, root_id)
+    wallets_before = _wallets(demo_db)
+    second = _approve(demo_db, child_id, submission_id, "approve:reuse-same")
+    assert second.replayed is True
+    assert second.data == first.data
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    assert _buckets(demo_db, root_id) == buckets_before
+    assert _wallets(demo_db) == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+# ---------------------------------------------------------------------------
 # 送金失敗（DONE は戻らない）
 # ---------------------------------------------------------------------------
 

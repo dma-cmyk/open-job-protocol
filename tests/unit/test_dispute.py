@@ -361,6 +361,42 @@ def test_dispute_after_approve_is_invalid_state(demo_db):
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 
+def test_dispute_operation_id_reuse_with_different_payload_is_conflict(demo_db):
+    """R2（dispute 経路の確認）: 成功した dispute と**同じ operation_id** を
+    別 payload（別 condition_id）で再利用すると、冪等性契約どおり
+    IDEMPOTENCY_CONFLICT になる（FORBIDDEN / INVALID_STATE ではない）。
+    同じ operation_id ＋同じ payload の再送は replay（dispute_id が同じ）。
+    dispute のドメイン検査は _run_idempotent 内のため、この契約は
+    _run_idempotent が担保する（前置検査の追加は不要）。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    first = _dispute(demo_db, child_id, submission_id, "dispute:idem")
+    dispute_id = first.data["dispute_id"]
+    # 同じ operation_id ＋別 payload（別 condition_id）は IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        _dispute(
+            demo_db, child_id, submission_id, "dispute:idem",
+            condition_id="total",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    # 同じ operation_id ＋別 Actor も IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        _dispute(
+            demo_db, child_id, submission_id, "dispute:idem",
+            actor_id=REQUESTER_ID,
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    # 同じ operation_id ＋同じ payload の再送は replay（同じ dispute_id）
+    replay = _dispute(demo_db, child_id, submission_id, "dispute:idem")
+    assert replay.replayed is True
+    assert replay.data["dispute_id"] == dispute_id
+    # 異議は 1 件だけ・Job・資金は不変
+    assert demo_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM disputes"
+    ).fetchone()["c"] == 1
+    assert _job(demo_db, child_id)["state"] == JobState.DISPUTED.value
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
 def test_approve_after_dispute_is_invalid_state(demo_db):
     """dispute が先に成立したら approve は INVALID_STATE。"""
     root_id, child_id, _v, submission_id = _submitted_child(demo_db)

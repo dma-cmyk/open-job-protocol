@@ -316,12 +316,22 @@ def _validate_expected(v: dict[str, int]) -> dict[str, int]:
 
 
 class TaskCatalogEntry(_StrictModel):
-    """Root 公開Versionに固定される Child タスクのカタログ要素。"""
+    """Root 公開Versionに固定される Child タスクのカタログ要素。
+
+    timing_policy を指定した entry は、その task_key の Child にだけ
+    カタログの timing を事前許可として与える（第8節「Root Requester は
+    Root 公開時に使用可能な客観的 Child タスクのカタログと予算上限を
+    許可する」の延長。都度承認ではなく事前許可）。未指定（None）なら
+    Child は Root 公開版の timing_policy を継承する（従来どおり）。
+    作成時に A（Parent Worker）が timing を指定することはできない
+    （すり替えを許さない。カタログの値だけを使う）。
+    """
 
     task_key: str = Field(min_length=1)
     input_values: list[StrictInt]
     expected: dict[str, StrictInt]
     budget_cap_units: Annotated[int, Field(gt=0, le=SQLITE_MAX_I64, strict=True)]
+    timing_policy: TimingPolicy | None = None
 
     @field_validator("input_values")
     @classmethod

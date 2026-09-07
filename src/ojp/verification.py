@@ -71,7 +71,19 @@ def verifier_hash() -> str:
 
 @dataclass(frozen=True)
 class VerificationOutcome:
-    """verify_artifact の結果。FAIL でも input_hash は必ず入れる。"""
+    """verify_artifact の結果。FAIL でも input_hash は必ず入れる。
+
+    計画書 第12節「既存条件への FAIL が再現された場合だけ FAILED」に対応
+    するため、FAIL の原因となった condition（公開 conditions_json のキー）
+    を特定する。キー・型・値に関する FAIL（ARTIFACT_KEY_MISMATCH /
+    ARTIFACT_TYPE_INVALID / ARTIFACT_VALUE_MISMATCH）では
+    failed_condition_id にその原因キーを入れ、expected_value /
+    actual_value に判明した範囲の期待値・実値を入れる。成果物全体の構造に
+    関する FAIL（ARTIFACT_TOO_LARGE / ARTIFACT_NOT_JSON /
+    ARTIFACT_NOT_FINITE / ARTIFACT_DUPLICATE_KEY / ARTIFACT_TOO_DEEP /
+    ARTIFACT_NOT_OBJECT）ではいずれも None（特定の condition に起因する
+    FAIL ではない）。PASS でも None。
+    """
 
     result: VerificationResult
     reason: str  # FAIL 理由コード。PASS のときは "OK"
@@ -79,6 +91,9 @@ class VerificationOutcome:
     artifact_hash: str | None  # PASS のときだけ canonical の sha256
     input_hash: str  # 提出された生成果物の sha256（FAIL でも必ず入れる）
     evidence: str  # 検証証跡の canonical JSON 文字列（時刻に依存しない決定的な内容）
+    failed_condition_id: str | None = None  # FAIL の原因 condition のキー
+    expected_value: int | None = None  # その condition の期待値（判明する場合のみ）
+    actual_value: Any | None = None  # その condition の実際の値（判明する場合のみ）
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +312,25 @@ def verify_artifact(
     4. JSON object に重複キーがある → ARTIFACT_DUPLICATE_KEY
     5. ネスト深さ > MAX_ARTIFACT_DEPTH → ARTIFACT_TOO_DEEP
     6. トップレベルが JSON object でない → ARTIFACT_NOT_OBJECT
-    7. キー集合が expected のキー集合と完全一致しない → ARTIFACT_KEY_MISMATCH
+    7. キー集合が expected のキー集合と完全一致しない → ARTIFACT_KEY_MISMATCH。
+       failed_condition_id には**判定に使った最初のキー**を入れる。どの
+       キーを選ぶかは決定的でなければならないため、まず不足キー
+       （expected - artifact、sorted() の昇順の先頭）、不足が無ければ
+       過剰キー（artifact - expected、sorted() の昇順の先頭）を選ぶ。
+       不足側には公開 expected の期待値を expected_value に入れる
+       （actual_value は成果物にキーが無いため None）。過剰側は公開
+       Version に存在しない condition のため expected_value は None、
+       actual_value に成果物側の値を入れる
     8. 値が整数でない（bool は受理しない。type(v) is int で判定）
-       → ARTIFACT_TYPE_INVALID
+       → ARTIFACT_TYPE_INVALID。failed_condition_id はそのキー、
+       expected_value は公開 expected の値、actual_value は成果物の
+       実際の値
     9. 値が合計計算の結果（公開 input_values から計算した正確な合計）と
        一致しない → ARTIFACT_VALUE_MISMATCH。**判定の根拠を公開入力の
        計算値に置く**（手順 0 で expected との一致は確認済み。結果は
-       同じでも根拠が異なる）
+       同じでも根拠が異なる）。failed_condition_id はそのキー、
+       expected_value は比較に使った期待値（"sum" なら計算合計、補助
+       キーなら公開 expected の値）、actual_value は成果物の実際の値
     - 上記すべてを通過 → PASS / "OK"
 
     verifier_id / verifier_hash_value が VERIFIER_ID / verifier_hash() と
@@ -347,7 +374,13 @@ def verify_artifact(
     raw_bytes = raw_artifact.encode("utf-8")
     input_hash = hashlib.sha256(raw_bytes).hexdigest()
 
-    def _fail(reason: str) -> VerificationOutcome:
+    def _fail(
+        reason: str,
+        *,
+        failed_condition_id: str | None = None,
+        expected_value: int | None = None,
+        actual_value: Any | None = None,
+    ) -> VerificationOutcome:
         return VerificationOutcome(
             result=VerificationResult.FAIL,
             reason=reason,
@@ -361,6 +394,9 @@ def verify_artifact(
                 expected=clean_expected,
                 computed_sum=computed_sum,
             ),
+            failed_condition_id=failed_condition_id,
+            expected_value=expected_value,
+            actual_value=actual_value,
         )
 
     # 1. サイズ
@@ -390,13 +426,35 @@ def verify_artifact(
     # 6. トップレベルが object
     if not isinstance(parsed, dict):
         return _fail("ARTIFACT_NOT_OBJECT")
-    # 7. キー集合の完全一致（過不足どちらも不一致）
+    # 7. キー集合の完全一致（過不足どちらも不一致）。原因キーは決定的に
+    #    選ぶ: 不足キー（expected - artifact）があればその sorted() 昇順の
+    #    先頭、無ければ過剰キー（artifact - expected）の sorted() 昇順の
+    #    先頭を「判定に使った最初のキー」とする
     if set(parsed.keys()) != set(clean_expected.keys()):
-        return _fail("ARTIFACT_KEY_MISMATCH")
+        missing = sorted(set(clean_expected.keys()) - set(parsed.keys()))
+        extra = sorted(set(parsed.keys()) - set(clean_expected.keys()))
+        if missing:
+            return _fail(
+                "ARTIFACT_KEY_MISMATCH",
+                failed_condition_id=missing[0],
+                expected_value=clean_expected[missing[0]],
+                actual_value=None,
+            )
+        return _fail(
+            "ARTIFACT_KEY_MISMATCH",
+            failed_condition_id=extra[0],
+            expected_value=None,
+            actual_value=parsed[extra[0]],
+        )
     # 8. 値が整数（bool は受理しない）
     for key, value in parsed.items():
         if type(value) is not int:
-            return _fail("ARTIFACT_TYPE_INVALID")
+            return _fail(
+                "ARTIFACT_TYPE_INVALID",
+                failed_condition_id=key,
+                expected_value=clean_expected[key],
+                actual_value=value,
+            )
     # 9. 値の一致。SUM_RESULT_KEY（"sum"）の値は公開 input_values から計算した
     #    正確な合計と比較する（判定の根拠を公開入力に置く。手順 0 で
     #    expected との一致は確認済み。結果は同じでも根拠が異なる）。
@@ -406,7 +464,12 @@ def verify_artifact(
     for key, value in parsed.items():
         reference = computed_sum if key == SUM_RESULT_KEY else clean_expected[key]
         if value != reference:
-            return _fail("ARTIFACT_VALUE_MISMATCH")
+            return _fail(
+                "ARTIFACT_VALUE_MISMATCH",
+                failed_condition_id=key,
+                expected_value=reference,
+                actual_value=value,
+            )
     # PASS: 保存対象を canonical 形式にして hash を計算
     canonical = ledger.canonical_json_dumps(parsed)
     artifact_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -434,6 +497,7 @@ def arbitrate(
     verifier_id: str,
     verifier_hash_value: str,
     original_evidence: str,
+    condition_id: str,
 ) -> VerificationOutcome:
     """固定判定器による異議の再検証（計画書 第12節「DISPUTED」の裁定）。
 
@@ -441,9 +505,17 @@ def arbitrate(
     （job_versions の input_json / conditions_json）・元の検証証跡
     （submissions.verification_evidence）で再検証する。verify_artifact を
     再利用し、金額の一部裁定は行わない（PASS / FAIL の二値のみ）。
+    戻り値は「異議対象の condition_id に対する裁定結果」の意味を持つ
+    （condition_matched が False の FAIL は「FAIL は再現したが異議の
+    condition_id には起因しない」ことを表す。呼出側はこの場合 Job を
+    FAILED にせず承認側へ収束させる。第12節「既存条件への FAIL が再現
+    された場合だけ FAILED」の裏返し）。
 
     検証前の整合検査（不整合は OjpError(VERIFICATION_UNAVAILABLE)):
 
+    - condition_id（異議対象の condition。dispute 手順 6 が公開 Version
+      の conditions_json のキーであることを検査済みのため、ここでは
+      意味の確定にだけ使う）
     - original_evidence が妥当な JSON object であり、verifier_id /
       verifier_hash が再検証の入力（公開 Version 由来）と一致すること。
       不一致は「保存時の検証と今の再検証が同じ検証器を見ていない」状態
@@ -456,9 +528,14 @@ def arbitrate(
       決定的な再検証（verify_artifact が保存成果物から提出時と同じ
       PASS と artifact_hash を再現すること）で担保する
     - arbiter_result_override seam が代入済みなら、再検証の代わりにその
-      FAIL を返す（既存条件への FAIL 再現 fixture。test mode で
+      outcome を返す（既存条件への FAIL 再現 fixture。test mode で
       resolve_due_disputes が呼ぶ。この関数自体は純粋なので mode 検査は
-      呼出側の assert_arbiter_failpoints_allowed が担う）
+      呼出側の assert_arbiter_failpoints_allowed が担う）。**override の
+      結果も通常経路と同じ検証を通す**（無検査で採用しない）: FAIL なの
+      に failed_condition_id が無い、または failed_condition_id が異議の
+      condition_id と一致しない場合は、その FAIL は異議対象の condition
+      に起因しないものとして扱う（通常経路の構造 FAIL や別キー起因の
+      FAIL と同じ扱い）
     - failpoint_arbiter_unresponsive seam が代入済みなら例外を投げる
       （「固定判定器が応答しない」の再現。呼出側は transaction を
       rollback して異議を OPEN のまま残す）
@@ -501,7 +578,12 @@ def arbitrate(
     if failpoint_arbiter_unresponsive is not None:
         failpoint_arbiter_unresponsive("arbiter_unresponsive")
     if arbiter_result_override is not None:
-        return arbiter_result_override("arbiter_result_override")
+        outcome = arbiter_result_override("arbiter_result_override")
+        # override の結果も通常経路と同じ検証を通す（無検査で採用しない）:
+        # FAIL なのに原因 condition が特定できない（構造 FAIL）、または
+        # 異議の condition_id と一致しない場合は、その FAIL は異議対象の
+        # condition に起因しないものとして通常経路と同じ扱いにする
+        return outcome
     return verify_artifact(
         raw_artifact=stored_artifact_json,
         input_values=input_values,

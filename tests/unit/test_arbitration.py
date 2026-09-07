@@ -181,6 +181,10 @@ def _payment_by_key(demo_db, business_key):
 
 
 def _fail_outcome():
+    """異議対象の condition（"sum"）に起因する FAIL の outcome（X14 証拠付き
+    FAIL fixture。failed_condition_id / expected_value / actual_value を
+    含める。計画書 第12節「既存条件への FAIL が再現された場合だけ
+    FAILED」を検証できる形）。"""
     return verification.VerificationOutcome(
         result=verification.VerificationResult.FAIL,
         reason="ARTIFACT_VALUE_MISMATCH",
@@ -190,6 +194,9 @@ def _fail_outcome():
         evidence=ledger.canonical_json_dumps(
             {"injected": "arbiter_result_override", "result": "FAIL"}
         ),
+        failed_condition_id="sum",
+        expected_value=6,
+        actual_value=5,
     )
 
 
@@ -221,6 +228,7 @@ def _expected_arbitrate_outcome(demo_db, dispute_id):
         verifier_id=version["verifier_id"],
         verifier_hash_value=version["verifier_hash"],
         original_evidence=str(submission["verification_evidence"]),
+        condition_id=str(dispute["condition_id"]),
     )
 
 
@@ -255,7 +263,9 @@ def test_resolve_pass_approves_and_reserves_payout(demo_db):
     ).fetchone()
     assert dispute["status"] == "RESOLVED"
     # resolution は canonical JSON: outcome / reason / evidence /
-    # condition_id / verifier_id / verifier_hash / input_hash を含む
+    # condition_id / verifier_id / verifier_hash / input_hash に加え、
+    # failed_condition_id / expected_value / actual_value /
+    # condition_matched を含む（第12節の判定根拠）
     resolution = _resolution_record(demo_db, dispute_id)
     assert resolution["outcome"] == "PASS"
     assert resolution["condition_id"] == dispute["condition_id"]
@@ -265,6 +275,12 @@ def test_resolve_pass_approves_and_reserves_payout(demo_db):
     assert resolution["input_hash"] == outcome.input_hash
     assert resolution["verifier_id"] == verification.VERIFIER_ID
     assert resolution["verifier_hash"] == verification.verifier_hash()
+    # PASS は異議の condition_id への帰属が維持される（原因 condition
+    # ではなく、保存済み PASS を採用するため failed_condition_id 系は None）
+    assert resolution["condition_matched"] is True
+    assert resolution["failed_condition_id"] is None
+    assert resolution["expected_value"] is None
+    assert resolution["actual_value"] is None
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 def test_resolve_is_idempotent(demo_db):
@@ -326,7 +342,10 @@ def test_resolve_fail_returns_child_work_to_available(demo_db):
     ).fetchone()
     assert dispute["status"] == "RESOLVED"
     # resolution は canonical JSON: 理由コード・証跡・異議の condition_id と
-    # の一致・arbitrate の証跡との一致を検証する
+    # の一致・arbitrate の証跡との一致を検証する。さらに FAIL の原因
+    # condition（failed_condition_id）が異議の condition_id と一致し、
+    # 期待値・実値・condition_matched が記録されることを検証する
+    # （計画書 第12節「既存条件への FAIL が再現された場合だけ FAILED」）
     resolution = _resolution_record(demo_db, dispute_id)
     assert resolution["outcome"] == "FAIL"
     assert resolution["condition_id"] == dispute["condition_id"]
@@ -335,6 +354,137 @@ def test_resolve_fail_returns_child_work_to_available(demo_db):
     assert resolution["input_hash"] == "0" * 64
     assert resolution["verifier_id"] == verification.VERIFIER_ID
     assert resolution["verifier_hash"] == verification.verifier_hash()
+    assert resolution["failed_condition_id"] == "sum"
+    assert resolution["expected_value"] == 6
+    assert resolution["actual_value"] == 5
+    assert resolution["condition_matched"] is True
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_resolve_fail_on_other_condition_converges_to_approved(demo_db):
+    """異議の condition_id（"sum"）に**一致しない** FAIL（別キー起因）を
+    override で返させた場合、Job は FAILED にならず DONE ＋ Acceptance
+    APPROVED ＋ 支払い予約へ収束する（第12節「既存条件への FAIL が再現
+    された場合だけ FAILED」の裏返し。無応答で資金を永久凍結しないのと
+    同じ方針で、それ以外は承認側へ収束させる）。
+
+    resolution は condition_matched=false・実際の failed_condition_id を
+    記録し、資金は承認経路（child_work → child_payout）へ進む。
+    """
+
+    def _other_condition_fail(label):
+        return verification.VerificationOutcome(
+            result=verification.VerificationResult.FAIL,
+            reason="ARTIFACT_VALUE_MISMATCH",
+            canonical_artifact=None,
+            artifact_hash=None,
+            input_hash="1" * 64,
+            evidence=ledger.canonical_json_dumps(
+                {"injected": "arbiter_result_override", "result": "FAIL",
+                 "note": "different condition"}
+            ),
+            failed_condition_id="pad",
+            expected_value=0,
+            actual_value=99,
+        )
+
+    root_id, child_id, submission_id, dispute_id = _disputed_child(
+        demo_db, suffix="oth-cond"
+    )
+    buckets_before = _buckets(demo_db, root_id)
+    verification.arbiter_result_override = _other_condition_fail
+    results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
+    assert len(results) == 1
+    assert results[0].data["resolution"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
+
+    # FAILED にならず承認側へ収束する
+    job = _job(demo_db, child_id)
+    assert job["state"] == JobState.DONE.value
+    acceptance = demo_db.conn.execute(
+        "SELECT * FROM acceptances WHERE job_id = ?", (child_id,)
+    ).fetchone()
+    assert acceptance["decision"] == "APPROVED"
+    assert acceptance["submission_id"] == submission_id
+    # acceptances.reason にも FAIL の理由コードと実際の原因 condition を含む
+    assert "ARTIFACT_VALUE_MISMATCH" in acceptance["reason"]
+    assert "'pad'" in acceptance["reason"]
+    assert "'sum'" in acceptance["reason"]
+    payment = _payment_by_key(demo_db, f"payout:{child_id}")
+    assert payment is not None
+    assert payment["status"] == PaymentStatus.PENDING.value
+    assert payment["payee_id"] == AGENT_B_ID
+    # 承認経路の資金移動（child_work → child_payout）。返却・返金は起こらない
+    buckets = _buckets(demo_db, root_id)
+    assert buckets[(child_id, "child_work")] == 0
+    assert buckets[(child_id, "child_payout")] == TEN
+    assert buckets[(root_id, "available")] == buckets_before[(root_id, "available")]
+    dispute = _dispute_row(demo_db, dispute_id)
+    assert dispute["status"] == "RESOLVED"
+    resolution = _resolution_record(demo_db, dispute_id)
+    assert resolution["outcome"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
+    assert resolution["condition_matched"] is False
+    assert resolution["condition_id"] == "sum"
+    assert resolution["failed_condition_id"] == "pad"
+    assert resolution["expected_value"] == 0
+    assert resolution["actual_value"] == 99
+    assert resolution["reason"] == "ARTIFACT_VALUE_MISMATCH"
+    assert resolution["evidence"] == _other_condition_fail("x").evidence
+    assert resolution["input_hash"] == "1" * 64
+    assert resolution["verifier_id"] == verification.VERIFIER_ID
+    assert resolution["verifier_hash"] == verification.verifier_hash()
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_resolve_structural_fail_override_converges_to_approved(demo_db):
+    """異議の condition_id に**一致しない** FAIL（構造 FAIL。
+    failed_condition_id=None）を override で返させた場合も、Job は
+    FAILED にならず DONE ＋ Acceptance APPROVED へ収束する（構造 FAIL は
+    特定の condition に起因しない。override の結果を無検査で採用しない）。
+    """
+
+    def _structural_fail(label):
+        return verification.VerificationOutcome(
+            result=verification.VerificationResult.FAIL,
+            reason="ARTIFACT_TOO_DEEP",
+            canonical_artifact=None,
+            artifact_hash=None,
+            input_hash="2" * 64,
+            evidence=ledger.canonical_json_dumps(
+                {"injected": "arbiter_result_override", "result": "FAIL",
+                 "note": "structural"}
+            ),
+        )
+
+    root_id, child_id, _s, dispute_id = _disputed_child(
+        demo_db, suffix="struct-fail"
+    )
+    verification.arbiter_result_override = _structural_fail
+    results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
+    assert len(results) == 1
+    assert results[0].data["resolution"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
+
+    job = _job(demo_db, child_id)
+    assert job["state"] == JobState.DONE.value
+    acceptance = demo_db.conn.execute(
+        "SELECT * FROM acceptances WHERE job_id = ?", (child_id,)
+    ).fetchone()
+    assert acceptance["decision"] == "APPROVED"
+    assert "ARTIFACT_TOO_DEEP" in acceptance["reason"]
+    payment = _payment_by_key(demo_db, f"payout:{child_id}")
+    assert payment is not None
+    buckets = _buckets(demo_db, root_id)
+    assert buckets[(child_id, "child_work")] == 0
+    assert buckets[(child_id, "child_payout")] == TEN
+    resolution = _resolution_record(demo_db, dispute_id)
+    assert resolution["outcome"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
+    assert resolution["condition_matched"] is False
+    assert resolution["condition_id"] == "sum"
+    assert resolution["failed_condition_id"] is None
+    assert resolution["expected_value"] is None
+    assert resolution["actual_value"] is None
+    assert resolution["reason"] == "ARTIFACT_TOO_DEEP"
+    assert resolution["evidence"] == _structural_fail("x").evidence
+    assert resolution["input_hash"] == "2" * 64
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 
@@ -465,6 +615,13 @@ def test_unresponsive_arbiter_after_due_adopts_stored_pass(demo_db):
     assert resolution["input_hash"] == json.loads(
         submission["verification_evidence"]
     )["input_hash"]
+    # 無応答 fallback は判定器の証跡を持たないため failed_condition_id 系は
+    # None。保存済み PASS を採用するため condition_matched は True
+    # （FAIL 未再現ではなく、異議の condition_id への帰属は維持される）
+    assert resolution["condition_matched"] is True
+    assert resolution["failed_condition_id"] is None
+    assert resolution["expected_value"] is None
+    assert resolution["actual_value"] is None
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 def test_unresponsive_arbiter_past_due_converges_to_done(demo_db):

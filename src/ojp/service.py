@@ -175,6 +175,54 @@ class CommandResult:
     replayed: bool = False
 
 
+def _reject_operation_id_reuse(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str | None,
+    actor_id: str,
+    kind: str,
+    payload: dict[str, Any],
+) -> None:
+    """既存 operations 行との照合を前置検査より先に確定する（計画書 第16節
+    「operation_id UNIQUE＋actor/kind/payload_hash照合。同ID別payloadや別
+    Actorでの再利用はIDEMPOTENCY_CONFLICT」）。
+
+    approve のような業務キー再利用（reuse_existing_payment）の前置検査を
+    持つコマンドでは、前置検査が _run_idempotent の照合より先に動くと、
+    同じ operation_id を別 Actor / 別 payload で再利用したとき所定の
+    IDEMPOTENCY_CONFLICT ではなく FORBIDDEN / INVALID_TARGET に化ける。
+    それを防ぐため、前置検査の先頭（ドメイン検査より前）で呼び、
+    operation_id 照合を常に最優先にする。
+
+    - operation_id が None（呼出側で未指定）なら何もしない
+      （_run_idempotent が新規採番するため照合対象が存在しない）
+    - operations に行が無ければ何もしない（新規の operation_id）
+    - actor_id / kind / payload_hash のいずれかが不一致なら
+      OjpError(IDEMPOTENCY_CONFLICT)。比較は _run_idempotent と同じ
+      （payload は _run_idempotent へ渡すものと同一の dict を渡し、
+      同じ _payload_hash(payload) で照合する）
+    - 一致する場合は何もしない（_run_idempotent の replay 経路に任せる）
+    """
+    if operation_id is None:
+        return
+    existing = conn.execute(
+        "SELECT actor_id, kind, payload_hash FROM operations"
+        " WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    if existing is None:
+        return
+    if (
+        existing["actor_id"] != actor_id
+        or existing["kind"] != kind
+        or existing["payload_hash"] != _payload_hash(payload)
+    ):
+        raise OjpError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "operation_id was already used with a different actor/kind/payload",
+        )
+
+
 def _run_idempotent(
     conn: sqlite3.Connection,
     *,
@@ -1814,6 +1862,9 @@ def create_child(
     Child の成功条件は Root 公開 Version の task_catalog の該当エントリから
     導出する（input_values → input_json、expected → conditions_json と
     conditions_hash、verifier_id/hash は Root 公開 Version から継承）。
+    timing_policy はカタログ entry に timing_policy があればその値（Root
+    Requester の事前許可。第8節の延長）、無ければ Root 公開版を継承する。
+    A が timing を引数で指定することはできない（すり替えを許さない）。
     成功条件・検証器・入力・受取人のすり替えは引数として受け付けない
     （第5節「MCP 引数に actor_id・payee_id を受け付けない」、第15節より
     MCP と CLI は同じ Application API を呼ぶ。X06 の期待結果は「拒否」であり
@@ -2004,10 +2055,12 @@ def create_child(
             )
         # --- Child Job・JobVersion の作成と資金拘束を同じ transaction で確定 ---
         # 固定するもの: 作成時の A（requester_id）、creator_lease_id = 現在の
-        # Parent Lease、Root policy（timing / artifact access は Root 公開版を
-        # 継承）、指定 task_key（第8節）。Child からの再委託は必ず拒否される
-        # ため、Child の JobVersion には無効化した policy と空のカタログを
-        # 保存する（スキーマの CHECK「Childのparent_idはRootのみ」と一致）
+        # Parent Lease、Root policy（artifact access は Root 公開版を継承、
+        # timing はカタログ entry の事前許可があればそれを使い、無ければ
+        # Root 公開版を継承）、指定 task_key（第8節）。Child からの再委託は
+        # 必ず拒否されるため、Child の JobVersion には無効化した policy と
+        # 空のカタログを保存する（スキーマの CHECK「Childのparent_idは
+        # Rootのみ」と一致）
         child_version_id = f"version:{child_id}:1"
         c.execute(
             "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
@@ -2036,6 +2089,17 @@ def create_child(
             max_children=0,
             max_depth=0,
         )
+        # Child の timing_policy: カタログ entry に timing_policy があれば
+        # それを使う（Root Requester の事前許可。第8節の延長）。無ければ
+        # 従来どおり Root 公開版の timing を継承する。A が引数で timing を
+        # 指定することはできない（すり替えを許さない。カタログの値だけを
+        # 使う）
+        if entry.timing_policy is not None:
+            child_timing_json = ledger.canonical_json_dumps(
+                entry.timing_policy.model_dump()
+            )
+        else:
+            child_timing_json = parent_version["timing_policy"]
         c.execute(
             "INSERT INTO job_versions (id, job_id, version, title, budget_units,"
             " asset, input_json, verifier_id, verifier_hash, conditions_json,"
@@ -2055,7 +2119,7 @@ def create_child(
                 child_conditions_hash,
                 ledger.canonical_json_dumps(child_policy.model_dump()),
                 "[]",
-                parent_version["timing_policy"],
+                child_timing_json,
                 parent_version["artifact_access_policy"],
                 deadline_us,
             ),
@@ -2689,6 +2753,10 @@ def approve(
     # 経路（既存 payout:{job_id} があると apply_effects を呼ばずに既存結果を
     # 返す）でも権限・状態・対象の検査がすり抜けないように、業務キー再利用の
     # 可否を先に確定する（R2。N05 の再利用経路そのものは維持する）:
+    #   0. operation_id 照合（最優先。第16節）: 同じ operation_id を別
+    #      Actor / 別 payload（別 submission_id・別 job_id）で再利用した
+    #      場合は、ドメイン検査より先に IDEMPOTENCY_CONFLICT とする。
+    #      一致する再送は _run_idempotent の replay 経路に任せる
     #   1. Job が無ければ INVALID_TARGET
     #   2. submission_id がその Job の保存済み Submission でなければ
     #      INVALID_TARGET
@@ -2700,6 +2768,13 @@ def approve(
     #   6. それ以外（LEASED / DISPUTED / 終端で Acceptance が無い、または
     #      Acceptance の submission_id が違う）は INVALID_STATE
     with db.transaction(conn, immediate=False):
+        _reject_operation_id_reuse(
+            conn,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            kind="approve",
+            payload=payload,
+        )
         job = _get_job_row(conn, job_id)
         submission = conn.execute(
             "SELECT job_id FROM submissions WHERE id = ?", (submission_id,)
@@ -3310,18 +3385,21 @@ def resolve_due_disputes(
                     operation_id=op_id,
                     now=now,
                 )
-                resolution = ledger.canonical_json_dumps(
-                    {
-                        "outcome": "UNRESPONSIVE_ARBITER_STORED_PASS",
-                        "reason": "ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK",
-                        "evidence": str(submission["verification_evidence"]),
-                        "condition_id": str(dispute["condition_id"]),
-                        "verifier_id": str(version_row["verifier_id"]),
-                        "verifier_hash": str(version_row["verifier_hash"]),
-                        "input_hash": _stored_evidence_input_hash(
-                            str(submission["verification_evidence"])
-                        ),
-                    }
+                resolution = _dispute_resolution_fields(
+                    outcome="UNRESPONSIVE_ARBITER_STORED_PASS",
+                    reason="ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK",
+                    evidence=str(submission["verification_evidence"]),
+                    condition_id=str(dispute["condition_id"]),
+                    verifier_id=str(version_row["verifier_id"]),
+                    verifier_hash=str(version_row["verifier_hash"]),
+                    input_hash=_stored_evidence_input_hash(
+                        str(submission["verification_evidence"])
+                    ),
+                    arbitration=None,
+                    # 判定器の証跡が無い経路。保存済み PASS を採用するため
+                    # FAIL 未再現ではなく、異議の condition_id への帰属は
+                    # 維持される（condition_matched=True）
+                    condition_matched=True,
                 )
                 c.execute(
                     "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3383,9 +3461,48 @@ def resolve_due_disputes(
                 if job["state"] != JobState.DISPUTED.value:
                     return {"dispute_id": dispute_id, "skipped": True}
                 version_row = _get_job_version_row(c, str(submission["version_id"]))
-                if _verdict == "PASS":
-                    # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約
-                    reason = f"dispute resolved by arbitration PASS ({dispute_id})"
+                # FAIL が異議の condition_id に起因するか（第12節「既存条件へ
+                # の FAIL が再現された場合だけ FAILED」）。PASS 経路は常に
+                # True。FAIL でも原因 condition が特定できない（構造 FAIL）、
+                # または異議の condition_id と一致しない場合は False
+                # （異議は成立しなかったとして承認側へ収束する）
+                condition_matched = True
+                if _verdict == "FAIL":
+                    condition_matched = (
+                        _outcome is not None
+                        and _outcome.failed_condition_id is not None
+                        and _outcome.failed_condition_id
+                        == str(dispute["condition_id"])
+                    )
+                if _verdict == "PASS" or not condition_matched:
+                    # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約。
+                    # FAIL が異議の condition_id に起因しない場合も同じ
+                    # 承認側へ収束する（資金を凍結しない。第12節「無応答で
+                    # 資金を永久凍結しない」と同じ方針）
+                    if _verdict == "PASS":
+                        reason = (
+                            f"dispute resolved by arbitration PASS ({dispute_id})"
+                        )
+                        outcome_label = "PASS"
+                        reason_code = _outcome.reason if _outcome is not None else "OK"
+                    else:
+                        # FAIL は再現したが異議の condition_id に起因しない
+                        # （構造 FAIL・別 condition 起因）。異議は成立しなかった
+                        reason_code = _outcome.reason if _outcome is not None else "OK"
+                        actual_failed = (
+                            _outcome.failed_condition_id
+                            if _outcome is not None
+                            else None
+                        )
+                        reason = (
+                            f"dispute not upheld ({dispute_id}): arbitration"
+                            f" reproduced FAIL but not on condition"
+                            f" {dispute['condition_id']!r} (reason:"
+                            f" {reason_code}, failed_condition_id:"
+                            f" {actual_failed!r}). 第12節「既存条件への FAIL が"
+                            " 再現された場合だけ FAILED」に起因しないため承認側へ収束"
+                        )
+                        outcome_label = "FAIL_NOT_ON_DISPUTED_CONDITION"
                     payment_operation_id = f"{op_id}:payment"
                     _insert_operation(
                         c,
@@ -3413,16 +3530,20 @@ def resolve_due_disputes(
                         operation_id=op_id,
                         now=now,
                     )
-                    resolution = ledger.canonical_json_dumps(
-                        {
-                            "outcome": _verdict,
-                            "reason": _outcome.reason,
-                            "evidence": _outcome.evidence,
-                            "condition_id": str(dispute["condition_id"]),
-                            "verifier_id": str(version_row["verifier_id"]),
-                            "verifier_hash": str(version_row["verifier_hash"]),
-                            "input_hash": _outcome.input_hash,
-                        }
+                    resolution = _dispute_resolution_fields(
+                        outcome=outcome_label,
+                        reason=reason_code,
+                        evidence=(
+                            _outcome.evidence if _outcome is not None else None
+                        ),
+                        condition_id=str(dispute["condition_id"]),
+                        verifier_id=str(version_row["verifier_id"]),
+                        verifier_hash=str(version_row["verifier_hash"]),
+                        input_hash=(
+                            _outcome.input_hash if _outcome is not None else None
+                        ),
+                        arbitration=_outcome,
+                        condition_matched=condition_matched,
                     )
                     c.execute(
                         "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3447,10 +3568,11 @@ def resolve_due_disputes(
                     return {
                         "dispute_id": dispute_id,
                         "job_id": job["id"],
-                        "resolution": _verdict,
+                        "resolution": outcome_label,
                         "approval": data,
                     }
-                # FAIL → FAILED ＋ Acceptance REJECTED ＋ 返却／返金予約
+                # FAIL（異議の condition_id に起因する）→ FAILED ＋
+                # Acceptance REJECTED ＋ 返却／返金予約
                 c.execute(
                     "INSERT INTO acceptances (job_id, submission_id, decision,"
                     " decided_by, reason, decided_at_us) VALUES (?, ?, ?, ?, ?, ?)",
@@ -3460,7 +3582,8 @@ def resolve_due_disputes(
                         domain.AcceptanceDecision.REJECTED.value,
                         actor_id,
                         f"dispute resolved by arbitration FAIL ({dispute_id}):"
-                        f" {_outcome.reason}",
+                        f" {_outcome.reason} on condition"
+                        f" {dispute['condition_id']!r}",
                         now,
                     ),
                 )
@@ -3483,16 +3606,16 @@ def resolve_due_disputes(
                     operation_id=f"{op_id}:funds",
                     now=now,
                 )
-                resolution = ledger.canonical_json_dumps(
-                    {
-                        "outcome": "FAIL",
-                        "reason": _outcome.reason,
-                        "evidence": _outcome.evidence,
-                        "condition_id": str(dispute["condition_id"]),
-                        "verifier_id": str(version_row["verifier_id"]),
-                        "verifier_hash": str(version_row["verifier_hash"]),
-                        "input_hash": _outcome.input_hash,
-                    }
+                resolution = _dispute_resolution_fields(
+                    outcome="FAIL",
+                    reason=_outcome.reason,
+                    evidence=_outcome.evidence,
+                    condition_id=str(dispute["condition_id"]),
+                    verifier_id=str(version_row["verifier_id"]),
+                    verifier_hash=str(version_row["verifier_hash"]),
+                    input_hash=_outcome.input_hash,
+                    arbitration=_outcome,
+                    condition_matched=True,
                 )
                 c.execute(
                     "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3594,6 +3717,53 @@ def _stored_evidence_input_hash(evidence_json: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _dispute_resolution_fields(
+    *,
+    outcome: str,
+    reason: str,
+    evidence: str | None,
+    condition_id: str,
+    verifier_id: str,
+    verifier_hash: str,
+    input_hash: str | None,
+    arbitration: verification.VerificationOutcome | None,
+    condition_matched: bool,
+) -> str:
+    """disputes.resolution へ保存する canonical JSON を組み立てる（第12節）。
+
+    PASS / FAIL / 無応答 fallback / FAIL 不成立の全経路で、異議の
+    condition_id に加えて、裁定の原因 condition（failed_condition_id）と
+    判明した期待値・実値（expected_value / actual_value）、FAIL が異議の
+    condition_id に起因するか（condition_matched）を記録する。第12節
+    「既存条件への FAIL が再現された場合だけ FAILED」の判定根拠を
+    resolution へ残す。arbitration が None（無応答 fallback）の経路では
+    判定器の証跡が無いため failed_condition_id / expected_value /
+    actual_value は None とし、condition_matched は True（保存済み PASS
+    を採用するため FAIL の未再現ではない）とする。
+    """
+    return ledger.canonical_json_dumps(
+        {
+            "outcome": outcome,
+            "reason": reason,
+            "evidence": evidence,
+            "condition_id": condition_id,
+            "verifier_id": verifier_id,
+            "verifier_hash": verifier_hash,
+            "input_hash": input_hash,
+            "failed_condition_id": (
+                arbitration.failed_condition_id if arbitration is not None else None
+            ),
+            "expected_value": (
+                arbitration.expected_value if arbitration is not None else None
+            ),
+            "actual_value": (
+                arbitration.actual_value if arbitration is not None else None
+            ),
+            "condition_matched": condition_matched,
+        }
+    )
+
+
 def _arbitrate_dispute_outcome(
     conn: sqlite3.Connection, dispute_row: sqlite3.Row, *, now_us: int
 ) -> tuple[str, verification.VerificationOutcome | None]:
@@ -3611,6 +3781,11 @@ def _arbitrate_dispute_outcome(
     VERIFICATION_UNAVAILABLE）は「判定器が応答しない」扱いにする。書込
     transaction の外で呼ぶため、例外で DB は一切変更されない。
     now_us は読取 snapshot の時刻（応答があった場合の裁定実行の時刻参照）。
+    異議対象の condition_id を arbitrate へ渡し、戻り値の outcome は
+    「その condition_id に対する裁定結果」として扱う（FAIL でも
+    failed_condition_id が condition_id と一致しない場合は、呼出側が
+    FAILED にしない。第12節「既存条件への FAIL が再現された場合だけ
+    FAILED」）。
     """
     submission = conn.execute(
         "SELECT * FROM submissions WHERE id = ?", (dispute_row["submission_id"],)
@@ -3641,6 +3816,7 @@ def _arbitrate_dispute_outcome(
             verifier_id=version_row["verifier_id"],
             verifier_hash_value=version_row["verifier_hash"],
             original_evidence=str(submission["verification_evidence"]),
+            condition_id=str(dispute_row["condition_id"]),
         )
     except Exception:
         # 判定器が応答しない。fallback 適用の可否（now >= due_at_us）は

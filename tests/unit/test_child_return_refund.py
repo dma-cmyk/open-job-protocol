@@ -322,7 +322,10 @@ def test_n13_route_arbitration_fail_single_additional_refund(demo_db):
     assert _job_state(demo_db, child_id) == JobState.DISPUTED.value
     assert _refund_payment_count(demo_db, root_id) == 1
 
-    # 裁定 FAIL を注入して確定
+    # 裁定 FAIL を注入して確定（異議対象の condition "sum" に起因する
+    # FAIL。第12節「既存条件への FAIL が再現された場合だけ FAILED」を
+    # 満たす形。failed_condition_id を含めない override は FAIL 不成立へ
+    # 収束するため、ここでは "sum" を指定する）
     verification.arbiter_result_override = lambda label: (
         verification.VerificationOutcome(
             result=verification.VerificationResult.FAIL,
@@ -333,6 +336,9 @@ def test_n13_route_arbitration_fail_single_additional_refund(demo_db):
             evidence=ledger.canonical_json_dumps(
                 {"injected": "arbiter_result_override", "result": "FAIL"}
             ),
+            failed_condition_id="sum",
+            expected_value=6,
+            actual_value=5,
         )
     )
     try:
