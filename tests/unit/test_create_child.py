@@ -603,13 +603,12 @@ def test_amount_and_ratio_both_exceeded_returns_max_amount(demo_db):
         ({"max_ratio_bps": 0}, PolicyLimitReason.MAX_RATIO.value),
         ({"max_children": 0}, PolicyLimitReason.MAX_CHILDREN.value),
         ({"max_depth": 0}, PolicyLimitReason.MAX_DEPTH.value),
-        ({"enabled": False}, PolicyLimitReason.DISABLED.value),
     ],
 )
 def test_zero_or_disabled_policy_forbids_creation(
     demo_db, policy_overrides, expected_reason
 ):
-    """enabled=false / depth=0 / 上限 0 なら Child 作成不可（第10節）。"""
+    """depth=0 / 上限 0 なら Child 作成不可（第10節）。reason で区別する。"""
     root_id, _version_id, lease_id = _leased_root(
         demo_db,
         policy=_generous_policy(**policy_overrides),
@@ -619,6 +618,23 @@ def test_zero_or_disabled_policy_forbids_creation(
         _create_child(demo_db, root_id, lease_id, "part-1", TEN, "create:lz-c1")
     assert exc_info.value.code == ErrorCode.POLICY_LIMIT.value
     assert exc_info.value.details == {"reason": expected_reason}
+    _assert_balance(demo_db, root_id, u=0, available=ROOT_BUDGET_UNITS, count=0)
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_disabled_policy_forbids_creation_without_reason(demo_db):
+    """enabled=false は POLICY_LIMIT で拒否するが、計画書（第10節・第11節）は
+    この拒否に個別の details.reason を定めていないため、details は None の
+    まま返す（MAX_DEPTH 等へ読み替えない）。"""
+    root_id, _version_id, lease_id = _leased_root(
+        demo_db,
+        policy=_generous_policy(enabled=False),
+        suffix="lim-disabled",
+    )
+    with pytest.raises(OjpError) as exc_info:
+        _create_child(demo_db, root_id, lease_id, "part-1", TEN, "create:ld-c1")
+    assert exc_info.value.code == ErrorCode.POLICY_LIMIT.value
+    assert exc_info.value.details is None
     _assert_balance(demo_db, root_id, u=0, available=ROOT_BUDGET_UNITS, count=0)
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 

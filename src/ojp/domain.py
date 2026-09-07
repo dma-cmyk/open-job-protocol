@@ -44,11 +44,10 @@ class ErrorCode(StrEnum):
 class PolicyLimitReason(StrEnum):
     """再委託上限の拒否理由（計画書 第10節・第11節の details.reason）。
 
-    TASK_BUDGET / MAX_AMOUNT / MAX_RATIO / MAX_CHILDREN / MAX_DEPTH は計画書が
-    列挙する 5 種。金額と比率を同時に超える場合は MAX_AMOUNT を返す。
-    DISABLED は「enabled=false なら Child 作成不可」（第10節）に対応する理由で、
-    計画書が個別の reason を定めていないため本 PoC で追加した実装判断
-    （政策上の拒否であることを POLICY_LIMIT で揃える）。
+    計画書が列挙する 5 種だけ。金額と比率を同時に超える場合は
+    MAX_AMOUNT を返す。enabled=false の拒否（第10節「Child 作成不可」）に
+    個別の reason は定められていないため、POLICY_LIMIT のみを返し
+    details は付けない。
     """
 
     TASK_BUDGET = "TASK_BUDGET"
@@ -56,7 +55,6 @@ class PolicyLimitReason(StrEnum):
     MAX_RATIO = "MAX_RATIO"
     MAX_CHILDREN = "MAX_CHILDREN"
     MAX_DEPTH = "MAX_DEPTH"
-    DISABLED = "DISABLED"
 
 
 class OjpError(Exception):

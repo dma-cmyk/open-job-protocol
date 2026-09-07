@@ -74,11 +74,16 @@ def _create_open_root(handle, suffix, *, budget="100.000000", budget_units=ROOT_
     return job_id, created.data["version_id"]
 
 
-def _insert_child_with_work(conn, root_id, child_id, *, budget_units, state=JobState.OPEN.value):
+def _insert_child_with_work(
+    conn, root_id, child_id, *, budget_units, state=JobState.OPEN.value,
+    deadline_us=DEADLINE_US,
+):
     """Child Job 行と child_work 拘束を作る（S2 の create_child が来るまでの土台）。
 
     child_work の拘束は ledger.allocate_child_work_in_tx（S2 の Child 作成が
     使うのと同じ台帳プリミティブ）で行い、台帳の保存則を実際に満たす形にする。
+    deadline_us は Root と別の期限を指定できる（Child だけを期限到来させる
+    fixture で使う。第8節: Child は独自の deadline を持つ）。
     """
     with db.transaction(conn, immediate=True):
         version_id = f"version:{child_id}:1"
@@ -92,7 +97,7 @@ def _insert_child_with_work(conn, root_id, child_id, *, budget_units, state=JobS
             "INSERT INTO job_versions (id, job_id, version, title, budget_units,"
             " asset, subcontract_policy, task_catalog, timing_policy, deadline_us)"
             " VALUES (?, ?, 1, ?, ?, 'mock-USDC', '{}', '[]', '{}', ?)",
-            (version_id, child_id, f"child {child_id}", budget_units, DEADLINE_US),
+            (version_id, child_id, f"child {child_id}", budget_units, deadline_us),
         )
         conn.execute(
             "UPDATE jobs SET version_id = ? WHERE id = ?", (version_id, child_id)
@@ -105,6 +110,24 @@ def _insert_child_with_work(conn, root_id, child_id, *, budget_units, state=JobS
             operation_id=f"allocate:{child_id}",
             now_us=TEST_T0_US,
         )
+
+
+def _lifecycle_audit_snapshot(conn):
+    """Job・Lease・残高・Journal・Operation・PaymentOperation の全体スナップショット。
+    認可拒否がいずれの表も変更しないことの前後比較に使う（タプルで比較可能に）。
+    """
+    def _rows(sql):
+        return tuple(tuple(r) for r in conn.execute(sql).fetchall())
+
+    return (
+        _rows("SELECT * FROM jobs ORDER BY id"),
+        _rows("SELECT * FROM leases ORDER BY id"),
+        _rows("SELECT * FROM budget_accounts ORDER BY id"),
+        _rows("SELECT * FROM journal_transactions ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_entries ORDER BY operation_id, entry_no"),
+        _rows("SELECT * FROM operations ORDER BY operation_id"),
+        _rows("SELECT * FROM payment_operations ORDER BY operation_id"),
+    )
 
 
 def _view(conn, root_id):
@@ -749,3 +772,332 @@ def test_abandon_replay_is_idempotent_and_invariants_hold(test_db):
     view = _view(test_db.conn, job_id)
     assert view.locked_breakdown_units["refund"] == ROOT_BUDGET_UNITS  # 二重予約なし
     ledger.assert_ledger_invariants(test_db.conn, job_id)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle の service 層認可: expire_due_leases は system 専用
+# ---------------------------------------------------------------------------
+
+
+def _due_child_world(test_db, suffix, *, child_deadline_us=None):
+    """期限到来 Job を持つ世界を作り、(root_id, child_id, child_lease_id) を返す。
+
+    Child の Lease だけを期限到来させる（Parent の Lease は延ばさない）。
+    """
+    _prepare_db(test_db)
+    root_id, root_version = _create_open_root(test_db, f"auth-{suffix}")
+    # Root を Claim してから Child を作る（Parent 生存中の Child 経路）
+    service.claim(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=root_id,
+        expected_version_id=root_version,
+        operation_id=f"claim:auth-{suffix}",
+    )
+    child_id = f"job:child-auth-{suffix}"
+    _insert_child_with_work(
+        test_db.conn, root_id, child_id, budget_units=10_000_000,
+        deadline_us=(
+            child_deadline_us if child_deadline_us is not None else DEADLINE_US
+        ),
+    )
+    child_version_id = test_db.conn.execute(
+        "SELECT version_id FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()["version_id"]
+    claimed = _claim_as(
+        test_db.conn, child_id, child_version_id, AGENT_B_ID, f"claim:auth-{suffix}-c"
+    )
+    # Child の Lease だけ期限到来（Parent は heartbeat で延ばす）
+    clock.set_test_now(test_db.conn, TEST_T0_US + 50_000_000)
+    service.heartbeat(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=root_id,
+        lease_id=f"lease:claim:auth-{suffix}",
+        generation=1,
+        operation_id=f"heartbeat:auth-{suffix}",
+    )
+    clock.set_test_now(test_db.conn, TEST_T0_US + 61_000_000)
+    return root_id, child_id, claimed.data["lease_id"]
+
+
+def test_expire_due_leases_by_non_system_actor_is_forbidden(test_db):
+    """登録済みの非system Actor（agent）が期限到来 Job へ expire_due_leases を
+    呼ぶと FORBIDDEN。拒否後に Job・Lease・残高・Journal・Operation・
+    PaymentOperation は一切不変。"""
+    root_id, child_id, _lease_id = _due_child_world(test_db, "fb")
+    before = _lifecycle_audit_snapshot(test_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.expire_due_leases(test_db.conn, actor_id=AGENT_A_ID)
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert test_db.conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()["state"] == JobState.LEASED.value
+    assert _lifecycle_audit_snapshot(test_db.conn) == before  # 副作用なし
+    # 拒否に使った操作 ID は DB に残らない（非systemが ID を消費しない）
+    # 続けて system が正常に失効処理できる
+    results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    assert [r.data["job_id"] for r in results] == [child_id]
+    assert results[0].data["state"] == JobState.EXPIRED.value
+    expiry_op_row = test_db.conn.execute(
+        "SELECT actor_id FROM operations WHERE operation_id = ?",
+        (results[0].operation_id,),
+    ).fetchone()
+    assert expiry_op_row["actor_id"] == SYSTEM_ID
+    view = _view(test_db.conn, root_id)
+    assert view.locked_breakdown_units["child_work"] == 0
+    # child_work 10 → available（Root 生存）: available は fund 100 に戻る
+    assert view.available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_expire_due_leases_by_unregistered_actor_is_forbidden(test_db):
+    """未登録 Actor でも FORBIDDEN（participants 行が無い場合も同様）。"""
+    _due_child_world(test_db, "fb-unreg")
+    before = _lifecycle_audit_snapshot(test_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.expire_due_leases(test_db.conn, actor_id="pt-unknown")
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert _lifecycle_audit_snapshot(test_db.conn) == before
+
+
+def test_expire_due_leases_non_system_forbidden_even_without_targets(test_db):
+    """期限対象が 0 件でも非system呼出しは FORBIDDEN（空配列ではない）。"""
+    _prepare_db(test_db)
+    _create_open_root(test_db, "auth-none")  # 期限到来 Job は無い
+    with pytest.raises(OjpError) as exc_info:
+        service.expire_due_leases(test_db.conn, actor_id=AGENT_B_ID)
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    # system なら対象 0 件で空配列を返す
+    assert service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID) == []
+
+
+# ---------------------------------------------------------------------------
+# Parent 生存中の Child 原資返却: return:{child_id} の記録（第16節の表）
+# ---------------------------------------------------------------------------
+
+
+def _return_op_row(conn, child_id):
+    return conn.execute(
+        "SELECT operation_id, actor_id, kind, status FROM operations"
+        " WHERE business_key = ?",
+        (f"return:{child_id}",),
+    ).fetchone()
+
+
+def _journal_of(conn, operation_id):
+    return conn.execute(
+        "SELECT operation_id, reason, created_at_us FROM journal_transactions"
+        " WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+
+
+def test_child_expiry_records_return_business_key(test_db):
+    """Parent 生存中の Child 期限失効後、operations.business_key =
+    return:{child_id} がちょうど 1 件。Operation ID は返却 Journal の
+    operation_id と一致し、actor は system、kind は return。"""
+    root_id, child_id, _lease_id = _due_child_world(test_db, "ret-exp")
+    results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    assert [r.data["job_id"] for r in results] == [child_id]
+    funds_op_id = f"{results[0].operation_id}:funds"
+
+    row = _return_op_row(test_db.conn, child_id)
+    assert row is not None
+    assert row["actor_id"] == SYSTEM_ID
+    assert row["kind"] == "return"
+    assert row["status"] == "SUCCEEDED"
+    assert row["operation_id"] == funds_op_id
+    # 返却 Journal と同じ operation_id
+    journal = _journal_of(test_db.conn, funds_op_id)
+    assert journal is not None
+    assert journal["reason"] == "return"
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    assert view.locked_breakdown_units["child_work"] == 0
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_child_abandon_records_return_business_key(test_db):
+    """Parent 生存中の Child abandon 後も同じ business key が 1 件。
+    Operation と Journal の ID が一致し、actor は Child Worker (B)。"""
+    _prepare_db(test_db)
+    root_id, root_version = _create_open_root(test_db, "ret-ab")
+    service.claim(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=root_id,
+        expected_version_id=root_version,
+        operation_id="claim:ret-ab",
+    )
+    child_id = "job:child-ret-ab"
+    _insert_child_with_work(test_db.conn, root_id, child_id, budget_units=10_000_000)
+    child_version_id = test_db.conn.execute(
+        "SELECT version_id FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()["version_id"]
+    claimed = _claim_as(test_db.conn, child_id, child_version_id, AGENT_B_ID, "claim:ret-ab-c")
+    result = service.abandon(
+        test_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=claimed.data["lease_id"],
+        operation_id="abandon:ret-ab-c",
+    )
+    funds_op_id = f"{result.operation_id}:funds"
+    row = _return_op_row(test_db.conn, child_id)
+    assert row is not None
+    assert row["actor_id"] == AGENT_B_ID  # abandon を実行した Child Worker
+    assert row["kind"] == "return"
+    assert row["operation_id"] == funds_op_id
+    journal = _journal_of(test_db.conn, funds_op_id)
+    assert journal is not None
+    # business_key 行は 1 件だけ
+    count = test_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+        (f"return:{child_id}",),
+    ).fetchone()["c"]
+    assert count == 1
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS  # child_work 10 → available
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_same_child_return_with_different_operation_id_is_invalid_state(test_db):
+    """異なる operation_id から同じ Child 返却を再試行すると INVALID_STATE。
+    business_key 行・Journal・残高は増えない。"""
+    root_id, child_id, _lease_id = _due_child_world(test_db, "ret-dup")
+    results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    assert len(results) == 1
+    # Parent 生存中の return:{child_id} が消費済み。同じ Child をもう一度
+    # 終端化する正常な経路は存在しないため、business_key 競合を
+    # return_child_work（同じ業務効果のコマンド）で直接再現する
+    before = _lifecycle_audit_snapshot(test_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=root_id,
+            child_id=child_id,
+            amount_units=0,  # no-op だと business_key を消費しない
+            operation_id="return:ret-dup-zero",
+        )
+    # no_op の呼び出しは新しい return:{child_id} を消費しない（正常 no-op）
+    assert _lifecycle_audit_snapshot(test_db.conn) == before
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=root_id,
+            child_id=child_id,
+            amount_units=10_000_000,
+            operation_id="return:ret-dup-second",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert _lifecycle_audit_snapshot(test_db.conn) == before  # 第二の効果なし
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_child_return_idempotent_resend_does_not_duplicate(test_db):
+    """同一 expiry／abandon の冪等再送でも business_key 行と Journal が増えない。"""
+    root_id, child_id, _lease_id = _due_child_world(test_db, "ret-replay")
+    first = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    assert len(first) == 1
+    # 同じ expiry operation_id（= 期限の再実行）は replay
+    again = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    assert again == []
+    count_ops = test_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+        (f"return:{child_id}",),
+    ).fetchone()["c"]
+    count_journal = test_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM journal_transactions WHERE operation_id = ?",
+        (f"{first[0].operation_id}:funds",),
+    ).fetchone()["c"]
+    assert count_ops == 1
+    assert count_journal == 1
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_child_return_abandon_replay_does_not_duplicate(test_db):
+    """abandon の冪等再送でも business_key 行と Journal が増えない。"""
+    _prepare_db(test_db)
+    root_id, root_version = _create_open_root(test_db, "ret-ab-rp")
+    service.claim(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=root_id,
+        expected_version_id=root_version,
+        operation_id="claim:ret-ab-rp",
+    )
+    child_id = "job:child-ret-ab-rp"
+    _insert_child_with_work(test_db.conn, root_id, child_id, budget_units=10_000_000)
+    child_version_id = test_db.conn.execute(
+        "SELECT version_id FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()["version_id"]
+    claimed = _claim_as(
+        test_db.conn, child_id, child_version_id, AGENT_B_ID, "claim:ret-ab-rp-c"
+    )
+    first = service.abandon(
+        test_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=claimed.data["lease_id"],
+        operation_id="abandon:ret-ab-rp-c",
+    )
+    replay = service.abandon(
+        test_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=claimed.data["lease_id"],
+        operation_id="abandon:ret-ab-rp-c",
+    )
+    assert replay.replayed is True
+    assert replay.data == first.data
+    count_ops = test_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+        (f"return:{child_id}",),
+    ).fetchone()["c"]
+    count_journal = test_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM journal_transactions WHERE operation_id = ?",
+        (f"{first.operation_id}:funds",),
+    ).fetchone()["c"]
+    assert count_ops == 1
+    assert count_journal == 1
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, root_id)
+
+
+def test_child_work_zero_noop_does_not_consume_return_business_key(test_db):
+    """child_work == 0 の no-op では新しい return:{child_id} を消費しない。"""
+    _prepare_db(test_db)
+    root_id, _root_version = _create_open_root(test_db, "ret-zero")
+    child_id = "job:child-ret-zero"
+    _insert_child_with_work(
+        test_db.conn, root_id, child_id, budget_units=10_000_000
+    )
+    # child_work を返却済みにして 0 にする（Parent 生存中の return 経路）
+    with db.transaction(test_db.conn, immediate=True):
+        ledger.child_failure_return_in_tx(
+            test_db.conn,
+            root_id=root_id,
+            child_id=child_id,
+            amount_units=10_000_000,
+            operation_id="return:ret-zero-first",
+            now_us=TEST_T0_US,
+            parent_terminal_refund_reserved=False,
+            child_done_payment_pending=False,
+        )
+    # この直接組み立ての operations 行は無い（business_key は未消費）
+    # Child を期限到来させ、child_work=0 での失効処理は no-op になる
+    clock.set_test_now(test_db.conn, DEADLINE_US)
+    results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    by_job = {r.data["job_id"]: r for r in results}
+    assert by_job[child_id].data["funds"]["amount_units"] == 0
+    # no-op は return:{child_id} を消費しない
+    assert _return_op_row(test_db.conn, child_id) is None
+    ledger.assert_ledger_invariants(test_db.conn, root_id)

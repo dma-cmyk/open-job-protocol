@@ -954,6 +954,28 @@ def heartbeat(
 # 呼出側から受け取る。
 
 
+def _require_system_actor(conn: sqlite3.Connection, actor_id: str) -> None:
+    """Lifecycle（expire_due_leases / reserve_refundable_balance）の呼出側が
+    DB に登録された system Participant であることを検査する（計画書 第14節
+    「tick／seedはsystem」。呼出側 scheduler／CLI だけに認可を任せない）。
+
+    participants を actor_id で検索し、行が無い場合または kind != system の
+    場合は FORBIDDEN。検査は呼出直後（対象の収集・既存 Operation の replay
+    より前）と、各書込 transaction 内（状態変更や Operation 確定の前）の
+    両方で行う。対象収集後に Participant の kind が変更される可能性を
+    残さないため、transaction 内でもう一度検証する。
+    """
+    row = conn.execute(
+        "SELECT kind FROM participants WHERE id = ?", (actor_id,)
+    ).fetchone()
+    if row is None or row["kind"] != domain.ParticipantKind.SYSTEM.value:
+        raise OjpError(
+            ErrorCode.FORBIDDEN,
+            f"actor {actor_id!r} is not a registered system participant"
+            " (Lifecycle は system 専用. 第14節「tick／seedはsystem」)",
+        )
+
+
 def _active_lease_has_valid_submission(conn: sqlite3.Connection, job_id: str) -> bool:
     """有効提出（submissions 行）が存在するか。失効処理は有効提出が無い
     場合にだけ Job を EXPIRED にする（第6節「Lease失効またはJob deadline
@@ -1137,7 +1159,9 @@ def _child_terminal_fund_effects(
     """Child 終端時の資金の後始末（計画書 第8節・第9節・第16節）。
 
     - Parent 生存中: child_work → available へ戻す
-      （ledger.child_failure_return_in_tx の通常経路。return:{child_id} 相当）。
+      （ledger.child_failure_return_in_tx の通常経路）。資金移動と同じ
+      書込 transaction 内で、派生資金 operation_id に対応する operations 行
+      （business_key return:{child_id}）を service 層から記録する。
       判定未確定の原資だけを戻す
     - Parent が FAILED / EXPIRED（終端）: child_work → available → refund の
       2 移動をこの 1 transaction（1 操作）で記録し、途中の available を外から
@@ -1149,6 +1173,8 @@ def _child_terminal_fund_effects(
     - Parent DONE はここに含めない。Parent 提出は全 Child 判定終端が前提
       （第8節 CHILDREN_UNRESOLVED）なので、DONE の Parent に生存 Child は
       存在し得ず、戻し先は available でよい
+    - child_work が 0 の no-op では新しい return:{child_id} を消費しない
+      （operations 行を作らない。第16節の残額 0 no-op と同じ規則）
     """
     child_id = str(job["id"])
     root_id = str(job["root_id"])
@@ -1161,6 +1187,32 @@ def _child_terminal_fund_effects(
         JobState.EXPIRED.value,
     }
     if not parent_terminal:
+        # Parent 生存中: child_work → available。派生資金 operation_id
+        # （expiry:...:funds / abandon:...:funds）と同じ operation_id で
+        # business_key return:{child_id} の operations 行を資金移動より先に
+        # 挿入する（第16節の表「Child原資返却: return:{child_id}」。既存の
+        # _insert_operation と migration 002 の operations_business_key_unique
+        # を利用）。異なる operation_id で同じ return:{child_id} が使われて
+        # いれば INVALID_STATE となり、transaction 全体が rollback されて
+        # Journal・残高変更を残さない
+        _insert_operation(
+            conn,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            kind="return",
+            payload_hash=_payload_hash(
+                {
+                    "root_id": root_id,
+                    "child_id": child_id,
+                    "amount_units": child_work_units,
+                    "parent_terminal_refund_reserved": False,
+                }
+            ),
+            business_key=f"return:{child_id}",
+            status=OperationStatus.SUCCEEDED,
+            result=None,
+            now_us=now_us,
+        )
         return ledger.child_failure_return_in_tx(
             conn,
             root_id=root_id,
@@ -1304,7 +1356,9 @@ def expire_due_leases(
     actor_id は起動設定が決める system Actor（第5節: サーバー起動設定から
     ActorContext を作る。第14節: tick／seedはsystem）。operations 行の
     actor_id は participants への FK があるため、呼出側（tick）が system
-    participant の ID を渡す。
+    participant の ID を渡す。service 層でも DB に登録された
+    ParticipantKind.SYSTEM の Actor であることを検証する
+    （_require_system_actor。呼出側 scheduler／CLI だけには任せない）。
 
     - 対象 1: 有効 Lease で now >= expires_at_us。→ closed_reason='expired'
       にし、有効提出が無ければ Job を EXPIRED にする
@@ -1323,11 +1377,19 @@ def expire_due_leases(
     - 自動処理の operation_id は第16節の規約に従い `expiry:{lease_id}`
       （Lease を伴わない Job 失効は `expiry:job:{job_id}`）。資金移動には
       派生 ID を割り当て、**同じ期限を二重処理しない**（再実行は冪等）
+    - **認可は service 層で行う**: 呼出 Actor が DB 登録済みの system
+      Participant でなければ FORBIDDEN（_require_system_actor）。期限対象の
+      収集前に検査するため、対象が 0 件でも非system呼出しは空配列ではなく
+      FORBIDDEN。各対象の書込 transaction 内でも、状態変更や Operation の
+      確定前に再検証する（収集後に kind が変更される可能性を残さない）
     - 1 対象ずつ独立した _run_idempotent（BEGIN IMMEDIATE）で処理し、
       now は各 transaction 内で 1 回だけ採取する。DB_BUSY は
       _run_idempotent の再試行に任せる
     """
     del escrow  # 資金移動は同一 DB の内部移動のみ（Escrow port は使わない）
+    # 認可は対象の収集より先（対象が 0 件でも非systemは FORBIDDEN）
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
     # 対象の収集は読み取りだけ（各対象の確定はそれぞれ独立した書込
     # transaction で行い、書込ロック内で再確認する）
     with db.transaction(conn, immediate=False):
@@ -1352,6 +1414,10 @@ def expire_due_leases(
                 str(lease_row["id"]) if lease_row is not None else None
             ),
         ) -> dict[str, Any]:
+            # 書込 transaction 内で認可を再検証する（収集後に Participant の
+            # kind が変更される可能性を残さない。状態変更や Operation の
+            # 確定より前）
+            _require_system_actor(c, actor_id)
             current = _get_job_row(c, _job_id)
             if current["state"] in {s.value for s in domain.TERMINAL_JOB_STATES}:
                 # 既に終端（先に有効提出や別の失効が確定した）。何もしない
@@ -1592,14 +1658,25 @@ def reserve_refundable_balance(
 
     actor_id は起動設定が決める system Actor（expire_due_leases と同じく
     tick からの呼び出しを想定。operations 行の actor_id は participants への
-    FK を満たす必要がある）。冪等性は operation_id の replay と、返金予約側の
-    business_key（refund:{root_id}:terminal）の PaymentOperation が担うため、
-    この operations 行自体は business_key を持たない（SUBMITTED / DONE での
+    FK を満たす必要がある）。**認可は service 層で行う**: 呼出 Actor が DB
+    登録済みの system Participant でなければ FORBIDDEN
+    （_require_system_actor）。_run_idempotent へ入る前に検査するため、
+    既存 Operation の replay を返す前にも system であることを保証する。
+    新規効果については _apply の書込 transaction 内でも再検証する。
+    冪等性は operation_id の replay と、返金予約側の business_key
+    （refund:{root_id}:terminal）の PaymentOperation が担うため、この
+    operations 行自体は business_key を持たない（SUBMITTED / DONE での
     hold 判定や no-op が業務キーを消費しないようにする）。
     """
+    # 認可は _run_idempotent より前（既存 Operation の replay を返す前に
+    # system であることを保証する）。拒否なら外側 Operation も残さない
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
     payload = {"root_id": root_id}
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 書込 transaction 内で認可を再検証する（新規効果の確定より前）
+        _require_system_actor(c, actor_id)
         job = _get_job_row(c, root_id)
         if job["parent_id"] is not None:
             raise OjpError(
@@ -1680,9 +1757,9 @@ def create_child(
        意味を持たない。それ以外の共通判定はそのまま適用する）
     2. 作成可否（カタログ参照・重複・予算件数の検査より先）: 親が depth=1
        （Child からの発注）なら POLICY_LIMIT/MAX_DEPTH で資金移動をしない。
-       policy.enabled=false なら POLICY_LIMIT/DISABLED、policy.max_depth=0
-       なら POLICY_LIMIT/MAX_DEPTH（「enabled=false／depth=0／上限0なら
-       Child 作成不可」第10節）
+       policy.enabled=false なら POLICY_LIMIT（details なし。計画書が個別の
+       reason を定めていない）、policy.max_depth=0 なら POLICY_LIMIT/MAX_DEPTH
+       （「enabled=false／depth=0／上限0ならChild 作成不可」第10節）
     3. カタログ参照 → task_key 重複 → 予算・件数:
        - 未知の task_key（カタログ外）は TASK_NOT_ALLOWED
        - 生存中（DRAFT/OPEN/LEASED/SUBMITTED/DISPUTED）または成功済み（DONE）
@@ -1797,8 +1874,11 @@ def create_child(
             parent_version["subcontract_policy"]
         )
         if not policy.enabled:
-            raise _policy_limit_error(
-                domain.PolicyLimitReason.DISABLED,
+            # enabled=false なら Child 作成不可（第10節）。計画書はこの拒否に
+            # 個別の details.reason を定めていないため、POLICY_LIMIT のみを
+            # 返し details は None にする（MAX_DEPTH 等へ読み替えない）
+            raise OjpError(
+                ErrorCode.POLICY_LIMIT,
                 "subcontracting is disabled by the root policy"
                 " (enabled=false なら Child 作成不可。第10節)",
             )

@@ -406,6 +406,121 @@ def test_rrb_no_op_when_available_is_zero(demo_db):
 
 
 # ---------------------------------------------------------------------------
+# reserve_refundable_balance の service 層認可: system 専用
+# ---------------------------------------------------------------------------
+
+
+def _rrb_audit_snapshot(conn):
+    """available/refund・Journal・Operation・PaymentOperation の前後比較用
+    スナップショット（認可拒否がいずれの表も変更しないことの検証）。"""
+
+    def _rows(sql):
+        return tuple(tuple(r) for r in conn.execute(sql).fetchall())
+
+    return (
+        _rows("SELECT * FROM budget_accounts ORDER BY id"),
+        _rows("SELECT * FROM journal_transactions ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_entries ORDER BY operation_id, entry_no"),
+        _rows("SELECT * FROM operations ORDER BY operation_id"),
+        _rows("SELECT * FROM payment_operations ORDER BY operation_id"),
+    )
+
+
+def test_rrb_by_non_system_actor_is_forbidden(demo_db):
+    """返金予約がまだない FAILED Root へ、登録済み非system Actor（human）の
+    reserve_refundable_balance は FORBIDDEN。拒否後に available/refund・
+    Journal・Operation・PaymentOperation は不変。system が同じ operation_id で
+    後から正常に予約でき、Operation と派生 Payment Operation の監査 Actor が
+    system になる。"""
+    root_id, _v, _lease_id = _leased_root(demo_db, suffix="rrb-auth")
+    # 返金予約がまだない FAILED Root（force_job_state による暫定的な組み立て。
+    # 実際の終端経路は終端化 transaction で予約を確定するため）
+    force_job_state(demo_db.conn, root_id, JobState.FAILED)
+    before = _rrb_audit_snapshot(demo_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_refundable_balance(
+            demo_db.conn, actor_id=REQUESTER_ID, root_id=root_id,
+            operation_id="reserve:rrb-auth-1",
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert _rrb_audit_snapshot(demo_db.conn) == before  # 副副作用なし
+
+    # 拒否に使った operation_id は DB に残らない。後から system が同じ ID で
+    # 正常に予約できる
+    result = service.reserve_refundable_balance(
+        demo_db.conn, actor_id=SYSTEM_ID, root_id=root_id,
+        operation_id="reserve:rrb-auth-1",
+    )
+    assert result.data["action"] == "refund_reserved"
+    assert result.operation_id == "reserve:rrb-auth-1"
+    assert result.replayed is False
+    # 監査 Actor は system（外側 Operation と派生 Payment Operation 両方）
+    outer = demo_db.conn.execute(
+        "SELECT actor_id FROM operations WHERE operation_id = ?",
+        ("reserve:rrb-auth-1",),
+    ).fetchone()
+    assert outer["actor_id"] == SYSTEM_ID
+    payment_op_id = result.data["payment_operation_id"]
+    payment_actor = demo_db.conn.execute(
+        "SELECT actor_id FROM operations WHERE operation_id = ?",
+        (payment_op_id,),
+    ).fetchone()
+    assert payment_actor["actor_id"] == SYSTEM_ID
+    ops = _payment_ops(demo_db, root_id)
+    assert [o["business_key"] for o in ops] == [f"refund:{root_id}:terminal"]
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_rrb_by_agent_actor_is_forbidden(demo_db):
+    """登録済み agent でも FORBIDDEN（human だけでなく非system全般で拒否）。"""
+    root_id, _v, _lease_id = _leased_root(demo_db, suffix="rrb-auth-agent")
+    force_job_state(demo_db.conn, root_id, JobState.FAILED)
+    before = _rrb_audit_snapshot(demo_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_refundable_balance(
+            demo_db.conn, actor_id=AGENT_A_ID, root_id=root_id,
+            operation_id="reserve:rrb-auth-agent-1",
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert _rrb_audit_snapshot(demo_db.conn) == before
+    # 拒否後も system は同じ operation_id で予約できる
+    result = service.reserve_refundable_balance(
+        demo_db.conn, actor_id=SYSTEM_ID, root_id=root_id,
+        operation_id="reserve:rrb-auth-agent-1",
+    )
+    assert result.data["action"] == "refund_reserved"
+
+
+def test_rrb_by_unregistered_actor_is_forbidden(demo_db):
+    """未登録 Actor でも FORBIDDEN（participants 行が無い場合も同様）。"""
+    root_id, _v, _lease_id = _leased_root(demo_db, suffix="rrb-auth-unreg")
+    force_job_state(demo_db.conn, root_id, JobState.FAILED)
+    before = _rrb_audit_snapshot(demo_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_refundable_balance(
+            demo_db.conn, actor_id="pt-unknown", root_id=root_id,
+            operation_id="reserve:rrb-auth-unreg-1",
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert _rrb_audit_snapshot(demo_db.conn) == before
+
+
+def test_rrb_non_system_rejected_even_for_hold_state(demo_db):
+    """hold 状態（OPEN 等）の Root でも、非system Actor は予約・hold 判定の
+    どちらも実行できない（system 専用 Lifecycle）。"""
+    root_id, _v, _lease_id = _leased_root(demo_db, suffix="rrb-auth-open")
+    before = _rrb_audit_snapshot(demo_db.conn)
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_refundable_balance(
+            demo_db.conn, actor_id=REQUESTER_ID, root_id=root_id,
+            operation_id="reserve:rrb-auth-open-1",
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert _rrb_audit_snapshot(demo_db.conn) == before
+
+
+# ---------------------------------------------------------------------------
 # Done when 1: N03。Child を LEASED / SUBMITTED / DISPUTED にして Parent 失敗
 # ---------------------------------------------------------------------------
 
@@ -649,6 +764,15 @@ def test_n13_additional_refund_after_parent_refund(demo_db):
     )
     assert replay.replayed is True
     assert len(_payment_ops(demo_db, root_id)) == 2
+
+    # Parent 終端後の経路は return:{child_id} を消費しない
+    # （追加返金は refund:{root_id}:child-return:{child_id} の PaymentOperation
+    #   で一意にする。第16節の表）
+    return_ops = demo_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+        (f"return:{child_id}",),
+    ).fetchone()["c"]
+    assert return_ops == 0
 
     # settle: 返金累計は入金額 100 と一致する（超えない）
     results = service.process_payments(demo_db.conn)
