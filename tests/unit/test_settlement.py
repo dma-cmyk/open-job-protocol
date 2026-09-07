@@ -507,6 +507,23 @@ def _payment_count(conn, business_key=None):
     return int(conn.execute(sql, params).fetchone()["c"])
 
 
+def _audit_snapshot(conn):
+    """拒否の前後比較用スナップショット（operations・payment_operations・
+    Journal・口座残高・Job 状態の一切が不変であることの検証）。"""
+
+    def _rows(sql):
+        return tuple(tuple(r) for r in conn.execute(sql).fetchall())
+
+    return (
+        _rows("SELECT * FROM operations ORDER BY operation_id"),
+        _rows("SELECT * FROM payment_operations ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_transactions ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_entries ORDER BY operation_id, entry_no"),
+        _rows("SELECT * FROM budget_accounts ORDER BY id"),
+        _rows("SELECT id, state, row_version FROM jobs ORDER BY id"),
+    )
+
+
 def test_reserve_child_payout_zero_noop_keeps_payout_business_key(test_db):
     """reserve_child_payout(amount_units=0) は正常 no-op で payout:{child_id} を
     消費しない。
@@ -1164,3 +1181,137 @@ def test_payment_failure_view_exposes_reason_and_locked_reservation(test_db):
     assert failure.kind.value == "payout"
     # 存在しない operation は None
     assert ledger.get_payment_failure_view(test_db.conn, "payout:ghost") is None
+
+
+# ---------------------------------------------------------------------------
+# 正額確定後の負数は INVALID_ARGUMENT（業務キー照会より前の引数検査）
+# ---------------------------------------------------------------------------
+
+
+def test_negative_after_real_child_payout_is_invalid_argument(test_db):
+    """正額の Child payout を確定させた後、別 operation_id で負数を渡すと
+    INVALID_ARGUMENT になる（既存の成功結果を返さない）。拒否は
+    _run_idempotent より前なので Operation 行も増えない。
+    """
+    _setup_funded_child(test_db)
+    real = _reserve_child_payout(test_db, operation_id="payout:real")
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_child_payout(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=-1,
+            payee_id=AGENT_B_ID,
+            operation_id="payout:neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "payout:neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_negative_after_real_parent_payout_is_invalid_argument(test_db):
+    """正額の Parent payout を確定させた後、別 operation_id で負数を渡すと
+    INVALID_ARGUMENT になる（既存の成功結果を返さない）。
+    """
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
+    real = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-real",
+    )
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_payout(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            payee_id=AGENT_A_ID,
+            operation_id="payout:parent-neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "payout:parent-neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_negative_after_real_parent_refund_is_invalid_argument(test_db):
+    """正額の Parent refund（payee_id あり）を確定させた後、別 operation_id で
+    負数を渡すと INVALID_ARGUMENT になる（既存の成功結果を返さない）。
+    payee_id=None の経路でも同様に INVALID_ARGUMENT になる。
+    """
+    _setup_funded_child(test_db)
+    real = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:real",
+    )
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            payee_id=REQUESTER_ID,
+            operation_id="refund:neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "refund:neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+    # payee_id=None（送金予約を持たない経路）でも INVALID_ARGUMENT
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            operation_id="reserve:neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "reserve:neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_bool_and_non_int_amount_units_are_invalid_argument(test_db):
+    """amount_units に bool（True / False）や int 以外を渡すと
+    INVALID_ARGUMENT になる（bool は int として受理しない）。
+    """
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db, operation_id="payout:real")
+    before = _audit_snapshot(test_db.conn)
+
+    for bad in (True, False, "10", 10.0, None):
+        with pytest.raises(OjpError) as exc_info:
+            service.reserve_child_payout(
+                test_db.conn,
+                actor_id=AGENT_A_ID,
+                root_id=ROOT_ID,
+                child_id=CHILD_ID,
+                amount_units=bad,
+                payee_id=AGENT_B_ID,
+                operation_id=f"payout:bad-{type(bad).__name__}",
+            )
+        assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+        assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)

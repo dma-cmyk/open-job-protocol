@@ -707,6 +707,23 @@ def _payment_count(conn, business_key=None):
     return int(conn.execute(sql, params).fetchone()["c"])
 
 
+def _audit_snapshot(conn):
+    """拒否の前後比較用スナップショット（operations・payment_operations・
+    Journal・口座残高・Job 状態の一切が不変であることの検証）。"""
+
+    def _rows(sql):
+        return tuple(tuple(r) for r in conn.execute(sql).fetchall())
+
+    return (
+        _rows("SELECT * FROM operations ORDER BY operation_id"),
+        _rows("SELECT * FROM payment_operations ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_transactions ORDER BY operation_id"),
+        _rows("SELECT * FROM journal_entries ORDER BY operation_id, entry_no"),
+        _rows("SELECT * FROM budget_accounts ORDER BY id"),
+        _rows("SELECT id, state, row_version FROM jobs ORDER BY id"),
+    )
+
+
 def _fund_root(test_db):
     service.fund_root(
         test_db.conn,
@@ -1079,6 +1096,180 @@ def test_allocate_child_work_zero_is_invalid_argument_and_leaves_nothing(test_db
     assert _bk_count(test_db.conn, f"allocate:{CHILD_ID}") == 0
     assert _journal_count(test_db.conn) == 1  # fund のみ
     assert _view(test_db).available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+# ---------------------------------------------------------------------------
+# 正額確定後の負数は INVALID_ARGUMENT（業務キー照会より前の引数検査）
+# ---------------------------------------------------------------------------
+
+
+def test_negative_after_real_return_child_work_is_invalid_argument(test_db):
+    """正額の通常返却（return:{child_id}）を確定させた後、別 operation_id で
+    負数を渡すと INVALID_ARGUMENT になる（業務キー競合の INVALID_STATE ではなく）。
+    拒否は _run_idempotent より前なので Operation 行も増えない。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    _allocate_child(test_db)
+    real = service.return_child_work(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=CHILD_BUDGET_UNITS,
+        operation_id="return:real",
+    )
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=-1,
+            operation_id="return:neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "return:neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_negative_after_real_child_return_after_parent_terminal_is_invalid_argument(
+    test_db,
+):
+    """Parent 終端後の追加返金（refund:{root_id}:child-return:{child_id}）を
+    正額で確定させた後、別 operation_id で負数を渡すと INVALID_ARGUMENT に
+    なる（業務キー競合の INVALID_STATE ではなく）。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    _allocate_child(test_db)
+    service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+    )
+    real = service.return_child_work(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=CHILD_BUDGET_UNITS,
+        parent_terminal_refund_reserved=True,
+        operation_id="return:child-real",
+    )
+    assert real.data.get("combined") is True
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=-1,
+            parent_terminal_refund_reserved=True,
+            operation_id="return:child-neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "return:child-neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_negative_after_real_reserve_parent_payout_is_invalid_argument(test_db):
+    """正額の Parent payout を確定させた後、別 operation_id で負数を渡すと
+    INVALID_ARGUMENT になる（既存の成功結果を返さない）。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID, seed_workers=True)
+    _fund_root(test_db)
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
+    real = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-real",
+    )
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_payout(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            payee_id=AGENT_A_ID,
+            operation_id="payout:parent-neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "payout:parent-neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_negative_after_real_reserve_parent_refund_is_invalid_argument(test_db):
+    """正額の Parent refund（payee_id=None）を確定させた後、別 operation_id で
+    負数を渡すと INVALID_ARGUMENT になる（業務キー競合の INVALID_STATE ではなく）。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    _allocate_child(test_db)
+    real = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        operation_id="reserve:refund-real",
+    )
+    assert real.replayed is False
+    before = _audit_snapshot(test_db.conn)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            operation_id="reserve:refund-neg-after-real",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "reserve:refund-neg-after-real")
+    assert _audit_snapshot(test_db.conn) == before
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_bool_amount_units_is_invalid_argument_for_return(test_db):
+    """return_child_work の amount_units に bool を渡すと INVALID_ARGUMENT
+    （bool は int として受理しない）。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    _allocate_child(test_db)
+    before = _audit_snapshot(test_db.conn)
+    for bad in (True, False):
+        with pytest.raises(OjpError) as exc_info:
+            service.return_child_work(
+                test_db.conn,
+                actor_id=AGENT_A_ID,
+                root_id=ROOT_ID,
+                child_id=CHILD_ID,
+                amount_units=bad,
+                operation_id=f"return:bad-{bad}",
+            )
+        assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+        assert _audit_snapshot(test_db.conn) == before
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 

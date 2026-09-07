@@ -2098,6 +2098,26 @@ def allocate_child_work(
     )
 
 
+def _validate_amount_units(amount_units: int) -> None:
+    """amount_units を非負 int に限定する（bool は int として受理しない）。
+
+    allocate_child_work / create_child と同じ段階（_run_idempotent より前、
+    業務キー照会・Operation 挿入の前）で引数の不正を弾くための検査
+    （計画書 第5節の金額検証・第13節 INVALID_ARGUMENT）。ゼロは特例として
+    受け付け、呼出側のゼロ no-op 挙動へ流す。ledger 側の負数拒否は
+    多重防御として残る。
+    """
+    if isinstance(amount_units, bool) or not isinstance(amount_units, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"amount_units must be int, got {type(amount_units).__name__}",
+        )
+    if amount_units < 0:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT, "amount must be non-negative"
+        )
+
+
 def reserve_child_payout(
     conn: sqlite3.Connection,
     *,
@@ -2120,8 +2140,10 @@ def reserve_child_payout(
     （_run_idempotent へは business_key=None で通し、再送用の主 Operation
     だけを保存する）。ゼロ時は payment_kind も None にするため
     `<operation_id>:payment` の派生 Operation と PaymentOperation は
-    作られない。負数はゼロ特例に含めず INVALID_ARGUMENT と rollback を維持。
+    作られない。負数（および bool・int 以外）は _run_idempotent より前に
+    INVALID_ARGUMENT で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "child_id": child_id,
@@ -2256,8 +2278,10 @@ def return_child_work(
     （_run_idempotent へは business_key=None で通し、再送用の主 Operation
     だけを保存する。正額時に return:{child_id} /
     refund:{root_id}:child-return:{child_id} を確定できるようにするため）。
-    負数はゼロ特例に含めず、ledger 側の INVALID_ARGUMENT と rollback を維持する。
+    負数（および bool・int 以外）は _run_idempotent より前に INVALID_ARGUMENT
+    で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "child_id": child_id,
@@ -2317,7 +2341,8 @@ def reserve_parent_payout(
     （_run_idempotent へは business_key=None で通し、再送用の主 Operation
     だけを保存する）。ゼロ時は payment_kind も None にするため
     `<operation_id>:payment` の派生 Operation と PaymentOperation は
-    作られない。負数はゼロ特例に含めず INVALID_ARGUMENT と rollback を維持。
+    作られない。負数（および bool・int 以外）は _run_idempotent より前に
+    INVALID_ARGUMENT で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
 
     **Parent DONE のときだけ許される**（計画書 第8節の表「DONE: Root の
     未拘束額は A 向け支払い予約へ移動」）。approve 自体は Phase 4 の範囲で、
@@ -2325,6 +2350,7 @@ def reserve_parent_payout(
     対象は Root（depth=0 の Parent）だけ。Child を指定した場合は
     INVALID_TARGET、Parent が DONE でなければ INVALID_STATE。
     """
+    _validate_amount_units(amount_units)
     payload = {"root_id": root_id, "amount_units": amount_units, "payee_id": payee_id}
     zero_no_op = amount_units == 0
 
@@ -2395,9 +2421,11 @@ def reserve_parent_refund(
     （_run_idempotent へは business_key=None で通し、再送用の主 Operation
     だけを保存する）。ゼロ時は payment_kind も None にするため
     `<operation_id>:payment` の派生 Operation と PaymentOperation は
-    作られない（payee_id 指定の有無双方で同様）。負数はゼロ特例に
-    含めず INVALID_ARGUMENT と rollback を維持する。
+    作られない（payee_id 指定の有無双方で同様）。負数（および bool・int 以外）は
+    _run_idempotent より前に INVALID_ARGUMENT で拒否する（業務キー照会の
+    前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "amount_units": amount_units,
