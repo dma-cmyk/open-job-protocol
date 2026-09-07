@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import sqlite3
@@ -94,6 +95,7 @@ class VerificationOutcome:
     failed_condition_id: str | None = None  # FAIL の原因 condition のキー
     expected_value: int | None = None  # その condition の期待値（判明する場合のみ）
     actual_value: Any | None = None  # その condition の実際の値（判明する場合のみ）
+    condition_matched: bool = False  # FAIL が異議対象の condition_id に起因するか（arbitrate だけが設定。verify_artifact では常に False）
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +143,14 @@ def fire_before_submission_commit(conn: sqlite3.Connection) -> None:
 # 方式で、test mode の DB でのみ有効。
 # ---------------------------------------------------------------------------
 
-# 強制的に FAIL の VerificationOutcome を返させる seam（既存条件への
-# FAIL 再現 fixture 用。X14「証拠付き FAIL」）。引数は dispute を識別する
-# ラベル文字列。
-arbiter_result_override: Callable[[str], VerificationOutcome] | None = None
+# 裁定の再検証へ渡す保存成果物の文字列を差し替える seam（判定器不具合・
+# 成果物の完全性喪失を模した専用 fixture。計画書 第12節「FAIL 経路は
+# 判定器不具合等を模した専用 fixture で検証する」・第18節 X14「証拠付き
+# FAIL」）。verdict を注入するのではなく、差し替えた成果物に対して
+# arbitrate が verify_artifact を実際に実行し、FAIL の理由と原因
+# condition を保存データから導出させる。引数は dispute を識別する
+# ラベル文字列、戻り値は再検証に使う成果物 JSON 文字列。
+arbiter_stored_artifact_override: Callable[[str], str] | None = None
 
 # 例外を投げて「固定判定器が応答しない」を再現する seam（X14「裁定応答なし」）。
 failpoint_arbiter_unresponsive: Callable[[str], None] | None = None
@@ -156,7 +162,10 @@ def assert_arbiter_failpoints_allowed(conn: sqlite3.Connection) -> None:
     resolve_due_disputes が何も書く前に呼ぶ前置検査（assert_submission_
     failpoints_allowed と同じ考え方。realtime では代入済みでも拒否する）。
     """
-    if arbiter_result_override is None and failpoint_arbiter_unresponsive is None:
+    if (
+        arbiter_stored_artifact_override is None
+        and failpoint_arbiter_unresponsive is None
+    ):
         return
     if clock.read_mode(conn) != ClockMode.TEST:
         raise OjpError(
@@ -505,17 +514,20 @@ def arbitrate(
     （job_versions の input_json / conditions_json）・元の検証証跡
     （submissions.verification_evidence）で再検証する。verify_artifact を
     再利用し、金額の一部裁定は行わない（PASS / FAIL の二値のみ）。
-    戻り値は「異議対象の condition_id に対する裁定結果」の意味を持つ
-    （condition_matched が False の FAIL は「FAIL は再現したが異議の
-    condition_id には起因しない」ことを表す。呼出側はこの場合 Job を
-    FAILED にせず承認側へ収束させる。第12節「既存条件への FAIL が再現
-    された場合だけ FAILED」の裏返し）。
+
+    condition_id（異議対象の condition）は帰属の評価に実際に使う:
+    FAIL が再現した場合、その原因 condition（実検証器が成果物データから
+    導出した failed_condition_id）が condition_id と一致するかをこの
+    関数の内部で評価し、結果を戻り値の condition_matched に入れる
+    （外部から与えられない）。condition_matched が False の FAIL は
+    「FAIL は再現したが異議の condition_id には起因しない」ことを表し、
+    呼出側はこの場合 Job を FAILED にせず承認側へ収束させる（第12節
+    「既存条件への FAIL が再現された場合だけ FAILED」の裏返し）。
+    result が PASS のとき condition_matched は False（FAIL していない
+    ので帰属は無い）。
 
     検証前の整合検査（不整合は OjpError(VERIFICATION_UNAVAILABLE)):
 
-    - condition_id（異議対象の condition。dispute 手順 6 が公開 Version
-      の conditions_json のキーであることを検査済みのため、ここでは
-      意味の確定にだけ使う）
     - original_evidence が妥当な JSON object であり、verifier_id /
       verifier_hash が再検証の入力（公開 Version 由来）と一致すること。
       不一致は「保存時の検証と今の再検証が同じ検証器を見ていない」状態
@@ -527,20 +539,17 @@ def arbitrate(
       input_hash は 64 桁 hex の形式検査のみ行い、成果物の同一性は
       決定的な再検証（verify_artifact が保存成果物から提出時と同じ
       PASS と artifact_hash を再現すること）で担保する
-    - arbiter_result_override seam が代入済みなら、再検証の代わりにその
-      outcome を返す（既存条件への FAIL 再現 fixture。test mode で
-      resolve_due_disputes が呼ぶ。この関数自体は純粋なので mode 検査は
-      呼出側の assert_arbiter_failpoints_allowed が担う）。**override の
-      結果も通常経路と同じ検証を通す**（無検査で採用しない）: FAIL なの
-      に failed_condition_id が無い、または failed_condition_id が異議の
-      condition_id と一致しない場合は、その FAIL は異議対象の condition
-      に起因しないものとして扱う（通常経路の構造 FAIL や別キー起因の
-      FAIL と同じ扱い）
+    - arbiter_stored_artifact_override seam が代入済みなら、再検証に
+      渡す保存成果物をその戻り値で差し替える（判定器不具合・成果物の
+      完全性喪失を模した専用 fixture。verdict は注入しない。差し替え後の
+      成果物に対して verify_artifact を実際に実行し、FAIL の理由と原因
+      condition は実データから導出する。test mode で resolve_due_disputes
+      が呼ぶ。この関数自体は純粋なので mode 検査は呼出側の
+      assert_arbiter_failpoints_allowed が担う）
     - failpoint_arbiter_unresponsive seam が代入済みなら例外を投げる
       （「固定判定器が応答しない」の再現。呼出側は transaction を
       rollback して異議を OPEN のまま残す）
     """
-    raw_bytes = stored_artifact_json.encode("utf-8")
     try:
         original = json.loads(original_evidence)
     except (json.JSONDecodeError, ValueError):
@@ -574,20 +583,35 @@ def arbitrate(
             ErrorCode.VERIFICATION_UNAVAILABLE,
             "stored evidence input_hash is malformed (expected 64 hex chars)",
         )
-    del raw_bytes  # 生成果物の hash は再検証できない（docstring 参照）
     if failpoint_arbiter_unresponsive is not None:
         failpoint_arbiter_unresponsive("arbiter_unresponsive")
-    if arbiter_result_override is not None:
-        outcome = arbiter_result_override("arbiter_result_override")
-        # override の結果も通常経路と同じ検証を通す（無検査で採用しない）:
-        # FAIL なのに原因 condition が特定できない（構造 FAIL）、または
-        # 異議の condition_id と一致しない場合は、その FAIL は異議対象の
-        # condition に起因しないものとして通常経路と同じ扱いにする
-        return outcome
-    return verify_artifact(
-        raw_artifact=stored_artifact_json,
+    artifact_to_verify = stored_artifact_json
+    if arbiter_stored_artifact_override is not None:
+        # 再検証に渡す保存成果物の差し替え（判定器不具合・成果物の完全性
+        # 喪失を模した fixture。verdict ではなく成果物データだけを差し
+        # 替え、FAIL の帰属は実検証器がこのデータから導出する）
+        artifact_to_verify = arbiter_stored_artifact_override(
+            "arbiter_stored_artifact_override"
+        )
+        if not isinstance(artifact_to_verify, str):
+            raise OjpError(
+                ErrorCode.VERIFICATION_UNAVAILABLE,
+                "arbiter_stored_artifact_override must return a str artifact",
+            )
+    outcome = verify_artifact(
+        raw_artifact=artifact_to_verify,
         input_values=input_values,
         expected=expected,
         verifier_id=verifier_id,
         verifier_hash_value=verifier_hash_value,
     )
+    # FAIL の帰属は保存データ（差し替え後の成果物）から実検証器が導出した
+    # failed_condition_id で評価する（外部から与えられない）。PASS なら
+    # FAIL していないので帰属は無い（condition_matched=False）
+    if outcome.result == VerificationResult.FAIL:
+        matched = (
+            outcome.failed_condition_id is not None
+            and outcome.failed_condition_id == condition_id
+        )
+        outcome = dataclasses.replace(outcome, condition_matched=matched)
+    return outcome

@@ -6,7 +6,8 @@
 - 同時 Claim の敗者が**勝者の Lease ID** で submit → FORBIDDEN
 - いずれの拒否後も submissions / submission_attempts / jobs / leases /
   operations / journal_transactions / journal_entries /
-  payment_operations / 全口座残高が不変
+  payment_operations / 全口座残高 / transfer_receipts / mock_wallets が
+  不変
 - その後**勝者 Actor が同じ Lease から submit できる**
 
 同時 Claim を実プロセス・barrier で起こす（既存
@@ -127,7 +128,8 @@ _CLAIM_SCRIPT = textwrap.dedent(
 
 
 def _full_state_snapshot(conn):
-    """受入条件で不変を確認する全表のスナップショット。"""
+    """受入条件で不変を確認する全表のスナップショット（transfer_receipts と
+    mock_wallets を含む）。"""
 
     def _rows(sql):
         return tuple(tuple(r) for r in conn.execute(sql).fetchall())
@@ -142,6 +144,8 @@ def _full_state_snapshot(conn):
         _rows("SELECT * FROM journal_entries ORDER BY operation_id, entry_no"),
         _rows("SELECT * FROM payment_operations ORDER BY operation_id"),
         _rows("SELECT * FROM budget_accounts ORDER BY id"),
+        _rows("SELECT * FROM transfer_receipts ORDER BY receipt_id"),
+        _rows("SELECT * FROM mock_wallets ORDER BY participant_id"),
     )
 
 
@@ -155,8 +159,8 @@ def test_claim_loser_submit_rejected_and_winner_can_submit(test_db, tmp_path):
     の両方で拒否される。いずれの拒否後も全テーブル（submissions /
     submission_attempts / jobs / leases / operations /
     journal_transactions / journal_entries / payment_operations /
-    全口座残高）が不変であり、その後勝者 A が同じ Lease から
-    submit できる。
+    全口座残高 / transfer_receipts / mock_wallets）が不変であり、
+    その後勝者 A が同じ Lease から submit できる。
     """
     _prepare_db(test_db)
     job_id, version_id = _create_open_root(test_db, "loser-submit")

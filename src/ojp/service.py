@@ -3312,7 +3312,7 @@ def resolve_due_disputes(
         # 期限判定は _apply の中で書込 transaction の now で確定する
         # （第7節: 書込ロックを取得した後のサーバー時刻で決める）
         preview_now = clock.now_for_read_snapshot(conn)
-        verdict, outcome = _arbitrate_dispute_outcome(
+        verdict, outcome, condition_matched = _arbitrate_dispute_outcome(
             conn, dispute_row, now_us=preview_now
         )
         if verdict == "unresponsive":
@@ -3396,10 +3396,10 @@ def resolve_due_disputes(
                         str(submission["verification_evidence"])
                     ),
                     arbitration=None,
-                    # 判定器の証跡が無い経路。保存済み PASS を採用するため
-                    # FAIL 未再現ではなく、異議の condition_id への帰属は
-                    # 維持される（condition_matched=True）
-                    condition_matched=True,
+                    # 判定器が応答せず FAIL を再現していない経路。
+                    # condition_matched は「再現した FAIL が異議の
+                    # condition_id に起因するか」の意味なので False
+                    condition_matched=False,
                 )
                 c.execute(
                     "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3436,6 +3436,7 @@ def resolve_due_disputes(
                 now: int,
                 _verdict: str = verdict,
                 _outcome: verification.VerificationOutcome | None = outcome,
+                _condition_matched: bool = condition_matched,
             ) -> dict[str, Any]:
                 _require_system_actor(c, actor_id)
                 dispute = c.execute(
@@ -3461,20 +3462,14 @@ def resolve_due_disputes(
                 if job["state"] != JobState.DISPUTED.value:
                     return {"dispute_id": dispute_id, "skipped": True}
                 version_row = _get_job_version_row(c, str(submission["version_id"]))
-                # FAIL が異議の condition_id に起因するか（第12節「既存条件へ
-                # の FAIL が再現された場合だけ FAILED」）。PASS 経路は常に
-                # True。FAIL でも原因 condition が特定できない（構造 FAIL）、
+                # FAIL が異議の condition_id に起因するかは arbitrate が
+                # 保存データから導出した condition_matched を使う（呼出側で
+                # 文字列比較をしない。第12節「既存条件への FAIL が再現された
+                # 場合だけ FAILED」）。PASS 経路は帰属が無いため True。
+                # FAIL でも原因 condition が特定できない（構造 FAIL）、
                 # または異議の condition_id と一致しない場合は False
                 # （異議は成立しなかったとして承認側へ収束する）
-                condition_matched = True
-                if _verdict == "FAIL":
-                    condition_matched = (
-                        _outcome is not None
-                        and _outcome.failed_condition_id is not None
-                        and _outcome.failed_condition_id
-                        == str(dispute["condition_id"])
-                    )
-                if _verdict == "PASS" or not condition_matched:
+                if _verdict == "PASS" or not _condition_matched:
                     # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約。
                     # FAIL が異議の condition_id に起因しない場合も同じ
                     # 承認側へ収束する（資金を凍結しない。第12節「無応答で
@@ -3543,7 +3538,7 @@ def resolve_due_disputes(
                             _outcome.input_hash if _outcome is not None else None
                         ),
                         arbitration=_outcome,
-                        condition_matched=condition_matched,
+                        condition_matched=_condition_matched,
                     )
                     c.execute(
                         "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3736,10 +3731,12 @@ def _dispute_resolution_fields(
     判明した期待値・実値（expected_value / actual_value）、FAIL が異議の
     condition_id に起因するか（condition_matched）を記録する。第12節
     「既存条件への FAIL が再現された場合だけ FAILED」の判定根拠を
-    resolution へ残す。arbitration が None（無応答 fallback）の経路では
-    判定器の証跡が無いため failed_condition_id / expected_value /
-    actual_value は None とし、condition_matched は True（保存済み PASS
-    を採用するため FAIL の未再現ではない）とする。
+    resolution へ残す。condition_matched は「**再現した FAIL が**異議の
+    condition_id に起因するか」の意味であり、異議の condition が有効か
+    どうかではない。したがって FAIL を再現していない経路（PASS・無応答
+    fallback・FAIL 不成立）では False になる。arbitration が None
+    （無応答 fallback）の経路では判定器の証跡が無いため
+    failed_condition_id / expected_value / actual_value も None とする。
     """
     return ledger.canonical_json_dumps(
         {
@@ -3766,26 +3763,29 @@ def _dispute_resolution_fields(
 
 def _arbitrate_dispute_outcome(
     conn: sqlite3.Connection, dispute_row: sqlite3.Row, *, now_us: int
-) -> tuple[str, verification.VerificationOutcome | None]:
-    """1 件の異議を裁定して (verdict, VerificationOutcome) を返す（書込は行わない）。
+) -> tuple[str, verification.VerificationOutcome | None, bool]:
+    """1 件の異議を裁定して (verdict, VerificationOutcome, condition_matched)
+    を返す（書込は行わない）。
 
     戻り値:
-    - ("PASS", outcome) / ("FAIL", outcome): 判定器が応答した場合。
-      outcome は裁定の証跡（reason / evidence / input_hash を含む。
-      resolution への保存に使う）
-    - ("unresponsive", None): 判定器が応答しない場合。保存済み PASS への
-      fallback を適用するかどうかは呼出側が書込 transaction 内の now で
-      再判定する（第7節: 書込ロック取得後のサーバー時刻で決める）
+    - ("PASS", outcome, False) / ("FAIL", outcome, condition_matched):
+      判定器が応答した場合。outcome は裁定の証跡（reason / evidence /
+      input_hash を含む。resolution への保存に使う）。condition_matched
+      は arbitrate が outcome から導出した「再現した FAIL が異議対象の
+      condition_id に起因するか」の評価結果（PASS は FAIL を再現して
+      いないので False）
+    - ("unresponsive", None, False): 判定器が応答しない場合。保存済み
+      PASS への fallback を適用するかどうかは呼出側が書込 transaction
+      内の now で再判定する（第7節: 書込ロック取得後のサーバー時刻で
+      決める）
 
     arbitrate の例外（failpoint_arbiter_unresponsive seam・
     VERIFICATION_UNAVAILABLE）は「判定器が応答しない」扱いにする。書込
     transaction の外で呼ぶため、例外で DB は一切変更されない。
     now_us は読取 snapshot の時刻（応答があった場合の裁定実行の時刻参照）。
-    異議対象の condition_id を arbitrate へ渡し、戻り値の outcome は
-    「その condition_id に対する裁定結果」として扱う（FAIL でも
-    failed_condition_id が condition_id と一致しない場合は、呼出側が
-    FAILED にしない。第12節「既存条件への FAIL が再現された場合だけ
-    FAILED」）。
+    condition_matched は arbitrate が返す outcome.condition_matched を
+    そのまま採用する（呼出側が文字列比較で帰属を再評価しない。第12節
+    「既存条件への FAIL が再現された場合だけ FAILED」の判定根拠）。
     """
     submission = conn.execute(
         "SELECT * FROM submissions WHERE id = ?", (dispute_row["submission_id"],)
@@ -3822,10 +3822,13 @@ def _arbitrate_dispute_outcome(
         # 判定器が応答しない。fallback 適用の可否（now >= due_at_us）は
         # 呼出側が書込 transaction 内の now で再判定する
         del now_us
-        return "unresponsive", None
+        return "unresponsive", None, False
     if outcome.result == domain.VerificationResult.PASS.value:
-        return "PASS", outcome
-    return "FAIL", outcome
+        # PASS は FAIL を再現していないので帰属は無い（condition_matched は
+        # 「再現した FAIL が異議の condition_id に起因するか」の意味であり、
+        # 「異議の condition が有効か」ではない）
+        return "PASS", outcome, False
+    return "FAIL", outcome, outcome.condition_matched
 
 
 # ---------------------------------------------------------------------------

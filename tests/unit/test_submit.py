@@ -369,8 +369,25 @@ def test_submit_fail_replay_with_same_operation_id(demo_db):
 
 
 def test_submit_rejects_old_version(demo_db):
-    """古い Version（version_id に別の版 ID）→ INVALID_TARGET。"""
-    _root, child_id, _version_id, lease_id, _rl = _leased_child(demo_db)
+    """古い Version（version_id に別の版 ID）→ INVALID_TARGET。
+
+    拒否後は Lease が開いたまま（closed_reason IS NULL）・Job は LEASED・
+    submissions / submission_attempts / acceptances / payment_operations
+    は 0 件のまま・budget_accounts 全行と mock_wallets 全行は呼出前後で
+    不変（支払い予約も資金移動も起きない）。"""
+    root_id, child_id, _version_id, lease_id, _rl = _leased_child(demo_db)
+    budgets_before = [
+        tuple(r)
+        for r in demo_db.conn.execute(
+            "SELECT * FROM budget_accounts ORDER BY id"
+        ).fetchall()
+    ]
+    wallets_before = [
+        tuple(r)
+        for r in demo_db.conn.execute(
+            "SELECT * FROM mock_wallets ORDER BY participant_id"
+        ).fetchall()
+    ]
     with pytest.raises(OjpError) as exc_info:
         _submit(
             demo_db,
@@ -381,10 +398,36 @@ def test_submit_rejects_old_version(demo_db):
             "submit:old-version",
         )
     assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
+    # Lease は開いたまま・Job は LEASED
+    assert _lease(demo_db, lease_id)["closed_reason"] is None
+    assert _job(demo_db, child_id)["state"] == JobState.LEASED.value
+    # submissions / submission_attempts は増えていない
     submissions, attempts, _f = _counts(demo_db, child_id)
     assert submissions == 0
     assert attempts == 0
-    assert _job(demo_db, child_id)["state"] == JobState.LEASED.value
+    # acceptances / payment_operations（支払い予約）は 0 件
+    assert (
+        demo_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM acceptances WHERE job_id = ?",
+            (child_id,),
+        ).fetchone()["c"]
+        == 0
+    )
+    assert _payment_ops(demo_db, root_id) == 0
+    # budget_accounts 全行と mock_wallets 全行は呼出前後で不変
+    assert [
+        tuple(r)
+        for r in demo_db.conn.execute(
+            "SELECT * FROM budget_accounts ORDER BY id"
+        ).fetchall()
+    ] == budgets_before
+    assert [
+        tuple(r)
+        for r in demo_db.conn.execute(
+            "SELECT * FROM mock_wallets ORDER BY participant_id"
+        ).fetchall()
+    ] == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 
 # ---------------------------------------------------------------------------

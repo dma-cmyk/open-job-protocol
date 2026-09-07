@@ -232,7 +232,11 @@ def _payment(conn, business_key):
 
 
 def _run_scheduler_once(root_dir: Path) -> subprocess.CompletedProcess[str]:
-    """独立プロセスで python -m ojp.scheduler --root <path> --once --json。"""
+    """独立プロセスで python -m ojp.scheduler --root <path> --once --json。
+
+    プロセス待機の timeout は OS の単調時計に依存する通常の subprocess
+    timeout を使い、Job 期限を実時間 sleep で待たない（計画書 第7節）。
+    """
     return subprocess.run(
         [
             sys.executable,
@@ -246,6 +250,7 @@ def _run_scheduler_once(root_dir: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
@@ -496,7 +501,9 @@ def test_overdue_processed_after_restart(demo_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
+def test_tick_keeps_submitted_between_lease_expiry_and_review_due(
+    demo_db, tmp_path
+):
     """N08（計画書 第18節「N08の専用時刻fixture」）: Root Lease 300秒・
     カタログの part-1 entry に Child 用 timing（Lease 60秒・
     review_window 120秒）を事前許可し、共有 Clock を t0 に固定したまま
@@ -504,7 +511,10 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
     t0+1秒で有効提出（review_due_at = t0+121秒）。harness は Clock を
     t0+61秒へ進め、
     `child_expires_at < now < child_review_due_at < root_lease_expires_at`
-    を確認してから独立 tick を 1 回実行する。
+    を確認してから独立プロセスの tick
+    （python -m ojp.scheduler --root <path> --once --json）を 1 回実行する
+    （計画書 第7節「期限処理の E2E は時刻更新 commit 後に独立プロセスの
+    ojp tick --once 完了を待つ」）。
 
     tick 後も Child は SUBMITTED 維持・Acceptance・PaymentOperation
     （Child 分）0 件・全口座残高・Wallet・PaymentOperation・Acceptance が
@@ -605,15 +615,39 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
 
     # harness は共有 Clock を t0+61秒へ進め、計画書の時刻関係
     # （child_expires_at < now < child_review_due_at < root_lease_expires_at）
-    # を確認してから独立 tick を 1 回実行する
+    # を確認する
     now = TEST_T0_US + 61_000_000
     assert child_expires_at < now < review_due_at < root_lease_expires_at
-    clock.set_test_now(demo_db.conn, now)
 
-    result = scheduler.tick_once(demo_db.conn, actor_id=SYSTEM_ID)
-    assert result["counts"]["approved_submissions"] == 0
+    # DB をプロジェクトルート風の配置へ複製し、時刻更新 transaction を
+    # commit してから（時刻更新 transaction に Job 処理を混在させない）、
+    # 期限処理は独立プロセスの tick で行う（計画書 第7節「期限処理の
+    # E2E は時刻更新 commit 後に独立プロセスの ojp tick --once 完了を
+    # 待つ」）
+    root_dir = tmp_path / "proj"
+    (root_dir / "data").mkdir(parents=True)
+    db_path = root_dir / "data" / "ojp.sqlite3"
+    demo_db.conn.close()
+    db_path.write_bytes(Path(demo_db.path).read_bytes())
 
-    conn = demo_db.fresh_conn()
+    conn = db.connect(db_path)
+    try:
+        clock.set_test_now(conn, now)
+    finally:
+        conn.close()
+
+    # 独立プロセスの tick を 1 回実行し、完了を待って終了コードと stdout
+    # の JSON を確認する
+    proc = _run_scheduler_once(root_dir)
+    assert proc.returncode == 0, proc.stderr
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    tick_result = json.loads(lines[0])
+    assert tick_result["counts"]["approved_submissions"] == 0
+    assert tick_result["error"] is None
+
+    # tick 後の状態は新しい接続で読み直して確認する
+    conn = db.connect(db_path)
     try:
         # Child は SUBMITTED を維持（OPEN / EXPIRED へ戻らない）
         job = _job(conn, child_id)
@@ -687,13 +721,29 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
     finally:
         conn.close()
 
-    # N11: review_due_at まで進めると通常の自動承認が機能する
-    clock.set_test_now(demo_db.conn, review_due_at)
-    result = scheduler.tick_once(demo_db.conn, actor_id=SYSTEM_ID)
-    assert result["counts"]["approved_submissions"] == 1
-    assert _job(demo_db.conn, child_id)["state"] == JobState.DONE.value
-    assert _wallets(demo_db.conn)[AGENT_B_ID] == TEN
-    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+    # N11: review_due_at まで進めると通常の自動承認が機能する。こちらも
+    # 時刻更新 commit 後に独立プロセスの tick で行う
+    conn = db.connect(db_path)
+    try:
+        clock.set_test_now(conn, review_due_at)
+    finally:
+        conn.close()
+
+    proc = _run_scheduler_once(root_dir)
+    assert proc.returncode == 0, proc.stderr
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    tick_result = json.loads(lines[0])
+    assert tick_result["counts"]["approved_submissions"] == 1
+    assert tick_result["error"] is None
+
+    conn = db.connect(db_path)
+    try:
+        assert _job(conn, child_id)["state"] == JobState.DONE.value
+        assert _wallets(conn)[AGENT_B_ID] == TEN
+        ledger.assert_ledger_invariants(conn, root_id)
+    finally:
+        conn.close()
 
 
 def test_child_without_catalog_timing_inherits_root_timing(demo_db):

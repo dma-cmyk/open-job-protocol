@@ -322,29 +322,16 @@ def test_n13_route_arbitration_fail_single_additional_refund(demo_db):
     assert _job_state(demo_db, child_id) == JobState.DISPUTED.value
     assert _refund_payment_count(demo_db, root_id) == 1
 
-    # 裁定 FAIL を注入して確定（異議対象の condition "sum" に起因する
-    # FAIL。第12節「既存条件への FAIL が再現された場合だけ FAILED」を
-    # 満たす形。failed_condition_id を含めない override は FAIL 不成立へ
-    # 収束するため、ここでは "sum" を指定する）
-    verification.arbiter_result_override = lambda label: (
-        verification.VerificationOutcome(
-            result=verification.VerificationResult.FAIL,
-            reason="ARTIFACT_VALUE_MISMATCH",
-            canonical_artifact=None,
-            artifact_hash=None,
-            input_hash="0" * 64,
-            evidence=ledger.canonical_json_dumps(
-                {"injected": "arbiter_result_override", "result": "FAIL"}
-            ),
-            failed_condition_id="sum",
-            expected_value=6,
-            actual_value=5,
-        )
-    )
+    # 裁定 FAIL を実データで再現して確定: 再検証へ渡す保存成果物を
+    # {"sum": 7}（公開 expected は {"sum": 6}）へ差し替える。FAIL の理由と
+    # 原因 condition は実検証器が差し替え後のデータから導出する（verdict
+    # の注入ではない）。原因 condition は異議対象の "sum" と一致するため
+    # 第12節「既存条件への FAIL が再現された場合だけ FAILED」を満たす
+    verification.arbiter_stored_artifact_override = lambda label: '{"sum": 7}'
     try:
         results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
     finally:
-        verification.arbiter_result_override = None
+        verification.arbiter_stored_artifact_override = None
     assert len(results) == 1
     assert results[0].data["resolution"] == "FAIL"
     assert _job_state(demo_db, child_id) == JobState.FAILED.value
