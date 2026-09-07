@@ -6,9 +6,13 @@ Done when の対応:
   Child なら child_work → available（Parent 生存中）、Parent 終端後なら
   追加返金 refund:{root_id}:child-return:{child_id} が 1 件だけ
 - failpoint_arbiter_unresponsive で無応答 → due_at_us 前は Job DISPUTED・
-  異議 OPEN・資金不変、due_at_us 到達後は保存済み PASS を採用して DONE ＋
-  Acceptance APPROVED ＋ 支払い予約
-- unresponsive_arbiter_fallback=None で公開した Version では fallback しない
+  異議 OPEN・資金不変、due_at_us 到達後（期限ちょうどを含む）は必ず
+  保存済み PASS を採用して DONE ＋ Acceptance APPROVED ＋ 支払い予約
+  （TimingPolicy.unresponsive_arbiter_fallback='stored_pass' は全 Version
+  が事前記録。資金を永久凍結しない）
+- 裁定結果（PASS / FAIL / 無応答 fallback）の resolution は
+  outcome / reason / evidence / condition_id / verifier_id / verifier_hash /
+  input_hash を含む canonical JSON
 - seam を realtime DB で使うと何も動かさず拒否
 - 全経路の後で ledger.assert_ledger_invariants が成立
 
@@ -18,6 +22,8 @@ Done when の対応:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from ojp import clock, db, ledger, service, verification
@@ -26,7 +32,6 @@ from ojp.domain import (
     JobState,
     OjpError,
     PaymentStatus,
-    TimingPolicy,
 )
 from tests.conftest import (
     AGENT_A_ID,
@@ -55,11 +60,13 @@ def _clear_arbitration_seams():
 
 @pytest.fixture
 def demo_db(test_db):
-    """固定 Actor + Wallet seed 済みの test mode DB（Worker も 0 で seed）。"""
+    """固定 Actor + Wallet seed 済みの test mode DB（Worker も 0 で seed）。
+    Requester は 300（Root 3 件分）持たせておき、期限境界テストなど複数
+    Root を作るテストに対応する。"""
     with db.transaction(test_db.conn, immediate=True):
         insert_demo_participants(test_db.conn)
         for participant_id, balance in (
-            (REQUESTER_ID, ROOT_BUDGET_UNITS),
+            (REQUESTER_ID, ROOT_BUDGET_UNITS * 3),
             (AGENT_A_ID, 0),
             (AGENT_B_ID, 0),
         ):
@@ -186,6 +193,37 @@ def _fail_outcome():
     )
 
 
+def _dispute_row(demo_db, dispute_id):
+    return demo_db.conn.execute(
+        "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+    ).fetchone()
+
+
+def _resolution_record(demo_db, dispute_id):
+    """disputes.resolution を canonical JSON として parse して返す。"""
+    return json.loads(_dispute_row(demo_db, dispute_id)["resolution"])
+
+
+def _expected_arbitrate_outcome(demo_db, dispute_id):
+    """保存成果物を verification.arbitrate で再検証した証跡（テスト内再現）。"""
+    dispute = _dispute_row(demo_db, dispute_id)
+    submission = demo_db.conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (dispute["submission_id"],)
+    ).fetchone()
+    version = demo_db.conn.execute(
+        "SELECT * FROM job_versions WHERE id = ?",
+        (submission["version_id"],),
+    ).fetchone()
+    return verification.arbitrate(
+        stored_artifact_json=str(submission["artifact_json"]),
+        input_values=json.loads(version["input_json"]),
+        expected=json.loads(version["conditions_json"]),
+        verifier_id=version["verifier_id"],
+        verifier_hash_value=version["verifier_hash"],
+        original_evidence=str(submission["verification_evidence"]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 裁定 PASS（X14「決定的裁定PASS」）
 # ---------------------------------------------------------------------------
@@ -216,9 +254,18 @@ def test_resolve_pass_approves_and_reserves_payout(demo_db):
         "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
     ).fetchone()
     assert dispute["status"] == "RESOLVED"
-    assert "PASS" in dispute["resolution"]
+    # resolution は canonical JSON: outcome / reason / evidence /
+    # condition_id / verifier_id / verifier_hash / input_hash を含む
+    resolution = _resolution_record(demo_db, dispute_id)
+    assert resolution["outcome"] == "PASS"
+    assert resolution["condition_id"] == dispute["condition_id"]
+    outcome = _expected_arbitrate_outcome(demo_db, dispute_id)
+    assert resolution["reason"] == outcome.reason
+    assert resolution["evidence"] == outcome.evidence
+    assert resolution["input_hash"] == outcome.input_hash
+    assert resolution["verifier_id"] == verification.VERIFIER_ID
+    assert resolution["verifier_hash"] == verification.verifier_hash()
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
-
 
 def test_resolve_is_idempotent(demo_db):
     """resolve:{dispute_id} は冪等（再実行は RESOLVED を選ばないため
@@ -253,7 +300,8 @@ def test_resolve_is_idempotent(demo_db):
 
 def test_resolve_fail_returns_child_work_to_available(demo_db):
     """FAIL 再現（Parent 生存中）→ FAILED ＋ Acceptance REJECTED ＋
-    child_work → available。返金 PaymentOperation は作らない。"""
+    child_work → available。返金 PaymentOperation は作らない。
+    resolution は理由コード・証跡・condition_id を含む canonical JSON。"""
     root_id, child_id, _s, dispute_id = _disputed_child(demo_db)
     verification.arbiter_result_override = lambda label: _fail_outcome()
     results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
@@ -265,6 +313,8 @@ def test_resolve_fail_returns_child_work_to_available(demo_db):
         "SELECT * FROM acceptances WHERE job_id = ?", (child_id,)
     ).fetchone()
     assert acceptance["decision"] == "REJECTED"
+    # FAIL の理由コードが acceptances.reason にも含まれる
+    assert "ARTIFACT_VALUE_MISMATCH" in acceptance["reason"]
     buckets = _buckets(demo_db, root_id)
     assert buckets[(child_id, "child_work")] == 0
     assert buckets[(root_id, "available")] == ROOT_BUDGET_UNITS
@@ -275,7 +325,16 @@ def test_resolve_fail_returns_child_work_to_available(demo_db):
         "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
     ).fetchone()
     assert dispute["status"] == "RESOLVED"
-    assert "FAIL" in dispute["resolution"]
+    # resolution は canonical JSON: 理由コード・証跡・異議の condition_id と
+    # の一致・arbitrate の証跡との一致を検証する
+    resolution = _resolution_record(demo_db, dispute_id)
+    assert resolution["outcome"] == "FAIL"
+    assert resolution["condition_id"] == dispute["condition_id"]
+    assert resolution["reason"] == "ARTIFACT_VALUE_MISMATCH"
+    assert resolution["evidence"] == _fail_outcome().evidence
+    assert resolution["input_hash"] == "0" * 64
+    assert resolution["verifier_id"] == verification.VERIFIER_ID
+    assert resolution["verifier_hash"] == verification.verifier_hash()
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 
@@ -332,6 +391,7 @@ def test_unresponsive_arbiter_before_due_keeps_disputed(demo_db):
     results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
     assert results[0].data["unresponsive"] is True
+    assert results[0].data["skipped"] is True
     verification.failpoint_arbiter_unresponsive = None
 
     assert _job(demo_db, child_id)["state"] == JobState.DISPUTED.value
@@ -356,8 +416,9 @@ def test_unresponsive_arbiter_before_due_keeps_disputed(demo_db):
 
 def test_unresponsive_arbiter_after_due_adopts_stored_pass(demo_db):
     """無応答 → due_at_us 到達後は保存済み PASS を採用して DONE ＋
-    Acceptance APPROVED ＋ 支払い予約（timing_policy 既定の
-    unresponsive_arbiter_fallback='stored_pass'）。"""
+    Acceptance APPROVED ＋ 支払い予約（全 Version が
+    unresponsive_arbiter_fallback='stored_pass' を事前記録。資金を永久
+    凍結しない）。resolution は fallback であることを示す canonical JSON。"""
     root_id, child_id, _s, dispute_id = _disputed_child(demo_db, suffix="fb")
     due_at = demo_db.conn.execute(
         "SELECT due_at_us FROM disputes WHERE id = ?", (dispute_id,)
@@ -389,22 +450,29 @@ def test_unresponsive_arbiter_after_due_adopts_stored_pass(demo_db):
         "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
     ).fetchone()
     assert dispute["status"] == "RESOLVED"
-    assert "UNRESPONSIVE_ARBITER_STORED_PASS" in dispute["resolution"]
+    # resolution は fallback であることを示す canonical JSON。証跡は保存済み
+    # 検証証跡（submissions.verification_evidence）と一致する
+    resolution = _resolution_record(demo_db, dispute_id)
+    submission = demo_db.conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (dispute["submission_id"],)
+    ).fetchone()
+    assert resolution["outcome"] == "UNRESPONSIVE_ARBITER_STORED_PASS"
+    assert resolution["reason"] == "ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK"
+    assert resolution["condition_id"] == dispute["condition_id"]
+    assert resolution["evidence"] == str(submission["verification_evidence"])
+    assert resolution["verifier_id"] == verification.VERIFIER_ID
+    assert resolution["verifier_hash"] == verification.verifier_hash()
+    assert resolution["input_hash"] == json.loads(
+        submission["verification_evidence"]
+    )["input_hash"]
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
-
-def test_unresponsive_arbiter_no_fallback_when_timing_policy_none(demo_db):
-    """unresponsive_arbiter_fallback=None で公開した Version では、
-    無応答のまま期限を越えても fallback しない（異議 OPEN・DISPUTED のまま）。"""
-    no_fallback_timing = TimingPolicy(
-        lease_seconds=60,
-        heartbeat_seconds=20,
-        review_window_seconds=30,
-        dispute_window_seconds=30,
-        unresponsive_arbiter_fallback=None,
-    )
+def test_unresponsive_arbiter_past_due_converges_to_done(demo_db):
+    """無応答のまま期限を越えたら必ず DONE ＋ Acceptance APPROVED ＋
+    支払い予約へ収束し、資金が凍結されない（誤った「fallback しない」
+    契約を固定していた旧テストの代替）。"""
     root_id, child_id, _s, dispute_id = _disputed_child(
-        demo_db, suffix="nofb", timing=no_fallback_timing
+        demo_db, suffix="conv"
     )
     due_at = demo_db.conn.execute(
         "SELECT due_at_us FROM disputes WHERE id = ?", (dispute_id,)
@@ -414,20 +482,125 @@ def test_unresponsive_arbiter_no_fallback_when_timing_policy_none(demo_db):
         raise RuntimeError(f"injected arbiter outage: {label}")
 
     verification.failpoint_arbiter_unresponsive = _unresponsive
-    clock.set_test_now(demo_db.conn, due_at)
+    # 期限を越えてもう一度実行しても必ず収束する
+    clock.set_test_now(demo_db.conn, due_at + 1_000_000)
     results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
     verification.failpoint_arbiter_unresponsive = None
     assert len(results) == 1
-    assert results[0].data["unresponsive"] is True
-
-    assert _job(demo_db, child_id)["state"] == JobState.DISPUTED.value
-    dispute = demo_db.conn.execute(
-        "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+    assert results[0].data["resolution"] == "UNRESPONSIVE_ARBITER_STORED_PASS"
+    assert _job(demo_db, child_id)["state"] == JobState.DONE.value
+    acceptance = demo_db.conn.execute(
+        "SELECT * FROM acceptances WHERE job_id = ?", (child_id,)
     ).fetchone()
-    assert dispute["status"] == "OPEN"
-    assert _payment_by_key(demo_db, f"payout:{child_id}") is None
+    assert acceptance["decision"] == "APPROVED"
+    payment = _payment_by_key(demo_db, f"payout:{child_id}")
+    assert payment["status"] == PaymentStatus.PENDING.value
+    assert payment["amount_units"] == TEN
+    # 資金が凍結されていない（child_work は child_payout へ移動）
+    buckets = _buckets(demo_db, root_id)
+    assert buckets[(child_id, "child_work")] == 0
+    assert buckets[(child_id, "child_payout")] == TEN
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
+@pytest.mark.parametrize(
+    ("offset", "expect_fallback"),
+    [(-1, False), (0, True), (1, True)],
+)
+def test_unresponsive_arbiter_boundary_at_due(demo_db, offset, expect_fallback):
+    """R4: 期限境界を固定 Clock で作り、due_at_us の直前・ちょうど・直後の
+    3 点を確定させる。ちょうど（now == due_at_us）は fallback 適用側
+    （失効側）を優先する。期限前は operations 行も残らない。"""
+    root_id, child_id, _s, dispute_id = _disputed_child(
+        demo_db, suffix=f"bnd{offset}"
+    )
+    due_at = demo_db.conn.execute(
+        "SELECT due_at_us FROM disputes WHERE id = ?", (dispute_id,)
+    ).fetchone()["due_at_us"]
+
+    def _unresponsive(label):
+        raise RuntimeError(f"injected arbiter outage: {label}")
+
+    verification.failpoint_arbiter_unresponsive = _unresponsive
+    clock.set_test_now(demo_db.conn, due_at + offset)
+    results = service.resolve_due_disputes(demo_db.conn, actor_id=SYSTEM_ID)
+    verification.failpoint_arbiter_unresponsive = None
+    assert len(results) == 1
+    if expect_fallback:
+        assert (
+            results[0].data["resolution"]
+            == "UNRESPONSIVE_ARBITER_STORED_PASS"
+        )
+        assert _job(demo_db, child_id)["state"] == JobState.DONE.value
+    else:
+        assert results[0].data["unresponsive"] is True
+        assert results[0].data["skipped"] is True
+        assert _job(demo_db, child_id)["state"] == JobState.DISPUTED.value
+        # 期限前は operations 行も残らない（transaction 全体が rollback）
+        assert (
+            demo_db.conn.execute(
+                "SELECT COUNT(*) AS c FROM operations WHERE operation_id = ?",
+                (f"resolve:{dispute_id}",),
+            ).fetchone()["c"]
+            == 0
+        )
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+def test_unresponsive_arbiter_fallback_is_always_stored_pass(demo_db):
+    """R3: TimingPolicy.unresponsive_arbiter_fallback は Literal['stored_pass']
+    （None 不可・既定 stored_pass）。キー欠落・None の timing_policy JSON
+    （後方互換）は "stored_pass" として扱い、例外にしない。"""
+    import json as _json
+
+    from ojp.domain import TimingPolicy
+
+    # 既定値
+    assert TimingPolicy().unresponsive_arbiter_fallback == "stored_pass"
+    # キー欠落の JSON（古い DB の timing_policy）→ stored_pass
+    legacy_json = _json.dumps(
+        {
+            "lease_seconds": 60,
+            "heartbeat_seconds": 20,
+            "review_window_seconds": 30,
+            "dispute_window_seconds": 30,
+        }
+    )
+    assert (
+        TimingPolicy.model_validate_json(legacy_json).unresponsive_arbiter_fallback
+        == "stored_pass"
+    )
+    # None（旧バージョンで保存された値）→ stored_pass として扱う
+    none_json = _json.dumps(
+        {
+            "lease_seconds": 60,
+            "heartbeat_seconds": 20,
+            "review_window_seconds": 30,
+            "dispute_window_seconds": 30,
+            "unresponsive_arbiter_fallback": None,
+        }
+    )
+    assert (
+        TimingPolicy.model_validate_json(none_json).unresponsive_arbiter_fallback
+        == "stored_pass"
+    )
+    # その他の値は拒否
+    import pytest as _pytest
+
+    from pydantic import ValidationError
+
+    with _pytest.raises(ValidationError):
+        TimingPolicy.model_validate_json(
+            _json.dumps(
+                {
+                    "lease_seconds": 60,
+                    "heartbeat_seconds": 20,
+                    "review_window_seconds": 30,
+                    "dispute_window_seconds": 30,
+                    "unresponsive_arbiter_fallback": "freeze_forever",
+                }
+            )
+        )
+    # （DB の job_versions 行は公開後 immutable なため、キー欠落の実データ
+    # は作れない。後方互換の読み取りは上の model_validate_json で検証する）
 
 # ---------------------------------------------------------------------------
 # seam の realtime 拒否

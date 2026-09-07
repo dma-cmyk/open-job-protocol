@@ -150,6 +150,16 @@ def test_pass_accepts_exactly_1mib_and_depth_8():
     outcome = _verify(depth9)
     assert outcome.reason == "ARTIFACT_TOO_DEEP"
 
+def test_verify_artifact_very_deep_input_returns_too_deep():
+    """R5: 深さ 10,000 程度の入力で RecursionError を漏らさず
+    ARTIFACT_TOO_DEEP の FAIL になる（json.loads の再帰限界も
+    RecursionError として捕まえる。_container_depth は反復実装）。"""
+    deep_artifact = '{"a":' * 10_000 + "1" + "}" * 10_000
+    assert len(deep_artifact.encode("utf-8")) <= 1048576  # サイズ検査は通る
+    outcome = _verify(deep_artifact)
+    assert outcome.result == VerificationResult.FAIL
+    assert outcome.reason == "ARTIFACT_TOO_DEEP"
+
 
 def test_pass_artifact_hash_is_canonical():
     """PASS 時の artifact_hash は canonical 形式の sha256 であること。

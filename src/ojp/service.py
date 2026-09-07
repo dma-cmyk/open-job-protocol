@@ -2383,15 +2383,37 @@ def submit(
             "attempt_id": attempt_id,
         }
 
-    result = _run_idempotent(
-        conn,
-        actor_id=actor_id,
-        kind="submit",
-        operation_id=operation_id,
-        business_key=None,
-        payload=payload,
-        apply_effects=_apply,
-    )
+    try:
+        result = _run_idempotent(
+            conn,
+            actor_id=actor_id,
+            kind="submit",
+            operation_id=operation_id,
+            business_key=None,
+            payload=payload,
+            apply_effects=_apply,
+        )
+    except OjpError:
+        raise
+    except sqlite3.OperationalError as exc:
+        if db.is_db_busy(exc):
+            # DB_BUSY は _run_idempotent の扱いを変えない（同一 operation_id
+            # での transaction 再試行・有限回で打ち切り）
+            raise
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            "storage failure while persisting the submission"
+            f" (sqlite error: {exc})",
+        ) from exc
+    except Exception as exc:
+        # 保存フェーズ（submissions・Job 更新・events の書込）で発生した
+        # 予期しない例外は再試行可能エラーへ正規化する（第11節「一時的
+        # DB 失敗は再試行可能エラーとして Worker の検証 FAIL と区別する」）。
+        # transaction は rollback 済み。生の例外を呼出側へ漏らさない
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            f"storage failure while persisting the submission: {exc!r}",
+        ) from exc
     if result.data.get("outcome") == domain.VerificationResult.FAIL.value:
         # commit 後に投げる。同じ operation_id の再送は replay 経路で
         # 保存済み結果から同じ VERIFICATION_FAILED を再現する（決定的）
@@ -2590,7 +2612,10 @@ def approve(
     冪等性: 同一 operation_id の再送は _run_idempotent の replay。別
     operation_id での二重 approve は business_key=payout:{...} の
     既存 PaymentOperation を返す（Acceptance・PaymentOperation・Receipt は
-    それぞれ 1 件だけ。N05・第16節）。
+    それぞれ 1 件だけ。N05・第16節）。ただし業務キー再利用の経路でも
+    権限・対象・状態の前置検査（Job 存在・Submission 所属・requester_id・
+    既存 APPROVED Acceptance）は _run_idempotent の前に読取 transaction
+    で確定する（別 Actor・誤った submission_id は再利用経路でも拒否）。
     """
     payload = {
         "job_id": job_id,
@@ -2659,6 +2684,57 @@ def approve(
         "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
     ).fetchone()
     business_key = f"payout:{job_id}" if job_row is not None else None
+
+    # 前置検査（読取 transaction）: _run_idempotent の reuse_existing_payment
+    # 経路（既存 payout:{job_id} があると apply_effects を呼ばずに既存結果を
+    # 返す）でも権限・状態・対象の検査がすり抜けないように、業務キー再利用の
+    # 可否を先に確定する（R2。N05 の再利用経路そのものは維持する）:
+    #   1. Job が無ければ INVALID_TARGET
+    #   2. submission_id がその Job の保存済み Submission でなければ
+    #      INVALID_TARGET
+    #   3. actor_id がその Job の requester_id でなければ FORBIDDEN
+    #   4. Job が SUBMITTED ならそのまま進む（通常の承認経路）
+    #   5. Job が SUBMITTED ではないが、その Job の acceptances 行が存在し
+    #      submission_id が一致し decision='APPROVED' なら、既存結果を返す
+    #      経路（業務キー再利用）へ進んでよい
+    #   6. それ以外（LEASED / DISPUTED / 終端で Acceptance が無い、または
+    #      Acceptance の submission_id が違う）は INVALID_STATE
+    with db.transaction(conn, immediate=False):
+        job = _get_job_row(conn, job_id)
+        submission = conn.execute(
+            "SELECT job_id FROM submissions WHERE id = ?", (submission_id,)
+        ).fetchone()
+        if submission is None or submission["job_id"] != job_id:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"submission not found for job {job_id}: {submission_id}",
+            )
+        if actor_id != job["requester_id"]:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not the requester of job {job_id}"
+                f" (requester: {job['requester_id']})."
+                " 検収はその Job の Requester のみ（第12節）",
+            )
+        if job["state"] != JobState.SUBMITTED.value:
+            acceptance = conn.execute(
+                "SELECT submission_id, decision FROM acceptances"
+                " WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not (
+                acceptance is not None
+                and acceptance["submission_id"] == submission_id
+                and acceptance["decision"]
+                == domain.AcceptanceDecision.APPROVED.value
+            ):
+                raise OjpError(
+                    ErrorCode.INVALID_STATE,
+                    f"job must be SUBMITTED to approve"
+                    f" (current state: {job['state']})."
+                    " 既存の APPROVED Acceptance が無い状態での再利用も拒否される",
+                )
+
     return _run_idempotent(
         conn,
         actor_id=actor_id,
@@ -3065,6 +3141,16 @@ def approve_due_submissions(
     return results
 
 
+class _ResolveSkipped(Exception):
+    """resolve_due_disputes の書込 transaction 内で「この異議への書き込みを
+    やめて transaction 全体を rollback する」ことを呼出側へ伝える内部例外。
+
+    無応答のまま書込 transaction の now が due_at_us に達していなかった場合
+    （読取 snapshot と書込ロック取得後の時刻の間に裁定可否が変わる場合）に
+    使う。    operations 行も含めて rollback されるため DB は一切変更されない。
+    """
+
+
 def resolve_due_disputes(
     conn: sqlite3.Connection,
     *,
@@ -3083,20 +3169,29 @@ def resolve_due_disputes(
     - FAIL → FAILED ＋ Acceptance REJECTED ＋ _job_terminal_fund_effects
       による返却／返金予約（返却・返金の計算をここで書き直さない）
     - 判定器が応答しない（arbitrate が例外）場合:
-      now < due_at_us の間は何もしない（異議 OPEN・Job DISPUTED・資金不変）。
-      now >= due_at_us なら、公開 Version の
-      timing_policy.unresponsive_arbiter_fallback == 'stored_pass' のときだけ
-      保存済み PASS を採用して自動承認する（_approve_effects と同じ効果。
-      無応答 fallback も Acceptance と支払い予約を 1 組だけ作る）。
-      fallback が None の Version では fallback しない
+      書込 transaction の now < due_at_us の間は何もしない（異議 OPEN・
+      Job DISPUTED・資金不変。operations 行も残さない）。now >= due_at_us
+      （期限ちょうどを含む。失効側優先）になったら必ず保存済み PASS を
+      採用して自動承認する。全ての公開 Version が fallback を事前記録する
+      （TimingPolicy.unresponsive_arbiter_fallback='stored_pass'。第12節
+      「Requester/A の無応答で資金を永久凍結しない」。_approve_effects と
+      同じ効果。無応答 fallback も Acceptance と支払い予約を 1 組だけ作る）
     - operation_id は resolve:{dispute_id}（第16節）。system 専用
       （_require_system_actor）。同一 operation_id の再送は保存済み結果の
       replay（actor/kind/payload_hash 照合。IDEMPOTENCY_CONFLICT）
     - 裁定（arbitrate の呼び出し）は書込 transaction の外で行い、効果の
-      確定だけを transaction 内で行う。seam の例外で裁定が「応答しない」
-      場合は DB を一切変更せず異議を OPEN のまま残し、結果へ
-      {"unresponsive": True} を返して次の異議へ進む（1 件分の失敗で
-      他を巻き込まない）
+      確定だけを transaction 内で行う。「無応答 fallback を適用するか /
+      何もせず OPEN のまま残すか」の期限判定は書込 transaction 内の now で
+      行う（第7節「書込ロックを取得した後のサーバー時刻で決め、期限
+      ちょうどは失効側を優先する」）。期限前に確定した場合は operations
+      行ごと rollback して DB を一切変更せず異議を OPEN のまま残し、結果へ
+      {"unresponsive": True, "skipped": True} を返して次の異議へ進む
+      （1 件分の失敗で他を巻き込まない）
+    - 裁定結果（PASS / FAIL / 無応答 fallback のすべて）は
+      disputes.resolution へ outcome / reason / evidence /
+      condition_id / verifier_id / verifier_hash / input_hash を含む
+      canonical JSON で保存する。FAIL の場合、acceptances.reason にも
+      理由コードを含める
     """
     del escrow  # 裁定は Escrow port を使わない（送金は process_payments）
     with db.transaction(conn, immediate=False):
@@ -3137,61 +3232,57 @@ def resolve_due_disputes(
             )
             continue
 
-        # 裁定（書込 transaction の外）。now はこの時点の Clock を使い、
-        # due_at_us との比較もこの値で行う（効果の記録時にもう一度採取する
-        # が、裁定可否の判定はこの時刻で確定する）
+        # 裁定（書込 transaction の外）。判定器の実行はここで行うが、
+        # 「無応答 fallback を適用するか / 何もせず OPEN のまま残すか」の
+        # 期限判定は _apply の中で書込 transaction の now で確定する
+        # （第7節: 書込ロックを取得した後のサーバー時刻で決める）
         preview_now = clock.now_for_read_snapshot(conn)
-        verdict = _arbitrate_dispute_outcome(conn, dispute_row, now_us=preview_now)
+        verdict, outcome = _arbitrate_dispute_outcome(
+            conn, dispute_row, now_us=preview_now
+        )
         if verdict == "unresponsive":
-            # 判定器が応答せず fallback も適用できない。異議は OPEN のまま
-            # 残り、この異議の分だけ結果へ記録して次へ進む
-            results.append(
-                CommandResult(
-                    data={"dispute_id": dispute_id, "unresponsive": True},
-                    operation_id=operation_id,
-                )
-            )
-            continue
-
-        def _apply(
-            c: sqlite3.Connection,
-            op_id: str,
-            now: int,
-            _verdict: str = verdict,
-        ) -> dict[str, Any]:
-            _require_system_actor(c, actor_id)
-            dispute = c.execute(
-                "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
-            ).fetchone()
-            if (
-                dispute is None
-                or dispute["status"] != domain.DisputeStatus.OPEN.value
-            ):
-                # 既に別の tick で裁定済み（冪等）。何もしない
-                return {"dispute_id": dispute_id, "skipped": True}
-            job = _get_job_row(c, str(dispute["job_id"]))
-            submission = c.execute(
-                "SELECT * FROM submissions WHERE id = ?",
-                (dispute["submission_id"],),
-            ).fetchone()
-            if submission is None:
-                raise OjpError(
-                    ErrorCode.INVALID_STATE,
-                    f"dispute {dispute_id} references a missing submission:"
-                    f" {dispute['submission_id']}",
-                )
-            if job["state"] != JobState.DISPUTED.value:
-                return {"dispute_id": dispute_id, "skipped": True}
-            if _verdict in ("PASS", "UNRESPONSIVE_ARBITER_STORED_PASS"):
-                # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約。
-                # 無応答 fallback は保存済み PASS の採用として同じ効果
-                if _verdict == "PASS":
-                    reason = f"dispute resolved by arbitration PASS ({dispute_id})"
-                else:
-                    reason = (
-                        "dispute resolved by stored_pass fallback after"
-                        f" unresponsive arbiter ({dispute_id})"
+            # 判定器が応答しない。fallback 適用の可否は書込 transaction 内の
+            # now で再判定するため、ここでは書込を試みる（期限前に確定した
+            # 場合は _apply が _ResolveSkipped を投げて transaction 全体を
+            # rollback する）
+            def _apply(
+                c: sqlite3.Connection,
+                op_id: str,
+                now: int,
+            ) -> dict[str, Any]:
+                _require_system_actor(c, actor_id)
+                dispute = c.execute(
+                    "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if (
+                    dispute is None
+                    or dispute["status"] != domain.DisputeStatus.OPEN.value
+                ):
+                    return {"dispute_id": dispute_id, "skipped": True}
+                # 期限の再判定は書込ロック取得後の now で行う（期限ちょうど
+                # は fallback 適用側＝失効側を優先する）
+                if now < int(dispute["due_at_us"]):
+                    # operations 行ごと rollback して何も書かない
+                    raise _ResolveSkipped(dispute_id)
+                job = _get_job_row(c, str(dispute["job_id"]))
+                submission = c.execute(
+                    "SELECT * FROM submissions WHERE id = ?",
+                    (dispute["submission_id"],),
+                ).fetchone()
+                if submission is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"dispute {dispute_id} references a missing submission:"
+                        f" {dispute['submission_id']}",
                     )
+                if job["state"] != JobState.DISPUTED.value:
+                    return {"dispute_id": dispute_id, "skipped": True}
+                # 保存済み PASS への fallback（第12節。全 Version が事前記録）
+                version_row = _get_job_version_row(c, str(submission["version_id"]))
+                reason = (
+                    "dispute resolved by stored_pass fallback after"
+                    f" unresponsive arbiter ({dispute_id})"
+                )
                 payment_operation_id = f"{op_id}:payment"
                 _insert_operation(
                     c,
@@ -3220,7 +3311,17 @@ def resolve_due_disputes(
                     now=now,
                 )
                 resolution = ledger.canonical_json_dumps(
-                    {"outcome": _verdict, "dispute_id": dispute_id}
+                    {
+                        "outcome": "UNRESPONSIVE_ARBITER_STORED_PASS",
+                        "reason": "ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK",
+                        "evidence": str(submission["verification_evidence"]),
+                        "condition_id": str(dispute["condition_id"]),
+                        "verifier_id": str(version_row["verifier_id"]),
+                        "verifier_hash": str(version_row["verifier_hash"]),
+                        "input_hash": _stored_evidence_input_hash(
+                            str(submission["verification_evidence"])
+                        ),
+                    }
                 )
                 c.execute(
                     "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
@@ -3245,67 +3346,177 @@ def resolve_due_disputes(
                 return {
                     "dispute_id": dispute_id,
                     "job_id": job["id"],
-                    "resolution": _verdict,
+                    "resolution": "UNRESPONSIVE_ARBITER_STORED_PASS",
                     "approval": data,
                 }
-            # FAIL → FAILED ＋ Acceptance REJECTED ＋ 返却／返金予約
-            c.execute(
-                "INSERT INTO acceptances (job_id, submission_id, decision,"
-                " decided_by, reason, decided_at_us) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    job["id"],
-                    submission["id"],
-                    domain.AcceptanceDecision.REJECTED.value,
-                    actor_id,
-                    f"dispute resolved by arbitration FAIL ({dispute_id})",
-                    now,
-                ),
-            )
-            cursor = c.execute(
-                "UPDATE jobs SET state = ?, active_lease_id = NULL,"
-                " row_version = row_version + 1"
-                " WHERE id = ? AND row_version = ?",
-                (JobState.FAILED.value, job["id"], int(job["row_version"])),
-            )
-            if cursor.rowcount != 1:
-                raise OjpError(
-                    ErrorCode.INVALID_STATE,
-                    "job state changed concurrently during dispute resolution"
-                    f" (job={job['id']})",
+
+        else:
+
+            def _apply(
+                c: sqlite3.Connection,
+                op_id: str,
+                now: int,
+                _verdict: str = verdict,
+                _outcome: verification.VerificationOutcome | None = outcome,
+            ) -> dict[str, Any]:
+                _require_system_actor(c, actor_id)
+                dispute = c.execute(
+                    "SELECT * FROM disputes WHERE id = ?", (dispute_id,)
+                ).fetchone()
+                if (
+                    dispute is None
+                    or dispute["status"] != domain.DisputeStatus.OPEN.value
+                ):
+                    # 既に別の tick で裁定済み（冪等）。何もしない
+                    return {"dispute_id": dispute_id, "skipped": True}
+                job = _get_job_row(c, str(dispute["job_id"]))
+                submission = c.execute(
+                    "SELECT * FROM submissions WHERE id = ?",
+                    (dispute["submission_id"],),
+                ).fetchone()
+                if submission is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"dispute {dispute_id} references a missing submission:"
+                        f" {dispute['submission_id']}",
+                    )
+                if job["state"] != JobState.DISPUTED.value:
+                    return {"dispute_id": dispute_id, "skipped": True}
+                version_row = _get_job_version_row(c, str(submission["version_id"]))
+                if _verdict == "PASS":
+                    # PASS → DONE ＋ Acceptance APPROVED ＋ 支払い予約
+                    reason = f"dispute resolved by arbitration PASS ({dispute_id})"
+                    payment_operation_id = f"{op_id}:payment"
+                    _insert_operation(
+                        c,
+                        operation_id=payment_operation_id,
+                        actor_id=actor_id,
+                        kind=PaymentKind.PAYOUT.value,
+                        payload_hash=_payload_hash(
+                            {
+                                "derived_from": op_id,
+                                "business_key": f"payout:{job['id']}",
+                            }
+                        ),
+                        business_key=None,
+                        status=OperationStatus.SUCCEEDED,
+                        result=None,
+                        now_us=now,
+                    )
+                    data = _approve_effects(
+                        c,
+                        job=job,
+                        submission=submission,
+                        actor_id=actor_id,
+                        decided_by=actor_id,
+                        reason=reason,
+                        operation_id=op_id,
+                        now=now,
+                    )
+                    resolution = ledger.canonical_json_dumps(
+                        {
+                            "outcome": _verdict,
+                            "reason": _outcome.reason,
+                            "evidence": _outcome.evidence,
+                            "condition_id": str(dispute["condition_id"]),
+                            "verifier_id": str(version_row["verifier_id"]),
+                            "verifier_hash": str(version_row["verifier_hash"]),
+                            "input_hash": _outcome.input_hash,
+                        }
+                    )
+                    c.execute(
+                        "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
+                        (
+                            domain.DisputeStatus.RESOLVED.value,
+                            resolution,
+                            dispute_id,
+                        ),
+                    )
+                    c.execute(
+                        "INSERT INTO events (root_id, job_id, actor_id, action,"
+                        " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            job["root_id"],
+                            job["id"],
+                            actor_id,
+                            "resolve",
+                            dispute_id,
+                            now,
+                        ),
+                    )
+                    return {
+                        "dispute_id": dispute_id,
+                        "job_id": job["id"],
+                        "resolution": _verdict,
+                        "approval": data,
+                    }
+                # FAIL → FAILED ＋ Acceptance REJECTED ＋ 返却／返金予約
+                c.execute(
+                    "INSERT INTO acceptances (job_id, submission_id, decision,"
+                    " decided_by, reason, decided_at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job["id"],
+                        submission["id"],
+                        domain.AcceptanceDecision.REJECTED.value,
+                        actor_id,
+                        f"dispute resolved by arbitration FAIL ({dispute_id}):"
+                        f" {_outcome.reason}",
+                        now,
+                    ),
                 )
-            funds = _job_terminal_fund_effects(
-                c,
-                job=job,
-                actor_id=actor_id,
-                operation_id=f"{op_id}:funds",
-                now=now,
-            )
-            resolution = ledger.canonical_json_dumps(
-                {"outcome": "FAIL", "dispute_id": dispute_id}
-            )
-            c.execute(
-                "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
-                (domain.DisputeStatus.RESOLVED.value, resolution, dispute_id),
-            )
-            c.execute(
-                "INSERT INTO events (root_id, job_id, actor_id, action,"
-                " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    job["root_id"],
-                    job["id"],
-                    actor_id,
-                    "resolve",
-                    dispute_id,
-                    now,
-                ),
-            )
-            return {
-                "dispute_id": dispute_id,
-                "job_id": job["id"],
-                "resolution": "FAIL",
-                "state": JobState.FAILED.value,
-                "funds": funds,
-            }
+                cursor = c.execute(
+                    "UPDATE jobs SET state = ?, active_lease_id = NULL,"
+                    " row_version = row_version + 1"
+                    " WHERE id = ? AND row_version = ?",
+                    (JobState.FAILED.value, job["id"], int(job["row_version"])),
+                )
+                if cursor.rowcount != 1:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        "job state changed concurrently during dispute resolution"
+                        f" (job={job['id']})",
+                    )
+                funds = _job_terminal_fund_effects(
+                    c,
+                    job=job,
+                    actor_id=actor_id,
+                    operation_id=f"{op_id}:funds",
+                    now=now,
+                )
+                resolution = ledger.canonical_json_dumps(
+                    {
+                        "outcome": "FAIL",
+                        "reason": _outcome.reason,
+                        "evidence": _outcome.evidence,
+                        "condition_id": str(dispute["condition_id"]),
+                        "verifier_id": str(version_row["verifier_id"]),
+                        "verifier_hash": str(version_row["verifier_hash"]),
+                        "input_hash": _outcome.input_hash,
+                    }
+                )
+                c.execute(
+                    "UPDATE disputes SET status = ?, resolution = ? WHERE id = ?",
+                    (domain.DisputeStatus.RESOLVED.value, resolution, dispute_id),
+                )
+                c.execute(
+                    "INSERT INTO events (root_id, job_id, actor_id, action,"
+                    " object_id, at_us) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job["root_id"],
+                        job["id"],
+                        actor_id,
+                        "resolve",
+                        dispute_id,
+                        now,
+                    ),
+                )
+                return {
+                    "dispute_id": dispute_id,
+                    "job_id": job["id"],
+                    "resolution": "FAIL",
+                    "state": JobState.FAILED.value,
+                    "funds": funds,
+                }
 
         data: dict[str, Any] | None = None
         for attempt in range(DB_BUSY_MAX_ATTEMPTS):
@@ -3332,6 +3543,22 @@ def resolve_due_disputes(
                         ),
                     )
                 break
+            except _ResolveSkipped:
+                # 無応答のまま書込 transaction 内の now が期限前に確定した。
+                # operations 行を含めて transaction 全体が rollback 済みのため、
+                # DB は一切変更されていない。異議は OPEN のまま次へ進む
+                results.append(
+                    CommandResult(
+                        data={
+                            "dispute_id": dispute_id,
+                            "unresponsive": True,
+                            "skipped": True,
+                        },
+                        operation_id=operation_id,
+                    )
+                )
+                data = None
+                break
             except sqlite3.OperationalError as exc:
                 if db.is_db_busy(exc) and attempt < DB_BUSY_MAX_ATTEMPTS - 1:
                     delay = min(
@@ -3344,22 +3571,46 @@ def resolve_due_disputes(
                     ErrorCode.DB_BUSY,
                     f"database is busy after {attempt + 1} attempts",
                 ) from exc
-        assert data is not None
+        if data is None:
+            # _ResolveSkipped で処理済み（結果は results へ追加済み）
+            continue
         results.append(CommandResult(data=data, operation_id=operation_id))
     return results
+
+def _stored_evidence_input_hash(evidence_json: str) -> str | None:
+    """保存済み検証証跡（canonical JSON）から input_hash を取り出す。
+
+    無応答 fallback の resolution 記録に使う。parse 不能・欠落の場合は
+    None を返す（証跡は submissions.verification_evidence の全文を別途
+    保存しているため、この値が欠けても裁定の根拠は失われない）。
+    """
+    try:
+        evidence = json.loads(evidence_json)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    value = evidence.get("input_hash")
+    return value if isinstance(value, str) else None
 
 
 def _arbitrate_dispute_outcome(
     conn: sqlite3.Connection, dispute_row: sqlite3.Row, *, now_us: int
-) -> str:
-    """1 件の異議を裁定して結果を文字列で返す（書込は行わない）。
+) -> tuple[str, verification.VerificationOutcome | None]:
+    """1 件の異議を裁定して (verdict, VerificationOutcome) を返す（書込は行わない）。
 
-    戻り値: "PASS" / "FAIL" / "UNRESPONSIVE_ARBITER_STORED_PASS" /
-    "unresponsive"（判定器が応答せず fallback も適用できない場合）。
+    戻り値:
+    - ("PASS", outcome) / ("FAIL", outcome): 判定器が応答した場合。
+      outcome は裁定の証跡（reason / evidence / input_hash を含む。
+      resolution への保存に使う）
+    - ("unresponsive", None): 判定器が応答しない場合。保存済み PASS への
+      fallback を適用するかどうかは呼出側が書込 transaction 内の now で
+      再判定する（第7節: 書込ロック取得後のサーバー時刻で決める）
 
     arbitrate の例外（failpoint_arbiter_unresponsive seam・
     VERIFICATION_UNAVAILABLE）は「判定器が応答しない」扱いにする。書込
     transaction の外で呼ぶため、例外で DB は一切変更されない。
+    now_us は読取 snapshot の時刻（応答があった場合の裁定実行の時刻参照）。
     """
     submission = conn.execute(
         "SELECT * FROM submissions WHERE id = ?", (dispute_row["submission_id"],)
@@ -3392,19 +3643,13 @@ def _arbitrate_dispute_outcome(
             original_evidence=str(submission["verification_evidence"]),
         )
     except Exception:
-        # 判定器が応答しない。now >= due_at_us なら保存済み PASS への
-        # fallback を公開 Version の timing_policy から判定する
-        if now_us < int(dispute_row["due_at_us"]):
-            return "unresponsive"
-        timing, _deadline = _get_job_version_timing(
-            conn, str(submission["version_id"])
-        )
-        if timing.unresponsive_arbiter_fallback == "stored_pass":
-            return "UNRESPONSIVE_ARBITER_STORED_PASS"
-        return "unresponsive"
+        # 判定器が応答しない。fallback 適用の可否（now >= due_at_us）は
+        # 呼出側が書込 transaction 内の now で再判定する
+        del now_us
+        return "unresponsive", None
     if outcome.result == domain.VerificationResult.PASS.value:
-        return "PASS"
-    return "FAIL"
+        return "PASS", outcome
+    return "FAIL", outcome
 
 
 # ---------------------------------------------------------------------------

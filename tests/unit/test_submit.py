@@ -394,9 +394,10 @@ def test_submit_rejects_old_version(demo_db):
 
 
 def test_submit_storage_failure_rolls_back_everything(demo_db):
-    """PASS 判定後の commit 前失敗: submissions 0 件・submission_attempts にも
-    行が残らない・Job は LEASED・Lease は開いたまま・review_due_at なし・
-    支払い予約 0 件・残高不変。"""
+    """PASS 判定後の commit 前失敗: 再試行可能エラー VERIFICATION_UNAVAILABLE
+    （生の RuntimeError を漏らさない。Worker の検証 FAIL とは別のコード）。
+    submissions 0 件・submission_attempts にも行が残らない・Job は LEASED・
+    Lease は開いたまま・review_due_at なし・支払い予約 0 件・残高不変。"""
     root_id, child_id, version_id, lease_id, _rl = _leased_child(demo_db)
     wallets_before = _wallets(demo_db)
 
@@ -404,11 +405,13 @@ def test_submit_storage_failure_rolls_back_everything(demo_db):
         raise RuntimeError(f"injected storage failure: {name}")
 
     verification.failpoint_before_submission_commit = _boom
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OjpError) as exc_info:
         _submit(
             demo_db, child_id, lease_id, version_id, '{"sum": 6}', "submit:boom"
         )
     verification.failpoint_before_submission_commit = None
+    assert exc_info.value.code == ErrorCode.VERIFICATION_UNAVAILABLE.value
+    assert exc_info.value.code != ErrorCode.VERIFICATION_FAILED.value
 
     job = _job(demo_db, child_id)
     assert job["state"] == JobState.LEASED.value

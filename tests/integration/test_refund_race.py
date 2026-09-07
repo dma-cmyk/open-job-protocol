@@ -55,10 +55,12 @@ def _prepare_db(handle):
             )
 
 
-def _leased_child(handle, *, suffix):
+def _leased_child(handle, *, suffix, child_claim_delay_us=0):
     """create_root → fund → A Claim → create_child(part-1, 10) → B Claim まで
     済みの Child を返す
-    （(root_id, child_id, child_lease_id, root_lease_id)）。"""
+    （(root_id, child_id, child_lease_id, root_lease_id)）。
+    child_claim_delay_us を渡すと B の Child Claim をその分だけ Clock を
+    進めてから行う（Child Lease 期限を Root Lease 期限から分離する）。"""
     _root_def, catalog = load_poc_catalog()
     created = service.create_root(
         handle.conn,
@@ -103,6 +105,8 @@ def _leased_child(handle, *, suffix):
         operation_id=f"create:{suffix}-c1",
     )
     child_id = created_child.data["child_id"]
+    if child_claim_delay_us:
+        clock.set_test_now(handle.conn, TEST_T0_US + child_claim_delay_us)
     claimed_child = service.claim(
         handle.conn,
         actor_id=AGENT_B_ID,
@@ -112,6 +116,12 @@ def _leased_child(handle, *, suffix):
     )
     return root_id, child_id, claimed_child.data["lease_id"], root_lease
 
+
+def _payment_by_key(conn, business_key):
+    return conn.execute(
+        "SELECT * FROM payment_operations WHERE business_key = ?",
+        (business_key,),
+    ).fetchone()
 
 def _wait_barrier_procs(procs):
     """barrier 付きサブプロセスの完了を待ち、(stdout 行群, stderr) を返す。"""
@@ -422,50 +432,205 @@ def _concurrent_parent_terminal_and_child_return(test_db, tmp_path, *, suffix):
         fresh.close()
 
 
-def test_x08_concurrent_parent_terminal_and_child_return_order_a(
-    test_db, tmp_path
-):
-    """X08（Parent 終了と child return の競合）: barrier 同時開始の結果は
-    直列化順序に依らず同じ返金総額（100）に収束する。"""
+def _assert_refund_totals(conn, root_id, *, child_state):
+    """X08 の共通 assert: Parent は EXPIRED・Child は指定の終端状態・
+    返金予約の合計は入金額 100 に一致・Child 原資は保護されている。"""
+    parent_state = conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (root_id,)
+    ).fetchone()["state"]
+    assert parent_state == JobState.EXPIRED.value
+    refund_ops = conn.execute(
+        "SELECT business_key, amount_units FROM payment_operations"
+        " WHERE root_id = ? AND kind = 'refund' ORDER BY business_key",
+        (root_id,),
+    ).fetchall()
+    total_refund_reserved = sum(int(r["amount_units"]) for r in refund_ops)
+    assert total_refund_reserved == ROOT_BUDGET_UNITS
+    if child_state == JobState.FAILED.value:
+        # Child 失敗が先: 1 件の terminal 予約（available 100）だけ
+        assert len(refund_ops) == 1
+        assert refund_ops[0]["business_key"] == f"refund:{root_id}:terminal"
+        assert int(refund_ops[0]["amount_units"]) == ROOT_BUDGET_UNITS
+    else:
+        # Parent 失効が先: terminal 90 + child-return 10 の 2 件
+        assert child_state == JobState.EXPIRED.value
+        assert len(refund_ops) == 2
+        by_key = {
+            row["business_key"]: int(row["amount_units"]) for row in refund_ops
+        }
+        child_id = conn.execute(
+            "SELECT id FROM jobs WHERE parent_id = ?", (root_id,)
+        ).fetchone()["id"]
+        assert by_key == {
+            f"refund:{root_id}:child-return:{child_id}": TEN,
+            f"refund:{root_id}:terminal": ROOT_BUDGET_UNITS - TEN,
+        }
+    ledger.assert_ledger_invariants(conn, root_id)
+    return refund_ops
 
-    root_id = _concurrent_parent_terminal_and_child_return(
-        test_db, tmp_path, suffix="race-a"
+
+def _process_refunds_and_assert_final(conn, root_id):
+    """返金予約を送金まで完了させ、返金累計 = 入金額 100・口座 0 を確認。"""
+    service.process_payments(conn)
+    view = ledger.get_root_ledger_view(conn, root_id)
+    assert view.refunded_units == ROOT_BUDGET_UNITS  # 返金累計 = 入金額
+    assert view.refunded_units <= view.deposit_units
+    assert view.available_units == 0
+    assert view.locked_units == 0
+    wallet = conn.execute(
+        "SELECT balance_units FROM mock_wallets WHERE participant_id = ?",
+        (REQUESTER_ID,),
+    ).fetchone()
+    assert int(wallet["balance_units"]) == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(conn, root_id)
+
+
+def test_x08_parent_terminal_first_then_child_failure(test_db):
+    """X08 順序 A（決定的）: Parent（Root）の終端返金予約（90）を確定させて
+    から Child の失敗を確定させる。追加返金 10 が 1 件だけ作られ、返金累計
+    は入金額 100 に一致する（Child 原資は保護される）。
+
+    Parent と Child の Lease 期限は timing 継承で同時刻（t0+60秒）になる
+    ため、B の Child Claim を 1 秒遅らせて Child Lease 期限（t0+61秒）を
+    Root Lease 期限（t0+60秒）から分離し、Parent 失効 → Child 失効の順序
+    を決定的に作る（timing を偽装しない。Clock と期限の設定差だけ使う）。"""
+    _prepare_db(test_db)
+    root_id, child_id, child_lease, _root_lease = _leased_child(
+        test_db, suffix="x08-a", child_claim_delay_us=1_000_000
     )
-    # 送金まで完了させる（fresh 接続で行う）
+    # 1. Parent を失効させる（t0+60秒ちょうど。Child の Lease は t0+61秒
+    #    まで有効なため伝播しない）
+    clock.set_test_now(test_db.conn, TEST_T0_US + 60_000_000)
+    service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    parent = test_db.conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (root_id,)
+    ).fetchone()
+    assert parent["state"] == JobState.EXPIRED.value
+    child = test_db.conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()
+    assert child["state"] == JobState.LEASED.value  # Child Lease はまだ有効
+    terminal = _payment_by_key(test_db.conn, f"refund:{root_id}:terminal")
+    assert terminal is not None
+    assert int(terminal["amount_units"]) == ROOT_BUDGET_UNITS - TEN
+
+    # 2. その後に Child を失敗させる（Lease 期限切れ → EXPIRED）
+    clock.set_test_now(
+        test_db.conn,
+        test_db.conn.execute(
+            "SELECT expires_at_us FROM leases WHERE id = ?", (child_lease,)
+        ).fetchone()["expires_at_us"],
+    )
+    service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+
     conn = test_db.fresh_conn()
     try:
-        service.process_payments(conn)
-        view = ledger.get_root_ledger_view(conn, root_id)
-        assert view.refunded_units == ROOT_BUDGET_UNITS  # 返金累計 = 入金額
-        assert view.refunded_units <= view.deposit_units
-        assert view.available_units == 0
-        assert view.locked_units == 0
-        wallet = conn.execute(
-            "SELECT balance_units FROM mock_wallets WHERE participant_id = ?",
-            (REQUESTER_ID,),
-        ).fetchone()
-        assert int(wallet["balance_units"]) == ROOT_BUDGET_UNITS
-        ledger.assert_ledger_invariants(conn, root_id)
+        child_state = conn.execute(
+            "SELECT state FROM jobs WHERE id = ?", (child_id,)
+        ).fetchone()["state"]
+        assert child_state == JobState.EXPIRED.value
+        _assert_refund_totals(conn, root_id, child_state=child_state)
+        _process_refunds_and_assert_final(conn, root_id)
     finally:
         conn.close()
 
 
-def test_x08_concurrent_parent_terminal_and_child_return_order_b(
-    test_db, tmp_path
-):
-    """X08 の再現性: 同じ競合をもう一度別 DB で実行しても同じ最終結果
-    （返金総額 100）に収束する（順序非依存・決定的）。"""
-    root_id = _concurrent_parent_terminal_and_child_return(
-        test_db, tmp_path, suffix="race-b"
+def test_x08_child_failure_first_then_parent_terminal(test_db):
+    """X08 順序 B（決定的）: Child の失敗を先に確定させてから Parent を
+    終端させる。Child の 10 は available へ戻った後に Parent 終端の返金予約
+    （100）へ合流し、返金累計は順序 A と同じ入金額 100 に一致する。"""
+    _prepare_db(test_db)
+    root_id, child_id, child_lease, root_lease = _leased_child(
+        test_db, suffix="x08-b"
     )
+    # 1. Child を abandon で失敗させる（Parent 生存中: child_work → available）
+    service.abandon(
+        test_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=child_lease,
+        operation_id="abandon:x08-b-c1",
+    )
+    child = test_db.conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()
+    assert child["state"] == JobState.FAILED.value
+
+    # 2. その後に Parent を失効させる（available 100 の terminal 返金 1 件）
+    clock.set_test_now(test_db.conn, TEST_T0_US + 61_000_000)
+    service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
+    del root_lease
+
     conn = test_db.fresh_conn()
     try:
-        service.process_payments(conn)
-        view = ledger.get_root_ledger_view(conn, root_id)
-        assert view.refunded_units == ROOT_BUDGET_UNITS
-        assert view.refunded_units <= view.deposit_units
-        assert view.available_units == 0
-        assert view.locked_units == 0
-        ledger.assert_ledger_invariants(conn, root_id)
+        child_state = conn.execute(
+            "SELECT state FROM jobs WHERE id = ?", (child_id,)
+        ).fetchone()["state"]
+        assert child_state == JobState.FAILED.value
+        _assert_refund_totals(conn, root_id, child_state=child_state)
+        _process_refunds_and_assert_final(conn, root_id)
     finally:
         conn.close()
+
+
+def test_x08_concurrent_never_exceeds_deposit(test_db, tmp_path):
+    """X08 真の同時実行は 1 本だけ: Parent 失効（Clock 更新を伴う）と
+    Child abandon を barrier で同時開始しても、返金累計が入金額 100 を
+    超えない（BEGIN IMMEDIATE の直列化でどちらかの順序に確定する。
+    順序の保証は上の 2 つの決定的テストが担う）。"""
+    _prepare_db(test_db)
+    root_id, child_id, child_lease, _root_lease = _leased_child(
+        test_db, suffix="x08-conc"
+    )
+    barrier = tmp_path / "x08-conc-barrier.txt"
+    barrier.write_text("")
+    expire_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _EXPIRE_PARENT_SCRIPT,
+            str(test_db.path),
+            root_id,
+            SYSTEM_ID,
+            str(barrier),
+            str(TEST_T0_US),
+            str(TEST_T0_US + 61_000_000),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    abandon_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _ABANDON_CHILD_SCRIPT,
+            str(test_db.path),
+            child_id,
+            child_lease,
+            AGENT_B_ID,
+            str(barrier),
+            str(TEST_T0_US),
+            "abandon:x08-conc-c1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _wait_barrier_procs([expire_proc, abandon_proc])
+
+    fresh = test_db.fresh_conn()
+    try:
+        # Parent は EXPIRED。Child はどちらの順序でも判定上の終端
+        parent_state = fresh.execute(
+            "SELECT state FROM jobs WHERE id = ?", (root_id,)
+        ).fetchone()["state"]
+        child_state = fresh.execute(
+            "SELECT state FROM jobs WHERE id = ?", (child_id,)
+        ).fetchone()["state"]
+        assert parent_state == JobState.EXPIRED.value
+        assert child_state in (JobState.FAILED.value, JobState.EXPIRED.value)
+        _assert_refund_totals(fresh, root_id, child_state=child_state)
+        _process_refunds_and_assert_final(fresh, root_id)
+    finally:
+        fresh.close()

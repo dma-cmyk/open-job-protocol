@@ -448,23 +448,21 @@ def test_overdue_processed_after_restart(demo_db, tmp_path):
 
 
 def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
-    """N08 相当: lease_expires_at < now < review_due_at で tick を 1 回実行 →
+    """N08: lease_expires_at < now < review_due_at で tick を 1 回実行 →
     Child は SUBMITTED 維持・Acceptance・PaymentOperation（Child 分）0 件・
-    Child 由来の全口座残高が提出直後から不変・leases.expires_at_us は
-    監査値のまま・closed_reason='submitted' のまま・Child への新 Lease・
-    expiry Event が作られない。その後 review_due_at まで進めると通常の
-    自動承認が機能する（N11）。
+    全口座残高・Wallet・PaymentOperation・Acceptance が提出直後の
+    スナップショットから 1 行単位で不変。窓の中では資金を動かす操作を
+    一切行わない。
 
     注意: create_child は timing を Root 公開版から継承するため、Child だけ
     別の Lease 長 / review_window を持つ構成は作れない（計画書のN08専用
     fixture では Root Lease 300秒・Child Lease 60秒・review 120秒）。
     そのためこのテストでは Root も同じ timing（Lease 30秒・review 120秒）
-    を持つ前提で組み、t0+61秒の tick は Root の Lease 失効（Lease 30秒）も
-    同時に処理する。Root は LEASED のまま有効提出が無いため EXPIRED となり
-    未拘束 available の返金予約（refund:{root_id}:terminal）が作られるが、
-    **Child は SUBMITTED を維持し**（Parent 終端を Child へ伝播しない）、
-    Child の検収期限処理は review_due_at まで何もしない。この Root/Child
-    の timing 分離ができない点は計画書との差分として報告する。
+    を持つ前提で組み、窓の中で Root が失効して返金送金が動くと残高不変の
+    検証にならないため、窓に入る前に A が Root の heartbeat を 1 回だけ
+    行って Root Lease を延ばす（heartbeat は資金を動かさない操作）。
+    この Root/Child の timing 分離ができない点は計画書との差分として
+    報告する。
     """
     root_id, child_id, submission_id = _submitted_child(
         demo_db, suffix="n08", timing=N08_TIMING
@@ -480,14 +478,56 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
     ).fetchone()
     assert lease["expires_at_us"] == TEST_T0_US + 30_000_000
 
-    # 旧 Lease 期限（t0+30秒）より後・review_due_at より前へ進める
-    now = TEST_T0_US + 61_000_000
-    assert lease["expires_at_us"] < now < review_due_at
-    clock.set_test_now(demo_db.conn, now)
+    # 旧 Lease 期限（t0+30秒）より後・review_due_at より前へ進める。
+    # 窓の中で Root が失効して返金送金が動くと残高不変の検証にならない
+    # ため、窓に入る前に A が Root の heartbeat を 1 回だけ行って Root
+    # Lease を延ばす（heartbeat は資金を動かさない操作。送金待ちを残さ
+    # ない構成）。
     wallets_after_submit = _wallets(demo_db.conn)
+    buckets_after_submit = {
+        (r["owner_job_id"], r["bucket"], r["source_key"]): int(r["amount_units"])
+        for r in demo_db.conn.execute(
+            "SELECT owner_job_id, bucket, source_key, amount_units"
+            " FROM budget_accounts WHERE root_id = ?",
+            (root_id,),
+        )
+    }
+    payments_after_submit = demo_db.conn.execute(
+        "SELECT operation_id, business_key, amount_units, payee_id, status"
+        " FROM payment_operations WHERE root_id = ? ORDER BY operation_id",
+        (root_id,),
+    ).fetchall()
+    assert payments_after_submit == []  # 送金待ちを残さない
+    acceptances_after_submit = demo_db.conn.execute(
+        "SELECT COUNT(*) AS c FROM acceptances WHERE job_id = ?",
+        (child_id,),
+    ).fetchone()["c"]
     events_after_submit = demo_db.conn.execute(
         "SELECT COUNT(*) AS c FROM events WHERE job_id = ?", (child_id,)
     ).fetchone()["c"]
+
+    # Root Lease を延ばす（t0+29秒。heartbeat は資金を動かさない）。
+    # これで窓の中の tick が Root を失効させず、返金予約・返金送金も
+    # 起こらない
+    clock.set_test_now(demo_db.conn, TEST_T0_US + 29_000_000)
+    root_lease = demo_db.conn.execute(
+        "SELECT * FROM leases WHERE job_id = ? AND closed_reason IS NULL",
+        (root_id,),
+    ).fetchone()
+    assert root_lease is not None
+    service.heartbeat(
+        demo_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=root_id,
+        lease_id=root_lease["id"],
+        generation=int(root_lease["generation"]),
+        operation_id="heartbeat:n08-root",
+    )
+
+    # 窓（t0+45秒）: lease_expires_at < now < review_due_at
+    now = TEST_T0_US + 45_000_000
+    assert lease["expires_at_us"] < now < review_due_at
+    clock.set_test_now(demo_db.conn, now)
 
     result = scheduler.tick_once(demo_db.conn, actor_id=SYSTEM_ID)
     assert result["counts"]["approved_submissions"] == 0
@@ -532,16 +572,35 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
             ).fetchone()["c"]
             == events_after_submit
         )
-        # Wallet: A / B は不変。Requester は Root 失効に伴う返金 90 の
-        # 送金だけ増える（Root/Child が同じ timing を持つ本構成の帰結。
-        # 計画書のN08専用fixtureでは Root Lease 期限が review_due_at より
-        # 後のため Root 失効も返金も起こらない。差分は報告参照）。
-        # Child 由来の資金移動は一切無い。
+        # 全口座残高（budget_accounts）は提出直後から 1 行単位で不変
+        buckets_after_tick = {
+            (r["owner_job_id"], r["bucket"], r["source_key"]): int(r["amount_units"])
+            for r in conn.execute(
+                "SELECT owner_job_id, bucket, source_key, amount_units"
+                " FROM budget_accounts WHERE root_id = ?",
+                (root_id,),
+            )
+        }
+        assert buckets_after_tick == buckets_after_submit
+        # Wallet は全口座不変（返金送金も起こっていない）
         fresh_wallets = _wallets(conn)
-        assert fresh_wallets[AGENT_A_ID] == wallets_after_submit[AGENT_A_ID]
-        assert fresh_wallets[AGENT_B_ID] == wallets_after_submit[AGENT_B_ID]
-        assert fresh_wallets[REQUESTER_ID] == (
-            wallets_after_submit[REQUESTER_ID] + ROOT_BUDGET_UNITS - TEN
+        assert fresh_wallets == wallets_after_submit
+        # PaymentOperation も 1 行単位で不変
+        payments_after_tick = conn.execute(
+            "SELECT operation_id, business_key, amount_units, payee_id, status"
+            " FROM payment_operations WHERE root_id = ? ORDER BY operation_id",
+            (root_id,),
+        ).fetchall()
+        assert [tuple(r) for r in payments_after_tick] == [
+            tuple(r) for r in payments_after_submit
+        ]
+        # Acceptance の行数も不変
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM acceptances WHERE job_id = ?",
+                (child_id,),
+            ).fetchone()["c"]
+            == acceptances_after_submit
         )
         ledger.assert_ledger_invariants(conn, root_id)
     finally:
@@ -555,36 +614,72 @@ def test_tick_keeps_submitted_between_lease_expiry_and_review_due(demo_db):
     assert _wallets(demo_db.conn)[AGENT_B_ID] == TEN
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
-
 # ---------------------------------------------------------------------------
 # N09: Parent 失効後も Child の期限処理が独立に継続
 # ---------------------------------------------------------------------------
 
 
 def test_child_approval_survives_parent_expiry(demo_db):
-    """N09: Child の Worker B が提出した後、Parent（Root）を失効させ、
-    そのあとも Child の期限承認で B への支払い予約と送金が成立する
-    （Parent 終端を Child へ伝播しない）。
+    """N09: A が Root を Claim して Child を作成した後、**Parent（Root）を
+    失効させる**。その後に B が Child を Claim して提出しても、固定検証と
+    期限承認・送金が成立する（Parent 終端を Child へ伝播しない。完了条件4
+    「Parent 失効後も Child の Lease・提出・期限処理が独立に継続する」）。
 
-    Root と Child は同じ timing（Lease 30秒・review 120秒）を継承するため、
-    t0+61秒で Root の Lease だけを失効させ（Child は SUBMITTED で対象外）、
-    t0+121秒の review_due_at で Child の期限承認を起こす。
+    順序（A プロセス停止の再現）: Root Claim → Child 作成 → Parent 失効
+    （t0+61秒で Lease 期限切れ）→ B が Child Claim（t0+62秒）→ B submit
+    （t0+63秒）→ review_due_at（t0+63+120秒）まで進めて tick → B へ支払い。
+    Root Requester が Child の成果物を（保存済み artifact として）取得
+    できることも確認する。
     """
-    root_id, child_id, submission_id = _submitted_child(
-        demo_db, suffix="n09", timing=N08_TIMING
+    root_id, child_version_id, root_lease = _leased_root(
+        demo_db, suffix="n09-r", timing=N08_TIMING
     )
+    created_child = service.create_child(
+        demo_db.conn,
+        actor_id=AGENT_A_ID,
+        parent_job_id=root_id,
+        lease_id=root_lease,
+        task_key="part-1",
+        budget_units=TEN,
+        deadline_us=DEADLINE_US,
+        operation_id="create:n09",
+    )
+    child_id = created_child.data["child_id"]
+
+    # Parent（Root）を失効させる（Child はまだ OPEN なので対象外。
+    # Parent 終端を Child へ伝播しない）
+    clock.set_test_now(demo_db.conn, TEST_T0_US + 61_000_000)
+    service.expire_due_leases(demo_db.conn, actor_id=SYSTEM_ID)
+    assert _job(demo_db.conn, root_id)["state"] == JobState.EXPIRED.value
+    assert _job(demo_db.conn, child_id)["state"] == JobState.OPEN.value
+
+    # Parent 失効後に B が Child を Claim して提出できる（t0+62〜63秒）
+    clock.set_test_now(demo_db.conn, TEST_T0_US + 62_000_000)
+    claimed_child = service.claim(
+        demo_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        expected_version_id=created_child.data["version_id"],
+        operation_id="claim:n09-b",
+    )
+    clock.set_test_now(demo_db.conn, TEST_T0_US + 63_000_000)
+    submitted = service.submit(
+        demo_db.conn,
+        actor_id=AGENT_B_ID,
+        job_id=child_id,
+        lease_id=claimed_child.data["lease_id"],
+        version_id=created_child.data["version_id"],
+        artifact_json='{"sum": 6}',
+        operation_id="submit:n09",
+    )
+    submission_id = submitted.data["submission_id"]
     review_due_at = demo_db.conn.execute(
         "SELECT review_due_at_us FROM submissions WHERE id = ?",
         (submission_id,),
     ).fetchone()["review_due_at_us"]
-    assert review_due_at == TEST_T0_US + 1_000_000 + 120_000_000
-
-    # Parent（Root）の Lease を期限切れにする（Child は SUBMITTED のため
-    # 失効処理の対象外。Parent 終端を Child へ伝播しない）
-    clock.set_test_now(demo_db.conn, TEST_T0_US + 61_000_000)
-    service.expire_due_leases(demo_db.conn, actor_id=SYSTEM_ID)
-    assert _job(demo_db.conn, root_id)["state"] == JobState.EXPIRED.value
+    assert review_due_at == TEST_T0_US + 63_000_000 + 120_000_000
     assert _job(demo_db.conn, child_id)["state"] == JobState.SUBMITTED.value
+    del child_version_id
 
     # Child の review_due_at 到達で tick: 自動承認 → 送金まで成立する
     clock.set_test_now(demo_db.conn, review_due_at)
@@ -598,10 +693,21 @@ def test_child_approval_survives_parent_expiry(demo_db):
     # Parent 終端後は Root の未拘束 available も返金予約へ
     refund = _payment(demo_db.conn, f"refund:{root_id}:terminal")
     assert refund is not None
-    assert refund["amount_units"] == ROOT_BUDGET_UNITS - TEN
-    # 返金の送金も同じ tick で処理される
-    # （Requester Wallet は seed 200M - 入金 100M + 返金 90M = 190M）
-    assert _wallets(demo_db.conn)[REQUESTER_ID] == (
-        ROOT_BUDGET_UNITS * 2 - ROOT_BUDGET_UNITS + ROOT_BUDGET_UNITS - TEN
-    )
+    assert refund["status"] == PaymentStatus.SUCCEEDED.value
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+    # Root Requester は Child の保存成果物を取得できる（Phase 5 の取得
+    # service は未実装のため、保存済み artifact と hash の照合で確認）
+    row = demo_db.conn.execute(
+        "SELECT artifact_json, artifact_hash, verification_result"
+        " FROM submissions WHERE id = ?",
+        (submission_id,),
+    ).fetchone()
+    import hashlib as _hashlib
+
+    assert row["verification_result"] == "PASS"
+    assert (
+        _hashlib.sha256(str(row["artifact_json"]).encode("utf-8")).hexdigest()
+        == row["artifact_hash"]
+    )
+    assert json.loads(str(row["artifact_json"])) == {"sum": 6}

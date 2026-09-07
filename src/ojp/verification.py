@@ -178,12 +178,27 @@ def _object_pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _container_depth(value: Any) -> int:
     """JSON 値の入れ子段数。トップレベルの object/array を 1 と数え、
-    葉（str/int/float/bool/None）は 0 と数える。"""
-    if isinstance(value, dict):
-        return 1 + max((_container_depth(v) for v in value.values()), default=0)
-    if isinstance(value, list):
-        return 1 + max((_container_depth(v) for v in value), default=0)
-    return 0
+    葉（str/int/float/bool/None）は 0 と数える。
+
+    明示スタックの反復実装（深い入力で RecursionError を投げない）。
+    """
+    max_depth = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, base = stack.pop()
+        if isinstance(current, dict):
+            depth = base + 1
+            if depth > max_depth:
+                max_depth = depth
+            for child in current.values():
+                stack.append((child, depth))
+        elif isinstance(current, list):
+            depth = base + 1
+            if depth > max_depth:
+                max_depth = depth
+            for child in current:
+                stack.append((child, depth))
+    return max_depth
 
 
 def _verify_published_inputs(
@@ -351,7 +366,10 @@ def verify_artifact(
     # 1. サイズ
     if len(raw_bytes) > MAX_ARTIFACT_BYTES:
         return _fail("ARTIFACT_TOO_LARGE")
-    # 2〜4. JSON 構造（parse 不可 / NaN / Infinity / 重複キー）
+    # 2〜4. JSON 構造（parse 不可 / NaN / Infinity / 重複キー）。
+    #     json.loads 自体も十分深い入力で RecursionError を投げうるため、
+    #     深さが原因の失敗は ARTIFACT_NOT_JSON ではなく ARTIFACT_TOO_DEEP
+    #     として扱う（深さ超過であることが明確なため）
     try:
         parsed = json.loads(
             raw_artifact,
@@ -362,6 +380,8 @@ def verify_artifact(
         return _fail("ARTIFACT_NOT_FINITE")
     except _DuplicateKeyError:
         return _fail("ARTIFACT_DUPLICATE_KEY")
+    except RecursionError:
+        return _fail("ARTIFACT_TOO_DEEP")
     except (json.JSONDecodeError, ValueError):
         return _fail("ARTIFACT_NOT_JSON")
     # 5. 深さ

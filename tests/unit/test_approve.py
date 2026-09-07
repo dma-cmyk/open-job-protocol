@@ -391,12 +391,16 @@ def test_root_requester_cannot_approve_child(demo_db):
 
 
 def test_approve_leased_job_is_invalid_state(demo_db):
-    """LEASED（提出前）の approve は INVALID_STATE。"""
+    """LEASED（提出前）の Job への approve は拒否される。R2 の前置検査
+    順序（Job 存在 → Submission 所属 → 権限 → 状態）により、提出を持た
+    ない Job への approve は INVALID_TARGET が先に確定する（存在しない
+    Submission を渡しても同じ）。状態検査（INVALID_STATE）の到達は
+    DISPUTED との競合テストで確認する。"""
     root_id, _root_v, _lease = _leased_root(demo_db, suffix="leased")
     with pytest.raises(OjpError) as exc_info:
         _approve(demo_db, root_id, "submission:unknown", "approve:leased",
                  actor_id=REQUESTER_ID)
-    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
 
 
 def test_approve_disputed_job_is_invalid_state(demo_db):
@@ -420,9 +424,12 @@ def test_approve_disputed_job_is_invalid_state(demo_db):
 
 
 def test_approve_terminal_job_is_invalid_state(demo_db):
-    """終端 Job（FAIL 系: FAILED）への approve は INVALID_STATE。
+    """終端 Job（FAIL 系: FAILED）への approve は拒否される。
     （DONE への別 operation_id での再 approve は N05 の再利用経路が
-    business_key=payout:{job_id} で返すため、ここは FAILED で検査する）"""
+    business_key=payout:{job_id} で返すため、ここは FAILED で検査する。
+    R2 の前置検査順序により、提出を持たない終端 Job（提出前 abandon）へは
+    INVALID_TARGET が先に確定する。提出済みで終端に至る Job の
+    INVALID_STATE は DISPUTED との競合テストが担う）"""
     root_id, root_v, root_lease = _leased_root(demo_db, suffix="term")
     # A が abandon で Root を FAILED へ（提出前放棄の実経路）
     service.abandon(
@@ -432,10 +439,11 @@ def test_approve_terminal_job_is_invalid_state(demo_db):
         lease_id=root_lease,
         operation_id="abandon:term",
     )
+    del root_v
     with pytest.raises(OjpError) as exc_info:
         _approve(demo_db, root_id, "submission:unknown", "approve:term-2",
                  actor_id=REQUESTER_ID)
-    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
 
 
 def test_approve_other_job_submission_is_invalid_target(demo_db):
@@ -448,6 +456,84 @@ def test_approve_other_job_submission_is_invalid_target(demo_db):
         _approve(demo_db, root_b, submission_a, "approve:cross",
                  actor_id=REQUESTER_ID)
     assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
+
+# ---------------------------------------------------------------------------
+# R2: 承認後の業務キー再利用経路も権限・対象・状態の前置検査を通る
+# ---------------------------------------------------------------------------
+
+def test_post_approval_other_actor_approve_is_forbidden(demo_db):
+    """承認後に別 Actor が（新規 operation_id で）approve しても FORBIDDEN。
+    業務キー再利用経路（reuse_existing_payment）が権限検査をすり抜けない。
+    Acceptance・PaymentOperation・残高は不変。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    _approve(demo_db, child_id, submission_id, "approve:owner")
+    buckets_before = _buckets(demo_db, root_id)
+    wallets_before = _wallets(demo_db)
+    with pytest.raises(OjpError) as exc_info:
+        _approve(
+            demo_db, child_id, submission_id, "approve:intruder",
+            actor_id=REQUESTER_ID,
+        )
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    assert _buckets(demo_db, root_id) == buckets_before
+    assert _wallets(demo_db) == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+def test_post_approval_wrong_submission_id_is_invalid_target(demo_db):
+    """承認後に同じ Requester が別 Job の submission_id を渡した新規
+    operation_id の approve は INVALID_TARGET。Acceptance・PaymentOperation・
+    残高は不変。"""
+    root_a, child_a, _va, submission_a = _submitted_child(demo_db, suffix="wa-r")
+    root_b, _vb, _sb, _submission_b = _submitted_child(demo_db, suffix="wb-r")
+    _approve(demo_db, child_a, submission_a, "approve:wa")
+    buckets_before = _buckets(demo_db, root_a)
+    wallets_before = _wallets(demo_db)
+    # child_a の Requester は A。別 Job（root_b 配下の Child）の submission
+    # を渡しても INVALID_TARGET（状態検査は通る）
+    other_child = demo_db.conn.execute(
+        "SELECT id FROM jobs WHERE parent_id = ?", (root_b,)
+    ).fetchone()["id"]
+    other_submission = demo_db.conn.execute(
+        "SELECT id FROM submissions WHERE job_id = ?",
+        (other_child,),
+    ).fetchone()["id"]
+    with pytest.raises(OjpError) as exc_info:
+        _approve(
+            demo_db, child_a, other_submission, "approve:wa-wrong",
+            actor_id=AGENT_A_ID,
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_TARGET.value
+    acceptances, payments, receipts = _counts(demo_db, child_a)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    assert _buckets(demo_db, root_a) == buckets_before
+    assert _wallets(demo_db) == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_a)
+    ledger.assert_ledger_invariants(demo_db.conn, root_b)
+
+def test_post_approval_same_submission_new_operation_id_reuses(demo_db):
+    """承認後に同じ Requester が同じ submission_id で別 operation_id の
+    approve をすると既存 Acceptance / PaymentOperation / Receipt が 1 件の
+    まま既存結果を返す（N05 の再利用経路は維持）。"""
+    root_id, child_id, _v, submission_id = _submitted_child(demo_db)
+    first = _approve(demo_db, child_id, submission_id, "approve:n05-a")
+    buckets_before = _buckets(demo_db, root_id)
+    wallets_before = _wallets(demo_db)
+    second = _approve(demo_db, child_id, submission_id, "approve:n05-b")
+    assert second.replayed is True
+    assert second.data["payment_operation_id"] == first.data["payment_operation_id"]
+    acceptances, payments, receipts = _counts(demo_db, child_id)
+    assert acceptances == 1
+    assert payments == 1
+    assert receipts == 0
+    assert _buckets(demo_db, root_id) == buckets_before
+    assert _wallets(demo_db) == wallets_before
+    ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
 
 # ---------------------------------------------------------------------------

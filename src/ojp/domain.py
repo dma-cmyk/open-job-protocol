@@ -9,7 +9,7 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 UNIT_SCALE = 1_000_000
 SQLITE_MAX_I64 = 9_223_372_036_854_775_807
@@ -252,17 +252,31 @@ class TimingPolicy(_StrictModel):
     unresponsive_arbiter_fallback は裁定無応答時の fallback 方針
     （計画書 第12節「この fallback を JobVersion に事前記録する」）。
     公開 Version の timing_policy 列へ保存され、resolve_due_disputes は
-    この保存値を読んで適用する。None（既定）は「記録が無い古い Job」と
-    同じ扱いで、fallback しない。
+    この保存値を読んで適用する。全ての公開 Version が fallback を
+    事前記録する（Requester/A の無応答で資金を永久凍結しない）。
+    保存済み timing_policy JSON に当該キーが無い場合（後方互換）は
+    "stored_pass" として扱う。
     """
 
     lease_seconds: Annotated[int, Field(gt=0, strict=True)] = 60
     heartbeat_seconds: Annotated[int, Field(gt=0, strict=True)] = 20
     review_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
     dispute_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
-    unresponsive_arbiter_fallback: (
-        Literal["stored_pass"] | None
-    ) = "stored_pass"
+    unresponsive_arbiter_fallback: Literal["stored_pass"] = "stored_pass"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_missing_fallback_to_stored_pass(cls, data: Any) -> Any:
+        """キー欠落（古い DB の timing_policy）を "stored_pass" として扱う。
+
+        None や他の値は後方互換のため None→"stored_pass" だけ受け入れ、
+        それ以外の文字列は Literal 検証で拒否する。
+        """
+        if isinstance(data, dict) and "unresponsive_arbiter_fallback" not in data:
+            return {**data, "unresponsive_arbiter_fallback": "stored_pass"}
+        if isinstance(data, dict) and data.get("unresponsive_arbiter_fallback") is None:
+            return {**data, "unresponsive_arbiter_fallback": "stored_pass"}
+        return data
 
 
 class ArtifactAccessPolicy(_StrictModel):
