@@ -963,8 +963,13 @@ def test_child_abandon_records_return_business_key(test_db):
 
 
 def test_same_child_return_with_different_operation_id_is_invalid_state(test_db):
-    """異なる operation_id から同じ Child 返却を再試行すると INVALID_STATE。
-    business_key 行・Journal・残高は増えない。"""
+    """消費済み return:{child_id} への別ID再試行の境界。
+
+    - 別IDのゼロ返却は正常な no-op（主 Operation は business_key=NULL で残る）
+    - Journal・残高・PaymentOperation は変化しない
+    - 既存の return:{child_id} は 1 件のまま
+    - その後の別IDによる正額二重返却だけが INVALID_STATE
+    """
     root_id, child_id, _lease_id = _due_child_world(test_db, "ret-dup")
     results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
@@ -972,17 +977,40 @@ def test_same_child_return_with_different_operation_id_is_invalid_state(test_db)
     # 終端化する正常な経路は存在しないため、business_key 競合を
     # return_child_work（同じ業務効果のコマンド）で直接再現する
     before = _lifecycle_audit_snapshot(test_db.conn)
-    with pytest.raises(OjpError) as exc_info:
-        service.return_child_work(
-            test_db.conn,
-            actor_id=SYSTEM_ID,
-            root_id=root_id,
-            child_id=child_id,
-            amount_units=0,  # no-op だと business_key を消費しない
-            operation_id="return:ret-dup-zero",
-        )
-    # no_op の呼び出しは新しい return:{child_id} を消費しない（正常 no-op）
-    assert _lifecycle_audit_snapshot(test_db.conn) == before
+
+    # 別IDのゼロ返却は例外ではなく正常な no-op
+    zero = service.return_child_work(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=root_id,
+        child_id=child_id,
+        amount_units=0,
+        operation_id="return:ret-dup-zero",
+    )
+    assert zero.data.get("no_op") is True
+    # no-op 主 Operation は business_key=NULL で保存される
+    zero_row = test_db.conn.execute(
+        "SELECT business_key FROM operations WHERE operation_id = ?",
+        ("return:ret-dup-zero",),
+    ).fetchone()
+    assert zero_row is not None
+    assert zero_row["business_key"] is None
+    # 既存の return:{child_id} は 1 件のまま
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+            (f"return:{child_id}",),
+        ).fetchone()["c"]
+        == 1
+    )
+    # Journal・残高・PaymentOperation は変化しない（operations 以外の表は不変）
+    after_zero = _lifecycle_audit_snapshot(test_db.conn)
+    assert after_zero[:5] == before[:5]  # jobs/leases/budget_accounts/journal 系
+    assert after_zero[6] == before[6]  # payment_operations
+    # no-op Operation 自体は追加されるため、operations の行数は 1 増える
+    assert len(after_zero[5]) == len(before[5]) + 1
+
+    # 別IDによる正額の二重返却だけが INVALID_STATE
     with pytest.raises(OjpError) as exc_info:
         service.return_child_work(
             test_db.conn,
@@ -993,7 +1021,8 @@ def test_same_child_return_with_different_operation_id_is_invalid_state(test_db)
             operation_id="return:ret-dup-second",
         )
     assert exc_info.value.code == ErrorCode.INVALID_STATE.value
-    assert _lifecycle_audit_snapshot(test_db.conn) == before  # 第二の効果なし
+    after_second = _lifecycle_audit_snapshot(test_db.conn)
+    assert after_second == after_zero  # 第二の効果なし
     view = _view(test_db.conn, root_id)
     assert view.available_units == ROOT_BUDGET_UNITS
     ledger.assert_ledger_invariants(test_db.conn, root_id)
@@ -1073,31 +1102,94 @@ def test_child_return_abandon_replay_does_not_duplicate(test_db):
 
 
 def test_child_work_zero_noop_does_not_consume_return_business_key(test_db):
-    """child_work == 0 の no-op では新しい return:{child_id} を消費しない。"""
+    """公開サービス経路でのゼロ返却 no-op は return:{child_id} を消費しない。
+
+    - service.return_child_work(amount_units=0) は正常 no-op（business_key=NULL）
+    - Journal・残高は不変
+    - 同じゼロ Operation ID の再送は replayed=True
+    - その後の別ID正額 return_child_work が成功し、return:{child_id} は 1 件
+    - 正額返却後に Child を期限到来させても child_work == 0 の
+      early return は既存キーと衝突しない
+    """
     _prepare_db(test_db)
     root_id, _root_version = _create_open_root(test_db, "ret-zero")
     child_id = "job:child-ret-zero"
     _insert_child_with_work(
         test_db.conn, root_id, child_id, budget_units=10_000_000
     )
-    # child_work を返却済みにして 0 にする（Parent 生存中の return 経路）
-    with db.transaction(test_db.conn, immediate=True):
-        ledger.child_failure_return_in_tx(
-            test_db.conn,
-            root_id=root_id,
-            child_id=child_id,
-            amount_units=10_000_000,
-            operation_id="return:ret-zero-first",
-            now_us=TEST_T0_US,
-            parent_terminal_refund_reserved=False,
-            child_done_payment_pending=False,
-        )
-    # この直接組み立ての operations 行は無い（business_key は未消費）
-    # Child を期限到来させ、child_work=0 での失効処理は no-op になる
+    # 正の child_work が残った Child へのゼロ返却（公開サービス経路）
+    before = _lifecycle_audit_snapshot(test_db.conn)
+    zero = service.return_child_work(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=root_id,
+        child_id=child_id,
+        amount_units=0,
+        operation_id="return:ret-zero-0",
+    )
+    assert zero.data.get("no_op") is True
+    # 主 Operation は business_key=NULL で保存される
+    zero_row = test_db.conn.execute(
+        "SELECT business_key FROM operations WHERE operation_id = ?",
+        ("return:ret-zero-0",),
+    ).fetchone()
+    assert zero_row is not None
+    assert zero_row["business_key"] is None
+    # Journal・残高は不変（operations に行が 1 つ増えるだけ）
+    after_zero = _lifecycle_audit_snapshot(test_db.conn)
+    assert after_zero[:5] == before[:5]  # jobs/leases/budget_accounts/journal 系
+    assert len(after_zero[5]) == len(before[5]) + 1
+    assert after_zero[6] == before[6]  # payment_operations
+
+    # 同じゼロ Operation ID の再送は replayed=True で同じ結果
+    replay = service.return_child_work(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=root_id,
+        child_id=child_id,
+        amount_units=0,
+        operation_id="return:ret-zero-0",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+    # return:{child_id} はまだ消費されていない
+    assert _return_op_row(test_db.conn, child_id) is None
+
+    # 別IDの正額返却が成功し、return:{child_id} は 1 件だけ確定する
+    real = service.return_child_work(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=root_id,
+        child_id=child_id,
+        amount_units=10_000_000,
+        operation_id="return:ret-zero-real",
+    )
+    assert real.data["amount_units"] == 10_000_000
+    row = _return_op_row(test_db.conn, child_id)
+    assert row is not None
+    assert row["operation_id"] == "return:ret-zero-real"
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+            (f"return:{child_id}",),
+        ).fetchone()["c"]
+        == 1
+    )
+    view = _view(test_db.conn, root_id)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    assert view.locked_breakdown_units["child_work"] == 0
+
+    # Child を期限到来させても、child_work == 0 の early return は
+    # 既存の return:{child_id} と衝突せず no-op として成功する
     clock.set_test_now(test_db.conn, DEADLINE_US)
     results = service.expire_due_leases(test_db.conn, actor_id=SYSTEM_ID)
     by_job = {r.data["job_id"]: r for r in results}
     assert by_job[child_id].data["funds"]["amount_units"] == 0
-    # no-op は return:{child_id} を消費しない
-    assert _return_op_row(test_db.conn, child_id) is None
+    assert (
+        test_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+            (f"return:{child_id}",),
+        ).fetchone()["c"]
+        == 1
+    )
     ledger.assert_ledger_invariants(test_db.conn, root_id)

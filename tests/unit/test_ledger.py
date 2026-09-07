@@ -658,6 +658,431 @@ def test_zero_amount_return_is_normal_no_op(test_db):
 
 
 # ---------------------------------------------------------------------------
+# ゼロ no-op は業務キーを消費しない（business_key=NULL の主 Operation だけ残す）
+# ---------------------------------------------------------------------------
+
+
+def _op_business_key(conn, operation_id):
+    row = conn.execute(
+        "SELECT business_key FROM operations WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    assert row is not None, f"operation not found: {operation_id}"
+    return row["business_key"]
+
+
+def _op_exists(conn, operation_id):
+    return (
+        conn.execute(
+            "SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _bk_count(conn, business_key):
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+            (business_key,),
+        ).fetchone()["c"]
+    )
+
+
+def _journal_count(conn):
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM journal_transactions"
+        ).fetchone()["c"]
+    )
+
+
+def _payment_count(conn, business_key=None):
+    if business_key is None:
+        sql = "SELECT COUNT(*) AS c FROM payment_operations"
+        params = ()
+    else:
+        sql = "SELECT COUNT(*) AS c FROM payment_operations WHERE business_key = ?"
+        params = (business_key,)
+    return int(conn.execute(sql, params).fetchone()["c"])
+
+
+def _fund_root(test_db):
+    service.fund_root(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        requester_id=REQUESTER_ID,
+        expected_amount_units=ROOT_BUDGET_UNITS,
+        amount_units=ROOT_BUDGET_UNITS,
+    )
+
+
+def _allocate_child(test_db):
+    service.allocate_child_work(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=CHILD_BUDGET_UNITS,
+    )
+
+
+def test_return_child_work_zero_noop_keeps_return_business_key(test_db):
+    """return_child_work(amount_units=0) は正常 no-op で return:{child_id} を
+    消費しない（Parent 生存中の通常返却経路）。
+
+    - 主 Operation は business_key=NULL で保存され、Journal・残高は不変
+    - 同一ゼロ ID の再送は replayed=True で同じ結果
+    - その後の別 ID 正額返却が成功し、return:{child_id} は 1 件だけ確定
+    - 正額への別 ID 二重試行は INVALID_STATE（二重効果なし）
+    - ゼロ→正額への同一 ID 流用は IDEMPOTENCY_CONFLICT
+    - 負数は INVALID_ARGUMENT で Operation を残さない
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    _allocate_child(test_db)
+
+    journal_before = _journal_count(test_db.conn)
+    view_before = _view(test_db)
+
+    zero = service.return_child_work(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=0,
+        operation_id="return:zero-1",
+    )
+    assert zero.data.get("no_op") is True
+    assert _op_business_key(test_db.conn, "return:zero-1") is None
+    assert _journal_count(test_db.conn) == journal_before
+    assert _view(test_db) == view_before  # 残高不変
+    assert _bk_count(test_db.conn, f"return:{CHILD_ID}") == 0
+
+    # 同一ゼロ ID の再送は同じ結果を replay する
+    replay = service.return_child_work(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=0,
+        operation_id="return:zero-1",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+
+    # 負数はゼロ特例に含めず INVALID_ARGUMENT（rollback で何も残さない）
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=-1,
+            operation_id="return:neg-1",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "return:neg-1")
+
+    # 別 ID の正額返却が成功する（ゼロが業務キーを消費していないことの反例）
+    real = service.return_child_work(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=CHILD_BUDGET_UNITS,
+        operation_id="return:real-1",
+    )
+    assert real.data["amount_units"] == CHILD_BUDGET_UNITS
+    assert _bk_count(test_db.conn, f"return:{CHILD_ID}") == 1
+    view = _view(test_db)
+    assert view.available_units == ROOT_BUDGET_UNITS
+    assert view.locked_breakdown_units["child_work"] == 0
+
+    # 正額への別 ID 二重試行は INVALID_STATE
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=CHILD_BUDGET_UNITS,
+            operation_id="return:real-2",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert _view(test_db) == view  # 二重効果なし
+
+    # ゼロで使った ID を正額へ流用すると IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        service.return_child_work(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=CHILD_BUDGET_UNITS,
+            operation_id="return:zero-1",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_reserve_parent_payout_zero_noop_keeps_payout_business_key(test_db):
+    """reserve_parent_payout(amount_units=0) は正常 no-op で payout:{root_id} を
+    消費しない。
+
+    - 主 Operation は business_key=NULL、派生 Operation と PaymentOperation は無い
+    - Journal・残高は不変
+    - 同一ゼロ ID の再送は replayed=True
+    - その後の別 ID 正額予約が成功し、payout:{root_id} と PaymentOperation は 1 件
+    - 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    - 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    - ゼロ→正額への同一 ID 流用は IDEMPOTENCY_CONFLICT
+    - 負数は INVALID_ARGUMENT で何も残さない
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    _fund_root(test_db)
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
+
+    journal_before = _journal_count(test_db.conn)
+    view_before = _view(test_db)
+
+    zero = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-zero",
+    )
+    assert zero.data.get("no_op") is True
+    assert "payment_operation_id" not in zero.data
+    assert _op_business_key(test_db.conn, "payout:parent-zero") is None
+    # 派生 Operation（<operation_id>:payment）も PaymentOperation も作らない
+    assert not _op_exists(test_db.conn, "payout:parent-zero:payment")
+    assert _payment_count(test_db.conn) == 0
+    assert _journal_count(test_db.conn) == journal_before
+    assert _view(test_db) == view_before
+    assert _bk_count(test_db.conn, f"payout:{ROOT_ID}") == 0
+
+    # 同一ゼロ ID の再送は同じ結果を replay する
+    replay = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-zero",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+
+    # 負数は INVALID_ARGUMENT で何も残さない
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_payout(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            payee_id=AGENT_A_ID,
+            operation_id="payout:parent-neg",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "payout:parent-neg")
+
+    # 別 ID の正額予約が成功する
+    real = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-real",
+    )
+    assert real.data["payment_operation_id"] == "payout:parent-real:payment"
+    assert _bk_count(test_db.conn, f"payout:{ROOT_ID}") == 1
+    assert _payment_count(test_db.conn, f"payout:{ROOT_ID}") == 1
+    view = _view(test_db)
+    assert view.available_units == 0
+    assert view.locked_breakdown_units["parent_payout"] == ROOT_BUDGET_UNITS
+
+    # 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    second = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-second",
+    )
+    assert second.replayed is True
+    assert second.data["payment_operation_id"] == "payout:parent-real:payment"
+    assert _payment_count(test_db.conn, f"payout:{ROOT_ID}") == 1
+
+    # 正額効果が既にある状態から別 ID のゼロを呼ぶと、例外でも既存正額結果の
+    # 再利用でもなく、正常なゼロ no-op になる
+    zero_after = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-zero-after",
+    )
+    assert zero_after.data.get("no_op") is True
+    assert "payment_operation_id" not in zero_after.data
+    assert _op_business_key(test_db.conn, "payout:parent-zero-after") is None
+
+    # ゼロで使った ID を正額へ流用すると IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_payout(
+            test_db.conn,
+            actor_id=REQUESTER_ID,
+            root_id=ROOT_ID,
+            amount_units=ROOT_BUDGET_UNITS,
+            payee_id=AGENT_A_ID,
+            operation_id="payout:parent-zero",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_reserve_parent_refund_zero_noop_keeps_refund_business_key(test_db):
+    """reserve_parent_refund(amount_units=0, payee_id=None) は正常 no-op で
+    refund:{root_id}:terminal を消費しない。
+
+    - 主 Operation は business_key=NULL、PaymentOperation は無い
+    - Journal・残高は不変
+    - 同一ゼロ ID の再送は replayed=True
+    - その後の別 ID 正額予約が成功し、refund:{root_id}:terminal は 1 件
+    - 正額への別 ID 二重予約は INVALID_STATE（payee_id=None の契約）
+    - 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    - ゼロ→正額への同一 ID 流用は IDEMPOTENCY_CONFLICT
+    - 負数は INVALID_ARGUMENT で何も残さない
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+
+    journal_before = _journal_count(test_db.conn)
+    view_before = _view(test_db)
+
+    zero = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        operation_id="reserve:refund-zero",
+    )
+    assert zero.data.get("no_op") is True
+    assert _op_business_key(test_db.conn, "reserve:refund-zero") is None
+    assert _payment_count(test_db.conn) == 0
+    assert _journal_count(test_db.conn) == journal_before
+    assert _view(test_db) == view_before
+    assert _bk_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 0
+
+    # 同一ゼロ ID の再送は同じ結果を replay する
+    replay = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        operation_id="reserve:refund-zero",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+
+    # 負数は INVALID_ARGUMENT で何も残さない
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            operation_id="reserve:refund-neg",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "reserve:refund-neg")
+
+    # 別 ID の正額予約が成功する
+    real = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        operation_id="reserve:refund-real",
+    )
+    assert real.data["amount_units"] == ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    assert _bk_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 1
+    view = _view(test_db)
+    assert view.available_units == CHILD_BUDGET_UNITS
+    assert view.locked_breakdown_units["refund"] == (
+        ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    )
+
+    # 正額への別 ID 二重予約は INVALID_STATE（payee_id=None の既存契約）
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+            operation_id="reserve:refund-second",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_STATE.value
+    assert _view(test_db) == view  # 二重効果なし
+
+    # 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    zero_after = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        operation_id="reserve:refund-zero-after",
+    )
+    assert zero_after.data.get("no_op") is True
+    assert _op_business_key(test_db.conn, "reserve:refund-zero-after") is None
+
+    # ゼロで使った ID を正額へ流用すると IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+            operation_id="reserve:refund-zero",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_allocate_child_work_zero_is_invalid_argument_and_leaves_nothing(test_db):
+    """allocate_child_work(amount_units=0) はゼロ特例に含めない
+    （INVALID_ARGUMENT で transaction 全体が rollback し、Operation・
+    business_key・Journal を残さない）。
+    """
+    setup_ledger_demo_world(test_db.conn, ROOT_ID)
+    insert_child_job(test_db.conn, ROOT_ID, CHILD_ID)
+    _fund_root(test_db)
+    with pytest.raises(OjpError) as exc_info:
+        service.allocate_child_work(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=0,
+            operation_id="allocate:zero",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "allocate:zero")
+    assert _bk_count(test_db.conn, f"allocate:{CHILD_ID}") == 0
+    assert _journal_count(test_db.conn) == 1  # fund のみ
+    assert _view(test_db).available_units == ROOT_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+# ---------------------------------------------------------------------------
 # Child DONE かつ送金障害中の失敗返却禁止（計画書 第9節）
 # ---------------------------------------------------------------------------
 

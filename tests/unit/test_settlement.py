@@ -457,6 +457,340 @@ def test_zero_amount_reserve_creates_no_payment_operation(test_db):
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
+# ---------------------------------------------------------------------------
+# ゼロ no-op は業務キーを消費しない（business_key=NULL の主 Operation だけ残す）
+# ---------------------------------------------------------------------------
+
+
+def _op_business_key(conn, operation_id):
+    row = conn.execute(
+        "SELECT business_key FROM operations WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    assert row is not None, f"operation not found: {operation_id}"
+    return row["business_key"]
+
+
+def _op_exists(conn, operation_id):
+    return (
+        conn.execute(
+            "SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _bk_count(conn, business_key):
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM operations WHERE business_key = ?",
+            (business_key,),
+        ).fetchone()["c"]
+    )
+
+
+def _journal_count(conn):
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM journal_transactions"
+        ).fetchone()["c"]
+    )
+
+
+def _payment_count(conn, business_key=None):
+    if business_key is None:
+        sql = "SELECT COUNT(*) AS c FROM payment_operations"
+        params = ()
+    else:
+        sql = "SELECT COUNT(*) AS c FROM payment_operations WHERE business_key = ?"
+        params = (business_key,)
+    return int(conn.execute(sql, params).fetchone()["c"])
+
+
+def test_reserve_child_payout_zero_noop_keeps_payout_business_key(test_db):
+    """reserve_child_payout(amount_units=0) は正常 no-op で payout:{child_id} を
+    消費しない。
+
+    - 主 Operation は business_key=NULL、派生 Operation（payout:zero:payment）
+      も PaymentOperation も作らない
+    - Journal・残高は不変
+    - 同一ゼロ ID の再送は replayed=True で同じ結果
+    - その後の別 ID 正額予約が成功し、payout:{child_id} と PaymentOperation は 1 件
+    - 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    - 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    - ゼロ→正額への同一 ID 流用は IDEMPOTENCY_CONFLICT
+    - 負数は INVALID_ARGUMENT で何も残さない
+    """
+    _setup_funded_child(test_db)
+    journal_before = _journal_count(test_db.conn)
+    view_before = _view(test_db)
+
+    zero = service.reserve_child_payout(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=0,
+        payee_id=AGENT_B_ID,
+        operation_id="payout:zero",
+    )
+    assert zero.data.get("no_op") is True
+    assert "payment_operation_id" not in zero.data
+    assert _op_business_key(test_db.conn, "payout:zero") is None
+    # 派生 Operation（<operation_id>:payment）も PaymentOperation も作らない
+    assert not _op_exists(test_db.conn, "payout:zero:payment")
+    assert _payment_count(test_db.conn) == 0
+    assert _journal_count(test_db.conn) == journal_before
+    assert _view(test_db) == view_before
+    assert _bk_count(test_db.conn, f"payout:{CHILD_ID}") == 0
+
+    # 同一ゼロ ID の再送は同じ結果を replay する
+    replay = service.reserve_child_payout(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=0,
+        payee_id=AGENT_B_ID,
+        operation_id="payout:zero",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+
+    # 負数は INVALID_ARGUMENT で何も残さない
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_child_payout(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=-1,
+            payee_id=AGENT_B_ID,
+            operation_id="payout:neg",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "payout:neg")
+
+    # 別 ID の正額予約が成功する（ゼロが業務キーを消費していないことの反例）
+    real = _reserve_child_payout(test_db, operation_id="payout:real")
+    assert real.data["payment_operation_id"] == "payout:real:payment"
+    assert _bk_count(test_db.conn, f"payout:{CHILD_ID}") == 1
+    assert _payment_count(test_db.conn, f"payout:{CHILD_ID}") == 1
+    view = _view(test_db)
+    assert view.locked_breakdown_units["child_work"] == 0
+    assert view.locked_breakdown_units["child_payout"] == CHILD_BUDGET_UNITS
+
+    # 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    second = service.reserve_child_payout(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=CHILD_BUDGET_UNITS,
+        payee_id=AGENT_B_ID,
+        operation_id="payout:second",
+    )
+    assert second.replayed is True
+    assert second.data["payment_operation_id"] == "payout:real:payment"
+    assert _payment_count(test_db.conn, f"payout:{CHILD_ID}") == 1
+
+    # 正額効果が既にある状態から別 ID のゼロを呼ぶと、例外でも既存正額結果の
+    # 再利用でもなく、正常なゼロ no-op になる
+    zero_after = service.reserve_child_payout(
+        test_db.conn,
+        actor_id=AGENT_A_ID,
+        root_id=ROOT_ID,
+        child_id=CHILD_ID,
+        amount_units=0,
+        payee_id=AGENT_B_ID,
+        operation_id="payout:zero-after",
+    )
+    assert zero_after.data.get("no_op") is True
+    assert "payment_operation_id" not in zero_after.data
+    assert _op_business_key(test_db.conn, "payout:zero-after") is None
+
+    # ゼロで使った ID を正額へ流用すると IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_child_payout(
+            test_db.conn,
+            actor_id=AGENT_A_ID,
+            root_id=ROOT_ID,
+            child_id=CHILD_ID,
+            amount_units=CHILD_BUDGET_UNITS,
+            payee_id=AGENT_B_ID,
+            operation_id="payout:zero",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_reserve_parent_refund_with_payee_zero_noop_keeps_refund_business_key(test_db):
+    """reserve_parent_refund(amount_units=0, payee_id=Root Requester) は正常
+    no-op で refund:{root_id}:terminal を消費しない（PaymentOperation 付き経路）。
+
+    - 主 Operation は business_key=NULL、派生 Operation も PaymentOperation も無い
+    - Journal・残高は不変
+    - 同一ゼロ ID の再送は replayed=True
+    - その後の別 ID 正額予約が成功し、PaymentOperation は 1 件だけ
+    - 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    - 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    - ゼロ→正額への同一 ID 流用は IDEMPOTENCY_CONFLICT
+    - 負数は INVALID_ARGUMENT で何も残さない
+    """
+    _setup_funded_child(test_db)
+    journal_before = _journal_count(test_db.conn)
+    view_before = _view(test_db)
+
+    zero = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:zero",
+    )
+    assert zero.data.get("no_op") is True
+    assert "payment_operation_id" not in zero.data
+    assert _op_business_key(test_db.conn, "refund:zero") is None
+    # 派生 Operation（<operation_id>:payment）も PaymentOperation も作らない
+    assert not _op_exists(test_db.conn, "refund:zero:payment")
+    assert _payment_count(test_db.conn) == 0
+    assert _journal_count(test_db.conn) == journal_before
+    assert _view(test_db) == view_before
+    assert _bk_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 0
+
+    # 同一ゼロ ID の再送は同じ結果を replay する
+    replay = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:zero",
+    )
+    assert replay.replayed is True
+    assert replay.data == zero.data
+
+    # 負数は INVALID_ARGUMENT で何も残さない
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=-1,
+            payee_id=REQUESTER_ID,
+            operation_id="refund:neg",
+        )
+    assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
+    assert not _op_exists(test_db.conn, "refund:neg")
+
+    # 別 ID の正額予約が成功する
+    real = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:real",
+    )
+    assert real.data["payment_operation_id"] == "refund:real:payment"
+    assert _bk_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 1
+    assert _payment_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 1
+    view = _view(test_db)
+    assert view.available_units == 0
+    assert view.locked_breakdown_units["child_work"] == CHILD_BUDGET_UNITS
+    assert view.locked_breakdown_units["refund"] == (
+        ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    )
+
+    # 正額への別 ID 再確定は既存 PaymentOperation の結果を返す（二重効果なし）
+    second = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:second",
+    )
+    assert second.replayed is True
+    assert second.data["payment_operation_id"] == "refund:real:payment"
+    assert _payment_count(test_db.conn, f"refund:{ROOT_ID}:terminal") == 1
+
+    # 正額効果が既にある状態から別 ID のゼロを呼ぶと正常なゼロ no-op
+    zero_after = service.reserve_parent_refund(
+        test_db.conn,
+        actor_id=SYSTEM_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=REQUESTER_ID,
+        operation_id="refund:zero-after",
+    )
+    assert zero_after.data.get("no_op") is True
+    assert "payment_operation_id" not in zero_after.data
+    assert _op_business_key(test_db.conn, "refund:zero-after") is None
+
+    # ゼロで使った ID を正額へ流用すると IDEMPOTENCY_CONFLICT
+    with pytest.raises(OjpError) as exc_info:
+        service.reserve_parent_refund(
+            test_db.conn,
+            actor_id=SYSTEM_ID,
+            root_id=ROOT_ID,
+            amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+            payee_id=REQUESTER_ID,
+            operation_id="refund:zero",
+        )
+    assert exc_info.value.code == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
+def test_reserve_parent_payout_zero_noop_then_real_creates_one_payment(test_db):
+    """Parent payout のゼロ no-op → 別 ID 正額の遷移で、PaymentOperation は
+    正額 1 件だけ作られる（settlement は 1 回だけ送金する）。
+
+    Parent payout の PaymentOperation 確認: ゼロ時に派生 Operation・
+    PaymentOperation が作られず、正額時にちょうど 1 件作られる。
+    """
+    _setup_funded_child(test_db)
+    # Child を成功扱いにして残額 90 の Parent を DONE にする
+    _reserve_child_payout(test_db)
+    force_job_state(test_db.conn, ROOT_ID, JobState.DONE)
+
+    zero = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=0,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-zero",
+    )
+    assert zero.data.get("no_op") is True
+    assert not _op_exists(test_db.conn, "payout:parent-zero:payment")
+    assert _payment_count(test_db.conn) == 1  # Child payout のみ
+
+    real = service.reserve_parent_payout(
+        test_db.conn,
+        actor_id=REQUESTER_ID,
+        root_id=ROOT_ID,
+        amount_units=ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS,
+        payee_id=AGENT_A_ID,
+        operation_id="payout:parent-real",
+    )
+    assert real.data["payment_operation_id"] == "payout:parent-real:payment"
+    assert _payment_count(test_db.conn, f"payout:{ROOT_ID}") == 1
+
+    # settlement は 2 件（Child payout + Parent payout）を 1 回ずつ送金する
+    results = service.process_payments(test_db.conn)
+    assert len(results) == 2
+    assert all(
+        r.data["payment_status"] == PaymentStatus.SUCCEEDED.value for r in results
+    )
+    view = _view(test_db)
+    assert view.paid_units == ROOT_BUDGET_UNITS
+    assert _wallet(test_db.conn, AGENT_B_ID) == CHILD_BUDGET_UNITS
+    assert _wallet(test_db.conn, AGENT_A_ID) == ROOT_BUDGET_UNITS - CHILD_BUDGET_UNITS
+    ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+
 def test_payment_operation_fields_are_fixed_at_creation(test_db):
     """原資・受取人は作成時に固定される（attempt しても変わらない）。"""
     _setup_funded_child(test_db)

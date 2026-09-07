@@ -2115,6 +2115,12 @@ def reserve_child_payout(
     （計画書 第9節 1）。残額 0 なら支払い Operation を作らず正常な no-op。
     business_key は payout:{child_id}。異なる operation_id で同じ Child の
     支払いを再確定しようとしても既存の結果を返す（二重送金しない）。
+
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない。負数はゼロ特例に含めず INVALID_ARGUMENT と rollback を維持。
     """
     payload = {
         "root_id": root_id,
@@ -2122,6 +2128,7 @@ def reserve_child_payout(
         "amount_units": amount_units,
         "payee_id": payee_id,
     }
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         data = ledger.child_approval_in_tx(
@@ -2148,11 +2155,11 @@ def reserve_child_payout(
         actor_id=actor_id,
         kind="payout",
         operation_id=operation_id,
-        business_key=f"payout:{child_id}",
+        business_key=None if zero_no_op else f"payout:{child_id}",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=True,
-        payment_kind=PaymentKind.PAYOUT,
+        reuse_existing_payment=not zero_no_op,
+        payment_kind=None if zero_no_op else PaymentKind.PAYOUT,
     )
 
 
@@ -2244,6 +2251,12 @@ def return_child_work(
     送金障害中の判定は引数の flag に加えて DB（jobs.state = DONE かつ
     payout:{child_id} の PaymentOperation が PENDING / RETRYABLE）からも
     導出し、どちらかが真なら拒否する。
+
+    amount_units == 0 の正常 no-op は business_key を消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する。正額時に return:{child_id} /
+    refund:{root_id}:child-return:{child_id} を確定できるようにするため）。
+    負数はゼロ特例に含めず、ledger 側の INVALID_ARGUMENT と rollback を維持する。
     """
     payload = {
         "root_id": root_id,
@@ -2252,11 +2265,13 @@ def return_child_work(
         "parent_terminal_refund_reserved": parent_terminal_refund_reserved,
         "child_done_payment_pending": child_done_payment_pending,
     }
-    business_key = (
-        f"refund:{root_id}:child-return:{child_id}"
-        if parent_terminal_refund_reserved
-        else f"return:{child_id}"
-    )
+    if amount_units == 0:
+        # ゼロ no-op は業務キーを持たない（どちらの経路でも消費しない）
+        business_key: str | None = None
+    elif parent_terminal_refund_reserved:
+        business_key = f"refund:{root_id}:child-return:{child_id}"
+    else:
+        business_key = f"return:{child_id}"
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         return ledger.child_failure_return_in_tx(
@@ -2298,6 +2313,12 @@ def reserve_parent_payout(
     business_key は payout:{root_id}。残額 0 なら支払い Operation を作らず
     正常な no-op。異なる operation_id の再確定は既存の結果を返す。
 
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない。負数はゼロ特例に含めず INVALID_ARGUMENT と rollback を維持。
+
     **Parent DONE のときだけ許される**（計画書 第8節の表「DONE: Root の
     未拘束額は A 向け支払い予約へ移動」）。approve 自体は Phase 4 の範囲で、
     Phase 4 の approve 経路が Parent を DONE にした後にこの予約を確定する。
@@ -2305,6 +2326,7 @@ def reserve_parent_payout(
     INVALID_TARGET、Parent が DONE でなければ INVALID_STATE。
     """
     payload = {"root_id": root_id, "amount_units": amount_units, "payee_id": payee_id}
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         job = _get_job_row(c, root_id)
@@ -2345,11 +2367,11 @@ def reserve_parent_payout(
         actor_id=actor_id,
         kind="payout",
         operation_id=operation_id,
-        business_key=f"payout:{root_id}",
+        business_key=None if zero_no_op else f"payout:{root_id}",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=True,
-        payment_kind=PaymentKind.PAYOUT,
+        reuse_existing_payment=not zero_no_op,
+        payment_kind=None if zero_no_op else PaymentKind.PAYOUT,
     )
 
 
@@ -2368,12 +2390,20 @@ def reserve_parent_refund(
     渡すと返金の PaymentOperation を同じ transaction で確定する（S2 の
     返金経路。送金処理は process_payments）。残額 0 なら支払い Operation を
     作らず正常な no-op。異なる operation_id の再確定は既存の結果を返す。
+
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない（payee_id 指定の有無双方で同様）。負数はゼロ特例に
+    含めず INVALID_ARGUMENT と rollback を維持する。
     """
     payload = {
         "root_id": root_id,
         "amount_units": amount_units,
         "payee_id": payee_id,
     }
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         data = ledger.parent_failure_refund_in_tx(
@@ -2401,11 +2431,13 @@ def reserve_parent_refund(
         actor_id=actor_id,
         kind="refund" if payee_id is not None else "reserve",
         operation_id=operation_id,
-        business_key=f"refund:{root_id}:terminal",
+        business_key=None if zero_no_op else f"refund:{root_id}:terminal",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=payee_id is not None,
-        payment_kind=PaymentKind.REFUND if payee_id is not None else None,
+        reuse_existing_payment=(payee_id is not None) and not zero_no_op,
+        payment_kind=(
+            PaymentKind.REFUND if payee_id is not None and not zero_no_op else None
+        ),
     )
 
 
