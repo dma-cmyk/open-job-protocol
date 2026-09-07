@@ -25,10 +25,12 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import clock, db, ledger
+from . import clock, db, domain, ledger
 from .domain import (
     Bucket,
     ErrorCode,
+    JobState,
+    LeaseClosedReason,
     OjpError,
     OperationStatus,
     PaymentKind,
@@ -46,6 +48,11 @@ _KIND_PREFIXES = {
     "reserve": "reserve",
     "payout": "payout",
     "refund": "refund",
+    "create": "create",
+    "claim": "claim",
+    "heartbeat": "heartbeat",
+    "expiry": "expiry",
+    "abandon": "abandon",
 }
 
 
@@ -97,7 +104,18 @@ def _insert_operation(
 
 
 def _map_integrity_error(exc: sqlite3.IntegrityError) -> OjpError:
+    """SQLite の制約違反を正常なドメイン競合へ変換する（計画書 第16節）。
+
+    生の sqlite3.IntegrityError を呼出側へ漏らさない。leases の
+    「有効 Lease は Job 当たり最大 1」「UNIQUE(job_id, generation)」の
+    制約違反は、同時 Claim・再 Claim 競合として CLAIM_CONFLICT へ変換する。
+    """
     message = str(exc)
+    if "leases_one_active_per_job" in message or "leases.job_id" in message:
+        return OjpError(
+            ErrorCode.CLAIM_CONFLICT,
+            f"lease conflict (another active lease won the job): {message}",
+        )
     if "operations_business_key_unique" in message or (
         "operations.business_key" in message
     ):
@@ -275,6 +293,190 @@ def _run_idempotent(
 
 
 # ---------------------------------------------------------------------------
+# Root 作成（計画書 第5節 Job / JobVersion）
+# ---------------------------------------------------------------------------
+
+
+def create_root(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    title: str,
+    budget: str,
+    deadline_us: int,
+    subcontract_policy: domain.SubcontractPolicy,
+    task_catalog: list[domain.TaskCatalogEntry],
+    timing_policy: domain.TimingPolicy | None = None,
+    artifact_access_policy: domain.ArtifactAccessPolicy | None = None,
+    input_json: str | None = None,
+    verifier_id: str | None = None,
+    verifier_hash: str | None = None,
+    conditions_json: str | None = None,
+    conditions_hash: str | None = None,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Root Job（DRAFT）と公開 JobVersion（version=1）を 1 つの書込
+    transaction で作成する（計画書 第5節 Job / JobVersion）。
+
+    - budget は6桁小数文字列を domain.parse_amount_units で units 化する
+      （正の整数。ゼロ・負・文字列以外は拒否）。asset は mock-USDC のみ
+    - deadline_us は作成時点の now より未来であることを要求する
+      （now >= deadline は拒否。第7節: 期限ちょうどは失効側）
+    - subcontract_policy の値域は第10節（max_ratio_bps 0〜10000、
+      max_amount_units 非負、max_children 非負整数、max_depth 0 または 1）
+      を domain.SubcontractPolicy の型で強制し、**金額制約
+      （max_amount_units）と比率制約（max_ratio_bps）の両方の指定を必須**
+      にする。どちらもこの payload では省略不可なので、型検証済みの値が
+      そのまま「両方指定あり」を意味する。値域違反・欠落は
+      INVALID_ARGUMENT（pydantic ValidationError を変換）
+    - timing_policy は domain.TimingPolicy の実値（既定: Lease 60秒 /
+      heartbeat 目安20秒 / 検収待ち30秒 / Dispute 判定待ち30秒）を JSON で
+      保存する。以後 Lease 長・検収期限はこの保存値から読み、コード内の
+      定数を直接使わない（第7節: JobVersion に実際の値を保存する）
+    - JobVersion は公開後 immutable（migration 004 のトリガーが UPDATE /
+      DELETE を DB レベルで拒否する）
+    - task_catalog 内の task_key 重複は INVALID_ARGUMENT で拒否する。
+      カタログは task_key で引く表（第11節）であり、重複があると Child
+      作成時のカタログ導出が一意に決まらない
+    - Root 作成は資金移動の業務効果を持たないので business_key を持たない
+      （business_key は二重拘束・二重払い・二重返金の防止のためのもので、
+      第16節の表は fund / allocate / return / payout / refund にだけ
+      定義する）。再送の冪等性は operation_id が担う（第16節の二段階
+      一意性のうち再送 ID 側だけが該当する）
+    """
+    try:
+        budget_units = domain.parse_amount_units(budget)
+    except domain.MoneyError:
+        raise
+    # subcontract_policy の値域検証（計画書 第10節）。呼出側が検証を
+    # バイパスして構築したポリシー（model_construct 等）でもサービス境界で
+    # 必ず再検証する。金額制約（max_amount_units）と比率制約
+    # （max_ratio_bps）の両方の指定を必須にする（この payload ではどちらも
+    # 省略不可のため、再検証済みの値がそのまま「両方指定あり」を意味する）。
+    # 値域違反・欠落は INVALID_ARGUMENT で拒否する。
+    try:
+        subcontract_policy = domain.SubcontractPolicy.model_validate(
+            subcontract_policy.model_dump(),
+            strict=True,
+        )
+    except Exception as exc:  # pydantic ValidationError（欠落・値域違反）
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"invalid subcontract_policy (第10節): {exc}",
+        ) from exc
+    try:
+        task_catalog = [
+            domain.TaskCatalogEntry.model_validate(entry.model_dump(), strict=True)
+            for entry in task_catalog
+        ]
+    except Exception as exc:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT, f"invalid task_catalog: {exc}"
+        ) from exc
+    # task_key の重複は拒否する。カタログは task_key で引く表（第11節）であり、
+    # 重複があると Child 作成時のカタログ導出が一意に決まらない。
+    task_keys = [entry.task_key for entry in task_catalog]
+    if len(task_keys) != len(set(task_keys)):
+        duplicates = sorted({key for key in task_keys if task_keys.count(key) > 1})
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"task_catalog contains duplicate task_key: {duplicates}"
+            " (カタログは task_key で引く表. 第11節)",
+        )
+    if not isinstance(deadline_us, int) or isinstance(deadline_us, bool):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"deadline_us must be int, got {type(deadline_us).__name__}",
+        )
+    if deadline_us < 0:
+        raise OjpError(ErrorCode.INVALID_ARGUMENT, "deadline_us must be non-negative")
+    timing = timing_policy if timing_policy is not None else domain.TimingPolicy()
+    access = (
+        artifact_access_policy
+        if artifact_access_policy is not None
+        else domain.ArtifactAccessPolicy()
+    )
+    payload = {
+        "title": title,
+        "budget": budget,
+        "deadline_us": deadline_us,
+        "subcontract_policy": subcontract_policy.model_dump(),
+        "task_catalog": [entry.model_dump() for entry in task_catalog],
+        "timing_policy": timing.model_dump(),
+        "artifact_access_policy": access.model_dump(),
+        "input_json": input_json,
+        "verifier_id": verifier_id,
+        "verifier_hash": verifier_hash,
+        "conditions_json": conditions_json,
+        "conditions_hash": conditions_hash,
+    }
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # now は _run_idempotent が BEGIN IMMEDIATE 後に 1 回だけ採取した値。
+        # 期限ちょうど（now == deadline）は失効側なので作成を拒否する（第7節）
+        if now >= deadline_us:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"deadline_us must be in the future: now={now} >= deadline={deadline_us}",
+            )
+        job_id = f"job:{op_id}"
+        version_id = f"version:{job_id}:1"
+        c.execute(
+            "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
+            " row_version, created_at_us)"
+            " VALUES (?, ?, NULL, ?, 'DRAFT', 0, ?)",
+            (job_id, job_id, actor_id, now),
+        )
+        c.execute(
+            "INSERT INTO job_versions (id, job_id, version, title, budget_units,"
+            " asset, input_json, verifier_id, verifier_hash, conditions_json,"
+            " conditions_hash, subcontract_policy, task_catalog, timing_policy,"
+            " artifact_access_policy, deadline_us)"
+            " VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                version_id,
+                job_id,
+                title,
+                budget_units,
+                domain.ASSET_MOCK_USDC,
+                input_json,
+                verifier_id,
+                verifier_hash,
+                conditions_json,
+                conditions_hash,
+                ledger.canonical_json_dumps(subcontract_policy.model_dump()),
+                ledger.canonical_json_dumps(
+                    [entry.model_dump() for entry in task_catalog]
+                ),
+                ledger.canonical_json_dumps(timing.model_dump()),
+                ledger.canonical_json_dumps(access.model_dump()),
+                deadline_us,
+            ),
+        )
+        c.execute(
+            "UPDATE jobs SET version_id = ? WHERE id = ?",
+            (version_id, job_id),
+        )
+        return {
+            "job_id": job_id,
+            "version_id": version_id,
+            "state": domain.JobState.DRAFT.value,
+            "budget_units": budget_units,
+            "deadline_us": deadline_us,
+        }
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="create",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Root funding
 # ---------------------------------------------------------------------------
 
@@ -298,8 +500,13 @@ def fund_root(
     （jobs / job_versions）から解決する:
 
     検査の順序は Root 性 → Actor 権限 → 申告 requester_id → 公開予算 →
-    asset。権限のない Actor には Job の公開状態（Version の有無・公開予算）
-    を返さないため、公開状態の解決は権限検査の後に行う:
+    asset → Job 状態（DRAFT 必須）。権限のない Actor には Job の公開状態
+    （Version の有無・公開予算）を返さないため、公開状態の解決は権限検査の
+    後に行う。状態検査は「権限のない Actor に DRAFT/OPEN 等の状態を
+    漏らさない位置」に挿すため、権限系の検査（Actor・申告・公開予算）が
+    すべて通った後・asset 検査の後に置く（状態は DRAFT だけが合法であり、
+    fund 成功のたびに OPEN へ 1 回だけ進む。第6節の表「DRAFT | Root の
+    正確な全額入金が確定 | OPEN」）:
 
     - 対象 Job が Root（parent_id IS NULL かつ root_id = id）でなければ
       INVALID_TARGET
@@ -308,6 +515,10 @@ def fund_root(
     - requester_id / expected_amount_units が DB の正本と違えば FORBIDDEN
       （呼出側の値を黙って採用しない）
     - asset は job_versions.asset が mock-USDC であることを要求する
+    - jobs.state が DRAFT でなければ INVALID_STATE（未入金 Root は OPEN に
+      ならず、OPEN 以降への二重 fund は business_key fund:{root_id} と
+      operation 冪等性で既に 1 回だけ。この状態検査はその上で Claim 等の
+      前提となる DRAFT→OPEN 遷移を記録する）
 
     実行（Wallet 減額と Escrow available 増額の Journal 確定）は
     EscrowPort.fund が呼出側の transaction 内で行う（計画書 第15節:
@@ -353,6 +564,37 @@ def fund_root(
                 ErrorCode.INVALID_STATE,
                 f"unsupported asset in the published version: {asset!r}",
             )
+        # 6. Job 状態（INVALID_STATE）: DRAFT のみ。権限系の検査をすべて
+        #    通過した後に置く（権限のない Actor に状態を漏らさない）。
+        #    読み取りと遷移（条件付き UPDATE）をこの transaction で直列化
+        #    する（BEGIN IMMEDIATE の書込ロック内）。
+        row = c.execute(
+            "SELECT state, row_version FROM jobs WHERE id = ?", (root_id,)
+        ).fetchone()
+        assert row is not None  # resolve_root_job で存在確認済み
+        if row["state"] != JobState.DRAFT.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "root job must be DRAFT to fund"
+                f" (current state: {row['state']})."
+                " 未入金 Root は OPEN にならず、二重 fund は"
+                " fund:{root_id} で 1 回だけ（第6節・第16節）",
+            )
+        cursor = c.execute(
+            "UPDATE jobs SET state = ?, row_version = row_version + 1"
+            " WHERE id = ? AND state = ? AND row_version = ?",
+            (
+                JobState.OPEN.value,
+                root_id,
+                JobState.DRAFT.value,
+                int(row["row_version"]),
+            ),
+        )
+        if cursor.rowcount != 1:  # pragma: no cover - 書込ロック内では到達しない
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "root job state changed concurrently during fund",
+            )
         return escrow_port.fund(
             c,
             op_id,
@@ -373,6 +615,1450 @@ def fund_root(
         kind="fund",
         operation_id=operation_id,
         business_key=f"fund:{root_id}",
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lease（計画書 第7節）: 共通判定と Claim / heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _get_job_row(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        raise OjpError(ErrorCode.INVALID_TARGET, f"job not found: {job_id}")
+    return row
+
+
+def _get_job_version_timing(
+    conn: sqlite3.Connection, version_id: str
+) -> tuple[domain.TimingPolicy, int]:
+    """公開 JobVersion から timing_policy（実値）と deadline を読む。
+
+    Lease 長・検収期限は JobVersion に保存した実値から読み、コード内の
+    定数を直接使わない（計画書 第7節: JobVersion に実際の値を保存する）。
+    """
+    row = conn.execute(
+        "SELECT timing_policy, deadline_us FROM job_versions WHERE id = ?",
+        (version_id,),
+    ).fetchone()
+    if row is None:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET, f"job version not found: {version_id}"
+        )
+    timing = domain.TimingPolicy.model_validate_json(row["timing_policy"])
+    return timing, int(row["deadline_us"])
+
+
+def _get_lease_row(conn: sqlite3.Connection, lease_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
+    if row is None:
+        raise OjpError(ErrorCode.INVALID_TARGET, f"lease not found: {lease_id}")
+    return row
+
+
+def require_active_lease(
+    conn: sqlite3.Connection,
+    job_id: str,
+    lease_id: str,
+    generation: int,
+    actor_id: str,
+    now_us: int,
+) -> domain.Lease:
+    """「Lease を必要とする操作」から再利用する共通の Lease 有効性判定
+    （計画書 第7節。Claim / heartbeat / abandon に加え、Phase 4 の submit
+    もこの関数を使う前提）。
+
+    検査の順序と対応コード（この順序のまま docstring にも固定する）:
+
+    1. lease_id がその Job の Lease でなければ INVALID_TARGET
+    2. closed_reason IS NOT NULL（閉じた Lease）なら LEASE_EXPIRED。
+       **閉じた Lease を復活させない**（第7節）
+    3. generation 不一致なら LEASE_EXPIRED（古い世代の Lease は失効扱い）
+    4. worker_id != actor_id なら FORBIDDEN（Lease の Worker 本人のみ）
+    5. now >= lease.expires_at_us または now >= job deadline なら
+       LEASE_EXPIRED。**期限ちょうどは失効側を優先する**（第7節:
+       now < deadline を有効、now >= deadline を失効とする）
+
+    now は必ず「書込ロック取得後」に clock.now_for_write_transaction(conn)
+    で 1 回だけ採取した値を呼出側から受け取る。クライアント時刻・
+    time.time() を信用しない。
+    """
+    row = _get_lease_row(conn, lease_id)
+    if row["job_id"] != job_id:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET,
+            f"lease {lease_id} does not belong to job {job_id}",
+        )
+    if row["closed_reason"] is not None:
+        raise OjpError(
+            ErrorCode.LEASE_EXPIRED,
+            f"lease {lease_id} is already closed"
+            f" (closed_reason={row['closed_reason']}). 閉じた Lease を復活させない",
+        )
+    if int(row["generation"]) != generation:
+        raise OjpError(
+            ErrorCode.LEASE_EXPIRED,
+            f"lease generation mismatch: lease has {row['generation']},"
+            f" got {generation}. 古い世代の Lease は失効扱い（第7節）",
+        )
+    if row["worker_id"] != actor_id:
+        raise OjpError(
+            ErrorCode.FORBIDDEN,
+            f"actor {actor_id} is not the worker of lease {lease_id}",
+        )
+    job = _get_job_row(conn, job_id)
+    if job["version_id"] is None:
+        raise OjpError(
+            ErrorCode.INVALID_STATE, f"job has no published version: {job_id}"
+        )
+    _, deadline_us = _get_job_version_timing(conn, job["version_id"])
+    if now_us >= int(row["expires_at_us"]):
+        raise OjpError(
+            ErrorCode.LEASE_EXPIRED,
+            f"lease expired: now={now_us} >= expires_at_us={row['expires_at_us']}",
+        )
+    if now_us >= deadline_us:
+        raise OjpError(
+            ErrorCode.LEASE_EXPIRED,
+            f"job deadline passed: now={now_us} >= deadline_us={deadline_us}",
+        )
+    return domain.Lease.model_validate(dict(row))
+
+
+def claim(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    expected_version_id: str,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Claim（計画書 第7節）。Job を LEASED にし、有効 Lease を 1 件作る。
+
+    BEGIN IMMEDIATE の transaction 内で、次を**再確認してから** Lease 作成と
+    Job 更新を一緒に commit する（第7節。検査順序は状態 → 期限 → 有効 Lease
+    → 公開版一致 → Requester 本人でないこと）:
+
+    1. Job が OPEN（DRAFT / LEASED / 終端は INVALID_STATE。未入金 Root は
+       OPEN にならないので DRAFT の Claim はここで拒否される。計画書 X01）
+    2. now < deadline（now >= deadline は失効側。ここでは Job を EXPIRED に
+       せず INVALID_STATE で拒否し、EXPIRED 化は expire_due_leases に任せる。
+       Claim 側で EXPIRED へ書き換えると、claim と失効処理の両方が同じ
+       遷移を持ち二重経路になるため、Lifecycle（expire_due_leases）に
+       一本化する。第6節「OPEN + deadline 到来 → EXPIRED」）
+    3. 有効 Lease（closed_reason IS NULL）が無い
+    4. expected_version_id が jobs.version_id（公開版）と一致する。
+       不一致は INVALID_TARGET
+    5. actor_id が jobs.requester_id と一致するなら FORBIDDEN
+       （Requester 本人は Claim できない。第7節の表「Requester本人でない
+       Worker が Claim」）
+
+    同時 Claim は DB の直列化で 1 件だけ成立する。敗者は条件付き UPDATE の
+    更新行数 0（既に LEASED）または UNIQUE index
+    leases_one_active_per_job / UNIQUE(job_id, generation) の制約違反から
+    CLAIM_CONFLICT を受け取る。プロセス内 Lock には依存しない（第16節）。
+    """
+    payload = {"job_id": job_id, "expected_version_id": expected_version_id}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        job = _get_job_row(c, job_id)
+        # 1. Job が OPEN。LEASED（別の Claim が先に成立）はドメイン競合として
+        #    CLAIM_CONFLICT にする（同時 Claim の敗者。計画書 第16節「同時
+        #    Claim: 1件だけLease作成、他はCLAIM_CONFLICT」）。DRAFT（未入金）
+        #    や終端状態は競合ではなく状態違反なので INVALID_STATE。
+        if job["state"] == JobState.LEASED.value:
+            raise OjpError(
+                ErrorCode.CLAIM_CONFLICT,
+                "job is already leased to another worker (同時 Claim の敗者)",
+            )
+        if job["state"] != JobState.OPEN.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job must be OPEN to claim (current state: {job['state']})",
+            )
+        if job["version_id"] is None:
+            raise OjpError(
+                ErrorCode.INVALID_STATE, f"job has no published version: {job_id}"
+            )
+        # 2. now < deadline（期限ちょうどは失効側。EXPIRED 化は失効処理に任せる）
+        timing, deadline_us = _get_job_version_timing(c, job["version_id"])
+        if now >= deadline_us:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job deadline passed: now={now} >= deadline_us={deadline_us}."
+                " Job の EXPIRED 化は expire_due_leases に任せる（第6節）",
+            )
+        # 3. 有効 Lease が無い（同時実行の競合は下の UNIQUE index でも直列化）
+        active = c.execute(
+            "SELECT id FROM leases WHERE job_id = ? AND closed_reason IS NULL",
+            (job_id,),
+        ).fetchone()
+        if active is not None:
+            raise OjpError(
+                ErrorCode.CLAIM_CONFLICT,
+                f"job already has an active lease: {active['id']}",
+            )
+        # 4. 公開版の一致
+        if expected_version_id != job["version_id"]:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                "expected_version_id does not match the published version"
+                f" (published: {job['version_id']}, got: {expected_version_id})",
+            )
+        # 5. Requester 本人は Claim できない
+        if actor_id == job["requester_id"]:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                "the job requester cannot claim their own job"
+                " (第7節: Requester本人でないWorkerがClaim)",
+            )
+        # generation はその Job の既存 Lease の最大 generation + 1（初回 1）。
+        # 過去 Lease（閉じた Lease）も含めた最大値から採番するため、世代は
+        # 単調に増え、UNIQUE(job_id, generation) と leases_one_active_per_job
+        # の両方が競合の最後の砦になる。
+        max_generation = c.execute(
+            "SELECT COALESCE(MAX(generation), 0) AS g FROM leases WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()["g"]
+        generation = int(max_generation) + 1
+        lease_id = f"lease:{op_id}"
+        # expires_at = min(now + lease_seconds, job deadline)。heartbeat でも
+        # この上限を越えない（第7節）
+        expires_at_us = min(now + timing.lease_seconds * 1_000_000, deadline_us)
+        try:
+            c.execute(
+                "INSERT INTO leases (id, job_id, worker_id, version_id, generation,"
+                " claimed_at_us, heartbeat_at_us, expires_at_us, closed_reason)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    lease_id,
+                    job_id,
+                    actor_id,
+                    job["version_id"],
+                    generation,
+                    now,
+                    now,
+                    expires_at_us,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise _map_integrity_error(exc) from exc
+        # 条件付き UPDATE: OPEN かつ読み取った row_version の行だけを LEASED へ。
+        # 更新行数 0 ならドメイン競合（別の Claim が先に成立）として扱う。
+        cursor = c.execute(
+            "UPDATE jobs SET state = ?, active_lease_id = ?,"
+            " row_version = row_version + 1"
+            " WHERE id = ? AND state = ? AND row_version = ?",
+            (
+                JobState.LEASED.value,
+                lease_id,
+                job_id,
+                JobState.OPEN.value,
+                int(job["row_version"]),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise OjpError(
+                ErrorCode.CLAIM_CONFLICT,
+                "job state changed concurrently during claim"
+                " (another claim won the job)",
+            )
+        return {
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "generation": generation,
+            "version_id": job["version_id"],
+            "expires_at": expires_at_us,
+            "state": JobState.LEASED.value,
+        }
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="claim",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+def heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    lease_id: str,
+    generation: int,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """heartbeat（計画書 第7節）。Lease の expires_at を更新する。
+
+    検査順序は require_active_lease の共通判定そのもの（1. lease_id がその
+    Job の Lease → INVALID_TARGET、2. 閉じた Lease → LEASE_EXPIRED（復活
+    させない）、3. generation 不一致 → LEASE_EXPIRED、4. Worker 本人でない
+    → FORBIDDEN、5. Lease 期限・Job deadline 到来 → LEASE_EXPIRED）。
+    heartbeat でも tick 未実行でも期限を検査する（第7節）。
+
+    成功時: heartbeat_at_us = now、expires_at_us = min(now + lease_seconds,
+    job deadline)。**heartbeat で Job deadline を越えない。**lease_seconds は
+    JobVersion の timing_policy（保存された実値）から読む。
+    """
+    payload = {"job_id": job_id, "lease_id": lease_id, "generation": generation}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        require_active_lease(c, job_id, lease_id, generation, actor_id, now)
+        job = _get_job_row(c, job_id)
+        assert job["version_id"] is not None
+        timing, deadline_us = _get_job_version_timing(c, job["version_id"])
+        new_expires_at_us = min(now + timing.lease_seconds * 1_000_000, deadline_us)
+        cursor = c.execute(
+            "UPDATE leases SET heartbeat_at_us = ?, expires_at_us = ?"
+            " WHERE id = ? AND closed_reason IS NULL",
+            (now, new_expires_at_us, lease_id),
+        )
+        if cursor.rowcount != 1:  # pragma: no cover - 共通判定済みなので到達しない
+            raise OjpError(
+                ErrorCode.LEASE_EXPIRED, f"lease was closed concurrently: {lease_id}"
+            )
+        return {
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "generation": generation,
+            "expires_at": new_expires_at_us,
+        }
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="heartbeat",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 失効処理と abandon（計画書 第6節・第7節・第14節・第15節 Lifecycle）
+# ---------------------------------------------------------------------------
+
+# 失効処理・abandon は system が tick から呼ぶ Lifecycle であり、通常の
+# Actor 操作ではない。operations 行の actor_id は participants へ FK がある
+# ため、Lifecycle の記録は system participant で行う（計画書 第14節
+# 「tick／seedはsystem」）。system Actor の ID を決めるのは起動設定であり
+# （第5節: サーバー起動設定から ActorContext を作る）、サービス層は
+# 呼出側から受け取る。
+
+
+def _require_system_actor(conn: sqlite3.Connection, actor_id: str) -> None:
+    """Lifecycle（expire_due_leases / reserve_refundable_balance）の呼出側が
+    DB に登録された system Participant であることを検査する（計画書 第14節
+    「tick／seedはsystem」。呼出側 scheduler／CLI だけに認可を任せない）。
+
+    participants を actor_id で検索し、行が無い場合または kind != system の
+    場合は FORBIDDEN。検査は呼出直後（対象の収集・既存 Operation の replay
+    より前）と、各書込 transaction 内（状態変更や Operation 確定の前）の
+    両方で行う。対象収集後に Participant の kind が変更される可能性を
+    残さないため、transaction 内でもう一度検証する。
+    """
+    row = conn.execute(
+        "SELECT kind FROM participants WHERE id = ?", (actor_id,)
+    ).fetchone()
+    if row is None or row["kind"] != domain.ParticipantKind.SYSTEM.value:
+        raise OjpError(
+            ErrorCode.FORBIDDEN,
+            f"actor {actor_id!r} is not a registered system participant"
+            " (Lifecycle は system 専用. 第14節「tick／seedはsystem」)",
+        )
+
+
+def _active_lease_has_valid_submission(conn: sqlite3.Connection, job_id: str) -> bool:
+    """有効提出（submissions 行）が存在するか。失効処理は有効提出が無い
+    場合にだけ Job を EXPIRED にする（第6節「Lease失効またはJob deadline
+    到来、有効提出なし」）。"""
+    row = conn.execute(
+        "SELECT 1 FROM submissions WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return row is not None
+
+
+def _read_available_units(conn: sqlite3.Connection, root_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_units), 0) AS total FROM budget_accounts"
+        " WHERE root_id = ? AND bucket = ?"
+        " AND (source_key IS NULL OR source_key != ?)",
+        (root_id, Bucket.AVAILABLE.value, ledger.WALLET_LEDGER_SOURCE_KEY),
+    ).fetchone()
+    return int(row["total"])
+
+
+def _read_child_work_units(conn: sqlite3.Connection, child_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_units), 0) AS total FROM budget_accounts"
+        " WHERE owner_job_id = ? AND bucket = ?",
+        (child_id, Bucket.CHILD_WORK.value),
+    ).fetchone()
+    return int(row["total"])
+
+
+def _close_lease_and_fail_job_effects(
+    conn: sqlite3.Connection,
+    *,
+    job: sqlite3.Row,
+    lease_row: sqlite3.Row | None,
+    closed_reason: LeaseClosedReason,
+    terminal_state: JobState,
+    now: int,
+) -> None:
+    """Job 終端化の共通効果: Lease を閉じ、Job を終端状態にする。
+
+    - Lease は closed_reason を設定して閉じる（閉じた Lease は復活しない）
+    - Job は終端状態（FAILED / EXPIRED）へ進め、active_lease_id を外す。
+      条件付き UPDATE（読み取った row_version に一致）で、同時実行による
+      先の確定（有効提出等）があれば INVALID_STATE のドメイン競合にする
+      （第7節: Submitとexpiryが競合した時は同じDB transaction境界で
+      直列化する）
+    """
+    if lease_row is not None and lease_row["closed_reason"] is None:
+        conn.execute(
+            "UPDATE leases SET closed_reason = ? WHERE id = ?",
+            (closed_reason.value, lease_row["id"]),
+        )
+    cursor = conn.execute(
+        "UPDATE jobs SET state = ?, active_lease_id = NULL,"
+        " row_version = row_version + 1"
+        " WHERE id = ? AND row_version = ?",
+        (terminal_state.value, job["id"], int(job["row_version"])),
+    )
+    if cursor.rowcount != 1:
+        raise OjpError(
+            ErrorCode.INVALID_STATE,
+            "job state changed concurrently during terminal transition"
+            f" (job={job['id']}, target={terminal_state.value})",
+        )
+
+
+def _insert_refund_payment_operation(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    base_operation_id: str,
+    business_key: str,
+    root_id: str,
+    job_id: str,
+    source_account_id: str,
+    amount_units: int,
+    payee_id: str,
+    now_us: int,
+) -> domain.PaymentOperation:
+    """返金予約に結合する PaymentOperation（PENDING）を同じ transaction で確定する。
+
+    payment_operations が operations を FK で参照するため、派生 ID
+    `<base_operation_id>:payment` の operations 行を先に挿入する
+    （_run_idempotent の payment_kind 派生行と同じ規則。計画書 第16節
+    「一連の処理から生じる各資金移動には派生 ID を割り当てる」）。
+    """
+    payment_operation_id = f"{base_operation_id}:payment"
+    _insert_operation(
+        conn,
+        operation_id=payment_operation_id,
+        actor_id=actor_id,
+        kind=PaymentKind.REFUND.value,
+        payload_hash=_payload_hash(
+            {"derived_from": base_operation_id, "business_key": business_key}
+        ),
+        business_key=None,
+        status=OperationStatus.SUCCEEDED,
+        result=None,
+        now_us=now_us,
+    )
+    return ledger.create_payment_operation_in_tx(
+        conn,
+        operation_id=payment_operation_id,
+        business_key=business_key,
+        root_id=root_id,
+        job_id=job_id,
+        source_account_id=source_account_id,
+        amount_units=amount_units,
+        payee_id=payee_id,
+        kind=PaymentKind.REFUND,
+    )
+
+
+def _reserve_terminal_refund_with_payment_in_tx(
+    conn: sqlite3.Connection,
+    *,
+    job: sqlite3.Row,
+    actor_id: str,
+    operation_id: str,
+    now_us: int,
+) -> dict[str, Any]:
+    """Root 終端時の返金予約: 未拘束 available だけを refund:{root_id}:terminal
+    の返金予約へ移し、返金の PaymentOperation を同じ transaction で確定する。
+
+    計画書 第8節「Parent 終了時」の表の FAILED / EXPIRED 行。locked
+    （child_work / child_payout / parent_payout）には触らない。available が
+    0 のときは返金予約を作らない（正常な no-op。第16節）。同一の業務効果
+    （business_key）の PaymentOperation が既にあれば新しい予約を作らず既存を
+    返す（二重返金しない）。
+    """
+    root_id = str(job["id"])
+    business_key = f"refund:{root_id}:terminal"
+    existing = ledger.get_payment_operation_by_business_key(conn, business_key)
+    if existing is not None:
+        return {
+            "root_id": root_id,
+            "amount_units": existing.amount_units,
+            "payment_operation_id": existing.operation_id,
+            "payment_status": existing.status.value,
+            "reused": True,
+        }
+    available_units = _read_available_units(conn, root_id)
+    if available_units == 0:
+        # 返金予約を作らない正常な no-op（計画書 第16節: 残額0なら支払い
+        # Operation は作らない）
+        return {"root_id": root_id, "amount_units": 0, "no_op": True}
+    data = ledger.parent_failure_refund_in_tx(
+        conn,
+        root_id=root_id,
+        amount_units=available_units,
+        operation_id=operation_id,
+        now_us=now_us,
+    )
+    payment = _insert_refund_payment_operation(
+        conn,
+        actor_id=actor_id,
+        base_operation_id=operation_id,
+        business_key=business_key,
+        root_id=root_id,
+        job_id=root_id,
+        source_account_id=data["refund_account_id"],
+        amount_units=available_units,
+        payee_id=str(job["requester_id"]),
+        now_us=now_us,
+    )
+    return {
+        **data,
+        "payment_operation_id": payment.operation_id,
+        "payment_status": payment.status.value,
+    }
+
+
+def _child_terminal_fund_effects(
+    conn: sqlite3.Connection,
+    *,
+    job: sqlite3.Row,
+    actor_id: str,
+    operation_id: str,
+    now_us: int,
+) -> dict[str, Any]:
+    """Child 終端時の資金の後始末（計画書 第8節・第9節・第16節）。
+
+    - Parent 生存中: child_work → available へ戻す
+      （ledger.child_failure_return_in_tx の通常経路）。資金移動と同じ
+      書込 transaction 内で、派生資金 operation_id に対応する operations 行
+      （business_key return:{child_id}）を service 層から記録する。
+      判定未確定の原資だけを戻す
+    - Parent が FAILED / EXPIRED（終端）: child_work → available → refund の
+      2 移動をこの 1 transaction（1 操作）で記録し、途中の available を外から
+      再利用させない（第9節）。追加返金は business_key
+      refund:{root_id}:child-return:{child_id} の PaymentOperation として
+      確定する（refund:{root_id}:terminal とは別の原資キー）。
+      **返金済み Parent の Job 状態は復活させない**（この関数は Parent の
+      jobs 行を一切更新しない）
+    - Parent DONE はここに含めない。Parent 提出は全 Child 判定終端が前提
+      （第8節 CHILDREN_UNRESOLVED）なので、DONE の Parent に生存 Child は
+      存在し得ず、戻し先は available でよい
+    - child_work が 0 の no-op では新しい return:{child_id} を消費しない
+      （operations 行を作らない。第16節の残額 0 no-op と同じ規則）
+    """
+    child_id = str(job["id"])
+    root_id = str(job["root_id"])
+    child_work_units = _read_child_work_units(conn, child_id)
+    if child_work_units == 0:
+        return {"root_id": root_id, "child_id": child_id, "amount_units": 0}
+    parent = _get_job_row(conn, str(job["parent_id"]))
+    parent_terminal = parent["state"] in {
+        JobState.FAILED.value,
+        JobState.EXPIRED.value,
+    }
+    if not parent_terminal:
+        # Parent 生存中: child_work → available。派生資金 operation_id
+        # （expiry:...:funds / abandon:...:funds）と同じ operation_id で
+        # business_key return:{child_id} の operations 行を資金移動より先に
+        # 挿入する（第16節の表「Child原資返却: return:{child_id}」。既存の
+        # _insert_operation と migration 002 の operations_business_key_unique
+        # を利用）。異なる operation_id で同じ return:{child_id} が使われて
+        # いれば INVALID_STATE となり、transaction 全体が rollback されて
+        # Journal・残高変更を残さない
+        _insert_operation(
+            conn,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            kind="return",
+            payload_hash=_payload_hash(
+                {
+                    "root_id": root_id,
+                    "child_id": child_id,
+                    "amount_units": child_work_units,
+                    "parent_terminal_refund_reserved": False,
+                }
+            ),
+            business_key=f"return:{child_id}",
+            status=OperationStatus.SUCCEEDED,
+            result=None,
+            now_us=now_us,
+        )
+        return ledger.child_failure_return_in_tx(
+            conn,
+            root_id=root_id,
+            child_id=child_id,
+            amount_units=child_work_units,
+            operation_id=operation_id,
+            now_us=now_us,
+            parent_terminal_refund_reserved=False,
+            child_done_payment_pending=False,
+        )
+    business_key = f"refund:{root_id}:child-return:{child_id}"
+    existing = ledger.get_payment_operation_by_business_key(conn, business_key)
+    if existing is not None:
+        # 同一の追加返金は 1 回だけ（第16節）
+        return {
+            "root_id": root_id,
+            "child_id": child_id,
+            "amount_units": existing.amount_units,
+            "payment_operation_id": existing.operation_id,
+            "payment_status": existing.status.value,
+            "reused": True,
+        }
+    data = ledger.child_failure_return_in_tx(
+        conn,
+        root_id=root_id,
+        child_id=child_id,
+        amount_units=child_work_units,
+        operation_id=operation_id,
+        now_us=now_us,
+        parent_terminal_refund_reserved=True,
+        child_done_payment_pending=False,
+    )
+    root = _get_job_row(conn, root_id)
+    payment = _insert_refund_payment_operation(
+        conn,
+        actor_id=actor_id,
+        base_operation_id=operation_id,
+        business_key=business_key,
+        root_id=root_id,
+        job_id=child_id,
+        source_account_id=data["refund_account_id"],
+        amount_units=child_work_units,
+        payee_id=str(root["requester_id"]),
+        now_us=now_us,
+    )
+    return {
+        **data,
+        "payment_operation_id": payment.operation_id,
+        "payment_status": payment.status.value,
+    }
+
+
+def _job_terminal_fund_effects(
+    conn: sqlite3.Connection,
+    *,
+    job: sqlite3.Row,
+    actor_id: str,
+    operation_id: str,
+    now: int,
+) -> dict[str, Any]:
+    """Job 終端時の資金の後始末（計画書 第6節・第8節の表）。
+
+    - Child（parent_id IS NOT NULL）: _child_terminal_fund_effects。
+      Parent 生存中なら child_work → available、Parent 終端後なら
+      child_work → available → refund の追加返金を 1 transaction で確定する
+    - Root: _reserve_terminal_refund_with_payment_in_tx（= 計画書 第15節
+      Lifecycle reserve_refundable_balance の終端行）。未拘束 available だけを
+      refund:{root_id}:terminal の返金予約へ移し PaymentOperation を確定する。
+      locked（child_work / child_payout / parent_payout）には触らない。
+      **Parent 終端を Child へ伝播しない**: この関数は Child の jobs 行・
+      child_work / child_payout を一切変更しない
+    """
+    if job["parent_id"] is not None:
+        return _child_terminal_fund_effects(
+            conn, job=job, actor_id=actor_id, operation_id=operation_id, now_us=now
+        )
+    return _reserve_terminal_refund_with_payment_in_tx(
+        conn, job=job, actor_id=actor_id, operation_id=operation_id, now_us=now
+    )
+
+
+def _collect_expiry_targets(
+    conn: sqlite3.Connection, now: int
+) -> list[tuple[sqlite3.Row, sqlite3.Row | None, str]]:
+    """失効対象を収集する（now はこの transaction で採取した 1 回の値）。
+
+    対象（計画書 第6節・第7節）:
+
+    - 対象 1: 有効 Lease で now >= expires_at_us。→ closed_reason='expired'
+      にし、有効提出が無ければ Job を EXPIRED にする
+    - 対象 2: OPEN で now >= deadline（Lease が無いまま期限到来）。
+      → Job を EXPIRED
+    - 対象 3: LEASED で now >= job deadline。→ Lease を閉じ Job を EXPIRED
+
+    戻り値は (job 行, lease 行または None, 対象種別) の列。自動 OPEN 復帰・
+    Worker 交代・新 Lease 作成はしない（対象の列挙にそもそも含めない）。
+    """
+    targets: list[tuple[sqlite3.Row, sqlite3.Row | None, str]] = []
+    seen_jobs: set[str] = set()
+    # 対象 1: 有効 Lease の期限切れ（LEASED の Job に紐づく）
+    lease_rows = conn.execute(
+        "SELECT l.* FROM leases l JOIN jobs j ON j.id = l.job_id"
+        " WHERE l.closed_reason IS NULL AND l.expires_at_us <= ?"
+        " ORDER BY l.id",
+        (now,),
+    ).fetchall()
+    for lease_row in lease_rows:
+        job = _get_job_row(conn, lease_row["job_id"])
+        if job["state"] in {s.value for s in domain.TERMINAL_JOB_STATES}:
+            continue
+        targets.append((job, lease_row, "lease"))
+        seen_jobs.add(job["id"])
+    # 対象 2・3: Job deadline 到来（OPEN / LEASED）
+    job_rows = conn.execute(
+        "SELECT j.* FROM jobs j JOIN job_versions v ON v.id = j.version_id"
+        " WHERE j.state IN (?, ?) AND v.deadline_us <= ?"
+        " ORDER BY j.id",
+        (JobState.OPEN.value, JobState.LEASED.value, now),
+    ).fetchall()
+    for job in job_rows:
+        if job["id"] in seen_jobs:
+            continue
+        lease_row = None
+        if job["active_lease_id"] is not None:
+            lease_row = _get_lease_row(conn, job["active_lease_id"])
+        targets.append((job, lease_row, "deadline"))
+    return targets
+
+
+def expire_due_leases(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    escrow: ledger.EscrowPort | None = None,
+) -> list[CommandResult]:
+    """期限到来分の失効処理（計画書 第15節 Lifecycle: expire_due_leases）。
+
+    tick から呼ばれる想定。**tick 未実行でも Claim / heartbeat が期限を
+    検査する**ため、失効の確定はこの Lifecycle が担う（第7節）。
+
+    actor_id は起動設定が決める system Actor（第5節: サーバー起動設定から
+    ActorContext を作る。第14節: tick／seedはsystem）。operations 行の
+    actor_id は participants への FK があるため、呼出側（tick）が system
+    participant の ID を渡す。service 層でも DB に登録された
+    ParticipantKind.SYSTEM の Actor であることを検証する
+    （_require_system_actor。呼出側 scheduler／CLI だけには任せない）。
+
+    - 対象 1: 有効 Lease で now >= expires_at_us。→ closed_reason='expired'
+      にし、有効提出が無ければ Job を EXPIRED にする
+    - 対象 2: OPEN で now >= deadline（Lease が無いまま期限到来）。
+      → Job を EXPIRED
+    - 対象 3: LEASED で now >= job deadline。→ Lease を閉じ Job を EXPIRED
+    - **自動 OPEN 復帰・Worker 交代・新 Lease 作成はしない**（第6節）
+    - 資金の後始末（計画書 第8節の表。_job_terminal_fund_effects）:
+      Root は未拘束 available のみ refund:{root_id}:terminal の返金予約へ移し
+      PaymentOperation を確定する（locked には触らない）。Child は Parent
+      生存中なら child_work → available、Parent 終端後なら
+      child_work → available → refund の追加返金を 1 transaction で確定する
+    - **Parent 終端を Child へ伝播しない**: Parent を EXPIRED にしても
+      Child を自動 EXPIRED にしない。Child の Lease・期限処理は独立に継続する
+      （Child は独自の deadline を持ち、Parent deadline を越えてもよい。第8節）
+    - 自動処理の operation_id は第16節の規約に従い `expiry:{lease_id}`
+      （Lease を伴わない Job 失効は `expiry:job:{job_id}`）。資金移動には
+      派生 ID を割り当て、**同じ期限を二重処理しない**（再実行は冪等）
+    - **認可は service 層で行う**: 呼出 Actor が DB 登録済みの system
+      Participant でなければ FORBIDDEN（_require_system_actor）。期限対象の
+      収集前に検査するため、対象が 0 件でも非system呼出しは空配列ではなく
+      FORBIDDEN。各対象の書込 transaction 内でも、状態変更や Operation の
+      確定前に再検証する（収集後に kind が変更される可能性を残さない）
+    - 1 対象ずつ独立した _run_idempotent（BEGIN IMMEDIATE）で処理し、
+      now は各 transaction 内で 1 回だけ採取する。DB_BUSY は
+      _run_idempotent の再試行に任せる
+    """
+    del escrow  # 資金移動は同一 DB の内部移動のみ（Escrow port は使わない）
+    # 認可は対象の収集より先（対象が 0 件でも非systemは FORBIDDEN）
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
+    # 対象の収集は読み取りだけ（各対象の確定はそれぞれ独立した書込
+    # transaction で行い、書込ロック内で再確認する）
+    with db.transaction(conn, immediate=False):
+        preview_now = clock.now_for_read_snapshot(conn)
+        targets = _collect_expiry_targets(conn, preview_now)
+    results: list[CommandResult] = []
+    for job, lease_row, kind in targets:
+        job_id = str(job["id"])
+        if lease_row is not None:
+            expiry_op_id = f"expiry:{lease_row['id']}"
+        else:
+            # Lease を伴わない Job 失効は衝突しない派生 ID にする（第16節）
+            expiry_op_id = f"expiry:job:{job_id}"
+        payload = {"job_id": job_id, "kind": kind}
+
+        def _apply(
+            c: sqlite3.Connection,
+            op_id: str,
+            now: int,
+            _job_id: str = job_id,
+            _lease_id: str | None = (
+                str(lease_row["id"]) if lease_row is not None else None
+            ),
+        ) -> dict[str, Any]:
+            # 書込 transaction 内で認可を再検証する（収集後に Participant の
+            # kind が変更される可能性を残さない。状態変更や Operation の
+            # 確定より前）
+            _require_system_actor(c, actor_id)
+            current = _get_job_row(c, _job_id)
+            if current["state"] in {s.value for s in domain.TERMINAL_JOB_STATES}:
+                # 既に終端（先に有効提出や別の失効が確定した）。何もしない
+                return {"job_id": _job_id, "state": current["state"], "skipped": True}
+            current_lease = (
+                _get_lease_row(c, _lease_id) if _lease_id is not None else None
+            )
+            if current["state"] == JobState.OPEN.value:
+                # 対象 2: OPEN + deadline 到来
+                if current["version_id"] is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"job has no published version: {_job_id}",
+                    )
+                _, deadline_us = _get_job_version_timing(c, current["version_id"])
+                if now < deadline_us:
+                    return {
+                        "job_id": _job_id,
+                        "state": current["state"],
+                        "skipped": True,
+                    }
+                _close_lease_and_fail_job_effects(
+                    c,
+                    job=current,
+                    lease_row=current_lease,
+                    closed_reason=LeaseClosedReason.EXPIRED,
+                    terminal_state=JobState.EXPIRED,
+                    now=now,
+                )
+            elif current["state"] == JobState.LEASED.value:
+                if current_lease is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"leased job has no lease row: {_job_id}",
+                    )
+                # 対象 1: 有効 Lease の期限切れ / 対象 3: LEASED + deadline 到来。
+                # どちらか一方でも到来していれば失効側（期限ちょうどは失効側）
+                if current["version_id"] is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_STATE,
+                        f"job has no published version: {_job_id}",
+                    )
+                _, deadline_us = _get_job_version_timing(c, current["version_id"])
+                lease_due = now >= int(current_lease["expires_at_us"])
+                deadline_due = now >= deadline_us
+                if not (lease_due or deadline_due):
+                    return {
+                        "job_id": _job_id,
+                        "state": current["state"],
+                        "skipped": True,
+                    }
+                if current_lease["closed_reason"] is not None:
+                    return {
+                        "job_id": _job_id,
+                        "state": current["state"],
+                        "skipped": True,
+                    }
+                # 有効提出があれば Job は EXPIRED にしない（Lease だけ閉じる
+                # こともしない。提出済みの Lease は submit 側が閉じる）
+                if _active_lease_has_valid_submission(c, _job_id):
+                    return {
+                        "job_id": _job_id,
+                        "state": current["state"],
+                        "skipped": True,
+                    }
+                _close_lease_and_fail_job_effects(
+                    c,
+                    job=current,
+                    lease_row=current_lease,
+                    closed_reason=LeaseClosedReason.EXPIRED,
+                    terminal_state=JobState.EXPIRED,
+                    now=now,
+                )
+            else:
+                # OPEN / LEASED 以外（SUBMITTED / DISPUTED 等）はこの Lifecycle の
+                # 対象外（提出後の進行は review / dispute 期限が担う）
+                return {
+                    "job_id": _job_id,
+                    "state": current["state"],
+                    "skipped": True,
+                }
+            # 資金の後始末は Job 終端化と同じ transaction で確定する。
+            # 派生 ID（<expiry_op_id>:funds）を資金移動に割り当てる（第16節
+            # 「一連の処理から生じる各資金移動には派生 ID を割り当てる」）
+            funds = _job_terminal_fund_effects(
+                c,
+                job=current,
+                actor_id=actor_id,
+                operation_id=f"{op_id}:funds",
+                now=now,
+            )
+            return {
+                "job_id": _job_id,
+                "state": JobState.EXPIRED.value,
+                "funds": funds,
+            }
+
+        results.append(
+            _run_idempotent(
+                conn,
+                actor_id=actor_id,
+                kind="expiry",
+                operation_id=expiry_op_id,
+                business_key=None,
+                payload=payload,
+                apply_effects=_apply,
+            )
+        )
+    return results
+
+
+def abandon(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+    lease_id: str,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Worker の提出前放棄（計画書 第6節・第14節 `ojp job abandon`）。
+
+    検査順序は第14節のとおり: **Lease に記録された Worker との Actor 一致
+    → Job が LEASED → Lease の指定・有効性**。提出後も Lease 履歴を使って
+    Actor を確認できるため、Child Requester A なら FORBIDDEN、提出済み
+    Child の Worker B なら INVALID_STATE となる。いずれも Child を失敗へ
+    変更できない。Requester の一方的 fail には使えない（FORBIDDEN）。
+
+    成功時: Lease を closed_reason='abandoned' で閉じ、Job を FAILED にする。
+    資金の後始末は失効処理と同じ規則（計画書 第8節の表。
+    _job_terminal_fund_effects）: Root は未拘束 available を返金予約
+    （PaymentOperation 付き）、Child は Parent 生存中なら
+    child_work → available、Parent 終端後なら child_work → available →
+    refund の追加返金。Parent 終端を Child へ伝播しない。
+    """
+    payload = {"job_id": job_id, "lease_id": lease_id}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 1. Lease に記録された Worker との Actor 一致（FORBIDDEN）。
+        #    提出後も Lease 履歴で Actor を確認する（第14節）
+        lease_row = _get_lease_row(c, lease_id)
+        if lease_row["job_id"] != job_id:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"lease {lease_id} does not belong to job {job_id}",
+            )
+        if lease_row["worker_id"] != actor_id:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not the worker of lease {lease_id}"
+                " (Child Requester A が Child を abandon → FORBIDDEN)",
+            )
+        # 2. Job が LEASED（有効提出後の SUBMITTED 等は INVALID_STATE）
+        job = _get_job_row(c, job_id)
+        if job["state"] != JobState.LEASED.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"job must be LEASED to abandon (current state: {job['state']})."
+                " 有効提出後の Worker は abandon できない（第14節）",
+            )
+        # 3. Lease の指定・有効性（その Job の有効 Lease であること）
+        if lease_row["closed_reason"] is not None:
+            raise OjpError(
+                ErrorCode.LEASE_EXPIRED,
+                f"lease {lease_id} is already closed"
+                f" (closed_reason={lease_row['closed_reason']})",
+            )
+        if job["active_lease_id"] != lease_id:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"lease {lease_id} is not the active lease of job {job_id}",
+            )
+        if job["version_id"] is None:
+            raise OjpError(
+                ErrorCode.INVALID_STATE, f"job has no published version: {job_id}"
+            )
+        _, deadline_us = _get_job_version_timing(c, job["version_id"])
+        if now >= int(lease_row["expires_at_us"]) or now >= deadline_us:
+            raise OjpError(
+                ErrorCode.LEASE_EXPIRED,
+                f"lease {lease_id} is already due"
+                f" (now={now}, expires_at_us={lease_row['expires_at_us']},"
+                f" deadline_us={deadline_us})",
+            )
+        _close_lease_and_fail_job_effects(
+            c,
+            job=job,
+            lease_row=lease_row,
+            closed_reason=LeaseClosedReason.ABANDONED,
+            terminal_state=JobState.FAILED,
+            now=now,
+        )
+        # 資金の後始末は Job 終端化と同じ transaction で確定する（派生 ID）
+        funds = _job_terminal_fund_effects(
+            c, job=job, actor_id=actor_id, operation_id=f"{op_id}:funds", now=now
+        )
+        return {"job_id": job_id, "state": JobState.FAILED.value, "funds": funds}
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="abandon",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parent 終了時の返金予約（計画書 第8節の表・第15節 Lifecycle）
+# ---------------------------------------------------------------------------
+
+
+def reserve_refundable_balance(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    root_id: str,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """計画書 第8節「Parent 終了時」の表の Root 未拘束額の行を確定する
+    Lifecycle（第15節 Lifecycle: reserve_refundable_balance）。
+
+    表の各行の担当箇所: 「新 Child」列は create_child の Parent LEASED 要求が、
+    「既存 Child」列は「Parent 終端を Child へ伝播しない」規則（失効・
+    abandon が Child の jobs 行・child_work / child_payout を触らないこと）が
+    担う。この関数は「Root の未拘束額」列を 1 箇所で判定する:
+
+    - FAILED / EXPIRED: 未拘束 available だけを refund:{root_id}:terminal の
+      返金予約へ移し、返金の PaymentOperation を同じ transaction で確定する
+      （_reserve_terminal_refund_with_payment_in_tx。失効・abandon の終端化
+      transaction でも同じ関数を使う）。既に確定済みなら既存の予約を返し、
+      available が 0 なら予約を作らない正常な no-op（第16節）
+    - SUBMITTED / DISPUTED: 返金予約を作らない（Parent 判定のため保持）
+    - DONE: A 向け支払い予約は Phase 4 の approve 経路が reserve_parent_payout
+      を使って確定する。この関数は DONE では資金を動かさない
+    - DRAFT / OPEN / LEASED: available として保持（何もしない）
+
+    actor_id は起動設定が決める system Actor（expire_due_leases と同じく
+    tick からの呼び出しを想定。operations 行の actor_id は participants への
+    FK を満たす必要がある）。**認可は service 層で行う**: 呼出 Actor が DB
+    登録済みの system Participant でなければ FORBIDDEN
+    （_require_system_actor）。_run_idempotent へ入る前に検査するため、
+    既存 Operation の replay を返す前にも system であることを保証する。
+    新規効果については _apply の書込 transaction 内でも再検証する。
+    冪等性は operation_id の replay と、返金予約側の business_key
+    （refund:{root_id}:terminal）の PaymentOperation が担うため、この
+    operations 行自体は business_key を持たない（SUBMITTED / DONE での
+    hold 判定や no-op が業務キーを消費しないようにする）。
+    """
+    # 認可は _run_idempotent より前（既存 Operation の replay を返す前に
+    # system であることを保証する）。拒否なら外側 Operation も残さない
+    with db.transaction(conn, immediate=False):
+        _require_system_actor(conn, actor_id)
+    payload = {"root_id": root_id}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # 書込 transaction 内で認可を再検証する（新規効果の確定より前）
+        _require_system_actor(c, actor_id)
+        job = _get_job_row(c, root_id)
+        if job["parent_id"] is not None:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                "reserve_refundable_balance target must be a root job"
+                f" (parent_id must be NULL): {root_id}",
+            )
+        state = str(job["state"])
+        if state in (JobState.FAILED.value, JobState.EXPIRED.value):
+            data = _reserve_terminal_refund_with_payment_in_tx(
+                c, job=job, actor_id=actor_id, operation_id=op_id, now_us=now
+            )
+            action = "no_op" if data.get("no_op") else "refund_reserved"
+            return {"root_id": root_id, "state": state, "action": action, **data}
+        # SUBMITTED / DISPUTED / DONE / DRAFT / OPEN / LEASED は資金を動かさない
+        return {"root_id": root_id, "state": state, "action": "hold"}
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="reserve",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Child 作成（計画書 第8節・第10節・第11節）
+# ---------------------------------------------------------------------------
+
+
+def _policy_limit_error(reason: domain.PolicyLimitReason, message: str) -> OjpError:
+    """POLICY_LIMIT に details.reason を載せる（計画書 第10節・第11節）。"""
+    return OjpError(
+        ErrorCode.POLICY_LIMIT, message, details={"reason": reason.value}
+    )
+
+
+def _get_job_version_row(conn: sqlite3.Connection, version_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM job_versions WHERE id = ?", (version_id,)
+    ).fetchone()
+    if row is None:
+        raise OjpError(
+            ErrorCode.INVALID_TARGET, f"job version not found: {version_id}"
+        )
+    return row
+
+
+def create_child(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    parent_job_id: str,
+    lease_id: str,
+    task_key: str,
+    budget_units: int,
+    deadline_us: int,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """Parent（Root, depth=0）の Worker A が Child を発注する（計画書 第8節）。
+
+    Root 資金の内部移動（available -X / child_work +X）と Job・JobVersion の
+    公開を 1 つの書込 transaction で行う。Child は作成と同時に OPEN
+    （拘束前の公開はない。第6節の表「作成中Child」）。
+
+    検査順序（第10節・第11節。この順序のまま docstring に固定する）:
+
+    1. Actor・親 Job・親 Lease の有効性: lease_id が親 Job の Lease
+       （INVALID_TARGET）、閉じた Lease（LEASE_EXPIRED。復活させない）、
+       Worker 本人でない（FORBIDDEN）、Lease 期限・親 Job deadline 到来
+       （LEASE_EXPIRED）を S1 の共通判定 require_active_lease で検査し、
+       Parent が LEASED であることを確認する。Parent が OPEN / 終端 /
+       Lease 失効中は作成不可（第8節の表）。generation はクライアントから
+       受け取らず、DB の Lease 行の現行値を使う（指定が無いため照合は
+       意味を持たない。それ以外の共通判定はそのまま適用する）
+    2. 作成可否（カタログ参照・重複・予算件数の検査より先）: 親が depth=1
+       （Child からの発注）なら POLICY_LIMIT/MAX_DEPTH で資金移動をしない。
+       policy.enabled=false なら POLICY_LIMIT（details なし。計画書が個別の
+       reason を定めていない）、policy.max_depth=0 なら POLICY_LIMIT/MAX_DEPTH
+       （「enabled=false／depth=0／上限0ならChild 作成不可」第10節）
+    3. カタログ参照 → task_key 重複 → 予算・件数:
+       - 未知の task_key（カタログ外）は TASK_NOT_ALLOWED
+       - 生存中（DRAFT/OPEN/LEASED/SUBMITTED/DISPUTED）または成功済み（DONE）
+         の同じ task_key の Child が既にあれば TASK_CONFLICT。FAILED/EXPIRED
+         は再発注可能だが新しい Child として作り、累計 max_children を消費
+         する（枠は戻らない。第8節・第10節）
+       - budget_units > カタログの budget_cap_units は POLICY_LIMIT/TASK_BUDGET
+       - U + budget > max_amount_units は POLICY_LIMIT/MAX_AMOUNT、
+         U + budget > floor(root_deposit_units * max_ratio_bps / 10000) は
+         POLICY_LIMIT/MAX_RATIO（**金額と比率を同時に超える場合は
+         MAX_AMOUNT**。第11節）
+       - budget > available も POLICY_LIMIT/MAX_AMOUNT（安全網。有効 Lease
+         中は available = D - U であり L <= D なので、L 判定が必ず先に
+         発火する。第10節の判定式をそのまま残す）
+       - 累計 Child 数 + 1 > max_children は POLICY_LIMIT/MAX_CHILDREN
+
+    Child の成功条件は Root 公開 Version の task_catalog の該当エントリから
+    導出する（input_values → input_json、expected → conditions_json と
+    conditions_hash、verifier_id/hash は Root 公開 Version から継承）。
+    成功条件・検証器・入力・受取人のすり替えは引数として受け付けない
+    （第5節「MCP 引数に actor_id・payee_id を受け付けない」、第15節より
+    MCP と CLI は同じ Application API を呼ぶ。X06 の期待結果は「拒否」であり
+    「黙って無視」ではないため、この関数は input_json / expected_json /
+    verifier_id / payee_id をシグネチャに持たず、渡すと TypeError になる）。
+    受取人は Child 承認時に当該 Lease の Worker へ確定するため作成時点では
+    保持しない（第12節）。budget_units と deadline_us だけが A の指定を
+    受け付ける値で、deadline_us は Parent deadline を越えてもよい（第8節）。
+
+    上限判定・task_key 重複判定・Job 作成・available 減額・locked 増額・
+    作成数更新（jobs 行の挿入）はすべてこの書込 transaction の中で行い、
+    transaction 外で読んだ残高を判断材料にしない（第10節）。拒否された
+    作成は transaction ごと rollback され、Job も task_key も確保しない。
+    business_key は allocate:{child_id}（Child 拘束の業務効果。第16節の表。
+    「Child作成要求operation_idもJobに一意結合」は child_id = job:{op_id}
+    の導出で満たす）。
+    """
+    # 引数の妥当性のうち transaction を必要としない部分（create_root と同じ
+    # 段階に揃える）。ゼロ・負の予算はポリシー上限ではなく引数の不正として
+    # 拒否する（ledger.allocate_child_work_in_tx の「ゼロChild予算拒否」と
+    # 同じ INVALID_ARGUMENT）。deadline_us と now の比較は transaction 内の
+    # now が必要なため _apply 側で行う（create_root と同じ構成）
+    if not isinstance(task_key, str) or not task_key:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"task_key must be a non-empty str: {task_key!r}",
+        )
+    if isinstance(budget_units, bool) or not isinstance(budget_units, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"budget_units must be int, got {type(budget_units).__name__}",
+        )
+    if budget_units <= 0:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            "child budget must be positive (ゼロ・負の Child 予算は拒否)",
+        )
+    if isinstance(deadline_us, bool) or not isinstance(deadline_us, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"deadline_us must be int, got {type(deadline_us).__name__}",
+        )
+    if deadline_us < 0:
+        raise OjpError(ErrorCode.INVALID_ARGUMENT, "deadline_us must be non-negative")
+    # business_key は allocate:{child_id}。child_id は job:{op_id} から導く
+    # ため、operation_id 未指定時はここで生成して確定させる（_run_idempotent
+    # 内の生成と同じ規則）
+    if operation_id is None:
+        operation_id = ledger.new_operation_id("create")
+    child_id = f"job:{operation_id}"
+    payload = {
+        "parent_job_id": parent_job_id,
+        "lease_id": lease_id,
+        "task_key": task_key,
+        "budget_units": budget_units,
+        "deadline_us": deadline_us,
+    }
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        # --- 検査順序 1: Actor・親 Job・親 Lease の有効性 ---
+        parent = _get_job_row(c, parent_job_id)
+        lease_row = _get_lease_row(c, lease_id)
+        require_active_lease(
+            c,
+            parent_job_id,
+            lease_id,
+            int(lease_row["generation"]),
+            actor_id,
+            now,
+        )
+        if parent["state"] != JobState.LEASED.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "parent job must be LEASED to create a child"
+                f" (current state: {parent['state']})."
+                " Parent が OPEN / 終端 / Lease 失効中は作成不可（第8節の表）",
+            )
+        # --- 検査順序 2: 作成可否（カタログ参照より先。資金移動なし） ---
+        if parent["parent_id"] is not None:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_DEPTH,
+                "child jobs cannot create children (depth=1 からの再委託は必ず"
+                "拒否する。第8節・第11節。カタログ参照より先に検査)",
+            )
+        if parent["version_id"] is None:
+            # require_active_lease が公開版の存在を検査済み。防御的な確認
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                f"parent job has no published version: {parent_job_id}",
+            )
+        parent_version = _get_job_version_row(c, parent["version_id"])
+        policy = domain.SubcontractPolicy.model_validate_json(
+            parent_version["subcontract_policy"]
+        )
+        if not policy.enabled:
+            # enabled=false なら Child 作成不可（第10節）。計画書はこの拒否に
+            # 個別の details.reason を定めていないため、POLICY_LIMIT のみを
+            # 返し details は None にする（MAX_DEPTH 等へ読み替えない）
+            raise OjpError(
+                ErrorCode.POLICY_LIMIT,
+                "subcontracting is disabled by the root policy"
+                " (enabled=false なら Child 作成不可。第10節)",
+            )
+        if policy.max_depth == 0:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_DEPTH,
+                "subcontract policy allows no children (max_depth=0。第10節)",
+            )
+        root_id = str(parent["root_id"])
+        # --- 検査順序 3a: カタログ参照（TASK_NOT_ALLOWED） ---
+        catalog = [
+            domain.TaskCatalogEntry.model_validate(entry)
+            for entry in json.loads(parent_version["task_catalog"])
+        ]
+        entry = next((e for e in catalog if e.task_key == task_key), None)
+        if entry is None:
+            raise OjpError(
+                ErrorCode.TASK_NOT_ALLOWED,
+                f"task_key is not in the root catalog: {task_key!r}"
+                " (カタログ外の成功条件や入力へのすり替えは拒否。第8節・第11節)",
+            )
+        # --- 検査順序 3b: task_key 重複（TASK_CONFLICT） ---
+        # 生存中 = DRAFT/OPEN/LEASED/SUBMITTED/DISPUTED、成功済み = DONE。
+        # FAILED/EXPIRED は再発注可能（第8節）
+        conflict = c.execute(
+            "SELECT id FROM jobs WHERE parent_id = ? AND task_key = ?"
+            " AND state IN ('DRAFT', 'OPEN', 'LEASED', 'SUBMITTED', 'DISPUTED',"
+            "              'DONE')",
+            (parent_job_id, task_key),
+        ).fetchone()
+        if conflict is not None:
+            raise OjpError(
+                ErrorCode.TASK_CONFLICT,
+                f"task_key {task_key!r} already has a live or succeeded child:"
+                f" {conflict['id']}"
+                " (失敗・失効したタスクだけ再発注可能。第8節)",
+            )
+        # --- 検査順序 3c: 予算・件数 ---
+        # Child の deadline は作成時点で未来（期限ちょうどは失効側。第7節）。
+        # Parent deadline を越える Child deadline は許可する（第8節）
+        if now >= deadline_us:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                "child deadline_us must be in the future:"
+                f" now={now} >= deadline={deadline_us}",
+            )
+        if budget_units > entry.budget_cap_units:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.TASK_BUDGET,
+                f"child budget {budget_units} exceeds the catalog cap"
+                f" {entry.budget_cap_units} for task_key {task_key!r}"
+                " (カタログの1件上限。第11節)",
+            )
+        # 上限判定はこの transaction 内で導出する（transaction 外で先に読んだ
+        # 残高を判断材料にしない。第10節）
+        usage = ledger.get_subcontract_usage(c, root_id)
+        amount_cap = policy.max_amount_units
+        ratio_cap = policy.max_ratio_bps * usage.deposit_units // 10_000
+        if usage.in_use_units + budget_units > amount_cap:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_AMOUNT,
+                f"subcontract usage {usage.in_use_units} + budget {budget_units}"
+                f" exceeds max_amount_units {amount_cap}"
+                " (金額と比率を同時に超える場合は MAX_AMOUNT。第10節・第11節)",
+            )
+        if usage.in_use_units + budget_units > ratio_cap:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_RATIO,
+                f"subcontract usage {usage.in_use_units} + budget {budget_units}"
+                f" exceeds the ratio cap {ratio_cap}"
+                f" (floor({usage.deposit_units} * {policy.max_ratio_bps} / 10000)."
+                " 第10節)",
+            )
+        if budget_units > usage.available_units:
+            # 安全網。有効 Lease 中は available = D - U であり L <= D のため、
+            # 上の L 判定が必ず先に発火する（第10節の判定式をそのまま残す）
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_AMOUNT,
+                f"child budget {budget_units} exceeds the available balance"
+                f" {usage.available_units} (新Child予算 <= available。第10節)",
+            )
+        if usage.child_count + 1 > policy.max_children:
+            raise _policy_limit_error(
+                domain.PolicyLimitReason.MAX_CHILDREN,
+                f"child count {usage.child_count} + 1 exceeds max_children"
+                f" {policy.max_children}"
+                " (累計作成件数。失敗した Child の枠は戻らない。第10節)",
+            )
+        # --- Child Job・JobVersion の作成と資金拘束を同じ transaction で確定 ---
+        # 固定するもの: 作成時の A（requester_id）、creator_lease_id = 現在の
+        # Parent Lease、Root policy（timing / artifact access は Root 公開版を
+        # 継承）、指定 task_key（第8節）。Child からの再委託は必ず拒否される
+        # ため、Child の JobVersion には無効化した policy と空のカタログを
+        # 保存する（スキーマの CHECK「Childのparent_idはRootのみ」と一致）
+        child_version_id = f"version:{child_id}:1"
+        c.execute(
+            "INSERT INTO jobs (id, root_id, parent_id, requester_id, state,"
+            " row_version, created_at_us, task_key, creator_lease_id)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (
+                child_id,
+                root_id,
+                parent_job_id,
+                actor_id,
+                JobState.OPEN.value,
+                now,
+                task_key,
+                lease_id,
+            ),
+        )
+        child_input_json = ledger.canonical_json_dumps(entry.input_values)
+        child_conditions_json = ledger.canonical_json_dumps(entry.expected)
+        child_conditions_hash = hashlib.sha256(
+            child_conditions_json.encode("utf-8")
+        ).hexdigest()
+        child_policy = domain.SubcontractPolicy(
+            enabled=False,
+            max_amount_units=0,
+            max_ratio_bps=0,
+            max_children=0,
+            max_depth=0,
+        )
+        c.execute(
+            "INSERT INTO job_versions (id, job_id, version, title, budget_units,"
+            " asset, input_json, verifier_id, verifier_hash, conditions_json,"
+            " conditions_hash, subcontract_policy, task_catalog, timing_policy,"
+            " artifact_access_policy, deadline_us)"
+            " VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                child_version_id,
+                child_id,
+                f"{task_key} (child of {parent_job_id})",
+                budget_units,
+                domain.ASSET_MOCK_USDC,
+                child_input_json,
+                parent_version["verifier_id"],
+                parent_version["verifier_hash"],
+                child_conditions_json,
+                child_conditions_hash,
+                ledger.canonical_json_dumps(child_policy.model_dump()),
+                "[]",
+                parent_version["timing_policy"],
+                parent_version["artifact_access_policy"],
+                deadline_us,
+            ),
+        )
+        c.execute(
+            "UPDATE jobs SET version_id = ? WHERE id = ?",
+            (child_version_id, child_id),
+        )
+        allocation = ledger.allocate_child_work_in_tx(
+            c,
+            root_id=root_id,
+            child_id=child_id,
+            amount_units=budget_units,
+            operation_id=op_id,
+            now_us=now,
+        )
+        after = ledger.get_subcontract_usage(c, root_id)
+        return {
+            "child_id": child_id,
+            "version_id": child_version_id,
+            "parent_job_id": parent_job_id,
+            "root_id": root_id,
+            "task_key": task_key,
+            "budget_units": budget_units,
+            "deadline_us": deadline_us,
+            "state": JobState.OPEN.value,
+            "child_work_account_id": allocation["child_work_account_id"],
+            "available_units": after.available_units,
+            "in_use_units": after.in_use_units,
+            "child_count": after.child_count,
+        }
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="create",
+        operation_id=operation_id,
+        business_key=f"allocate:{child_id}",
         payload=payload,
         apply_effects=_apply,
     )
@@ -412,6 +2098,26 @@ def allocate_child_work(
     )
 
 
+def _validate_amount_units(amount_units: int) -> None:
+    """amount_units を非負 int に限定する（bool は int として受理しない）。
+
+    allocate_child_work / create_child と同じ段階（_run_idempotent より前、
+    業務キー照会・Operation 挿入の前）で引数の不正を弾くための検査
+    （計画書 第5節の金額検証・第13節 INVALID_ARGUMENT）。ゼロは特例として
+    受け付け、呼出側のゼロ no-op 挙動へ流す。ledger 側の負数拒否は
+    多重防御として残る。
+    """
+    if isinstance(amount_units, bool) or not isinstance(amount_units, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"amount_units must be int, got {type(amount_units).__name__}",
+        )
+    if amount_units < 0:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT, "amount must be non-negative"
+        )
+
+
 def reserve_child_payout(
     conn: sqlite3.Connection,
     *,
@@ -429,13 +2135,22 @@ def reserve_child_payout(
     （計画書 第9節 1）。残額 0 なら支払い Operation を作らず正常な no-op。
     business_key は payout:{child_id}。異なる operation_id で同じ Child の
     支払いを再確定しようとしても既存の結果を返す（二重送金しない）。
+
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない。負数（および bool・int 以外）は _run_idempotent より前に
+    INVALID_ARGUMENT で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "child_id": child_id,
         "amount_units": amount_units,
         "payee_id": payee_id,
     }
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         data = ledger.child_approval_in_tx(
@@ -462,11 +2177,11 @@ def reserve_child_payout(
         actor_id=actor_id,
         kind="payout",
         operation_id=operation_id,
-        business_key=f"payout:{child_id}",
+        business_key=None if zero_no_op else f"payout:{child_id}",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=True,
-        payment_kind=PaymentKind.PAYOUT,
+        reuse_existing_payment=not zero_no_op,
+        payment_kind=None if zero_no_op else PaymentKind.PAYOUT,
     )
 
 
@@ -519,6 +2234,25 @@ def _attach_payment_operation(
     }
 
 
+def _child_done_with_pending_payment(conn: sqlite3.Connection, child_id: str) -> bool:
+    """Child が DONE で PaymentOperation が PENDING / RETRYABLE（送金障害中）か。
+
+    計画書 第9節「Child が DONE だが送金障害中の場合は失敗返却を禁止する」
+    の判定を DB から導出する。呼出側が flag を渡さなくても、失敗返却の経路
+    （Phase 4 の dispute FAIL 等）がこの禁止をすり抜けないようにする。
+    """
+    job = conn.execute(
+        "SELECT state FROM jobs WHERE id = ?", (child_id,)
+    ).fetchone()
+    if job is None or job["state"] != JobState.DONE.value:
+        return False
+    payment = ledger.get_payment_operation_by_business_key(conn, f"payout:{child_id}")
+    return payment is not None and payment.status in (
+        PaymentStatus.PENDING,
+        PaymentStatus.RETRYABLE,
+    )
+
+
 def return_child_work(
     conn: sqlite3.Connection,
     *,
@@ -535,8 +2269,19 @@ def return_child_work(
     Parent 失敗後（parent_terminal_refund_reserved=True）なら
     child_work → available → refund を 1 transaction で記録し、
     business_key refund:{root_id}:child-return:{child_id} で結合する。
-    Child DONE かつ送金障害中（child_done_payment_pending=True）は禁止。
+    Child DONE かつ送金障害中は禁止（INVALID_STATE。計画書 第9節）。
+    送金障害中の判定は引数の flag に加えて DB（jobs.state = DONE かつ
+    payout:{child_id} の PaymentOperation が PENDING / RETRYABLE）からも
+    導出し、どちらかが真なら拒否する。
+
+    amount_units == 0 の正常 no-op は business_key を消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する。正額時に return:{child_id} /
+    refund:{root_id}:child-return:{child_id} を確定できるようにするため）。
+    負数（および bool・int 以外）は _run_idempotent より前に INVALID_ARGUMENT
+    で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "child_id": child_id,
@@ -544,19 +2289,16 @@ def return_child_work(
         "parent_terminal_refund_reserved": parent_terminal_refund_reserved,
         "child_done_payment_pending": child_done_payment_pending,
     }
-    business_key = (
-        f"refund:{root_id}:child-return:{child_id}"
-        if parent_terminal_refund_reserved
-        else f"return:{child_id}"
-    )
-    return _run_idempotent(
-        conn,
-        actor_id=actor_id,
-        kind="return",
-        operation_id=operation_id,
-        business_key=business_key,
-        payload=payload,
-        apply_effects=lambda c, op_id, now: ledger.child_failure_return_in_tx(
+    if amount_units == 0:
+        # ゼロ no-op は業務キーを持たない（どちらの経路でも消費しない）
+        business_key: str | None = None
+    elif parent_terminal_refund_reserved:
+        business_key = f"refund:{root_id}:child-return:{child_id}"
+    else:
+        business_key = f"return:{child_id}"
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        return ledger.child_failure_return_in_tx(
             c,
             root_id=root_id,
             child_id=child_id,
@@ -564,8 +2306,20 @@ def return_child_work(
             operation_id=op_id,
             now_us=now,
             parent_terminal_refund_reserved=parent_terminal_refund_reserved,
-            child_done_payment_pending=child_done_payment_pending,
-        ),
+            child_done_payment_pending=(
+                child_done_payment_pending
+                or _child_done_with_pending_payment(c, child_id)
+            ),
+        )
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="return",
+        operation_id=operation_id,
+        business_key=business_key,
+        payload=payload,
+        apply_effects=_apply,
     )
 
 
@@ -582,10 +2336,40 @@ def reserve_parent_payout(
 
     business_key は payout:{root_id}。残額 0 なら支払い Operation を作らず
     正常な no-op。異なる operation_id の再確定は既存の結果を返す。
+
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない。負数（および bool・int 以外）は _run_idempotent より前に
+    INVALID_ARGUMENT で拒否する（業務キー照会の前に引数検査。第5節・第13節）。
+
+    **Parent DONE のときだけ許される**（計画書 第8節の表「DONE: Root の
+    未拘束額は A 向け支払い予約へ移動」）。approve 自体は Phase 4 の範囲で、
+    Phase 4 の approve 経路が Parent を DONE にした後にこの予約を確定する。
+    対象は Root（depth=0 の Parent）だけ。Child を指定した場合は
+    INVALID_TARGET、Parent が DONE でなければ INVALID_STATE。
     """
+    _validate_amount_units(amount_units)
     payload = {"root_id": root_id, "amount_units": amount_units, "payee_id": payee_id}
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        job = _get_job_row(c, root_id)
+        if job["parent_id"] is not None:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                "parent payout target must be a root job"
+                f" (parent_id must be NULL): {root_id}",
+            )
+        if job["state"] != JobState.DONE.value:
+            raise OjpError(
+                ErrorCode.INVALID_STATE,
+                "parent payout reservation is allowed only when the parent job"
+                f" is DONE (current state: {job['state']})."
+                " available を parent_payout へ移すのは Parent DONE のときだけ"
+                "（第8節の表。A 向け支払い予約は Phase 4 の approve 経路が使う）",
+            )
         data = ledger.parent_approval_in_tx(
             c,
             root_id=root_id,
@@ -609,11 +2393,11 @@ def reserve_parent_payout(
         actor_id=actor_id,
         kind="payout",
         operation_id=operation_id,
-        business_key=f"payout:{root_id}",
+        business_key=None if zero_no_op else f"payout:{root_id}",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=True,
-        payment_kind=PaymentKind.PAYOUT,
+        reuse_existing_payment=not zero_no_op,
+        payment_kind=None if zero_no_op else PaymentKind.PAYOUT,
     )
 
 
@@ -632,12 +2416,22 @@ def reserve_parent_refund(
     渡すと返金の PaymentOperation を同じ transaction で確定する（S2 の
     返金経路。送金処理は process_payments）。残額 0 なら支払い Operation を
     作らず正常な no-op。異なる operation_id の再確定は既存の結果を返す。
+
+    amount_units == 0 の正常 no-op は業務キーを消費しない
+    （_run_idempotent へは business_key=None で通し、再送用の主 Operation
+    だけを保存する）。ゼロ時は payment_kind も None にするため
+    `<operation_id>:payment` の派生 Operation と PaymentOperation は
+    作られない（payee_id 指定の有無双方で同様）。負数（および bool・int 以外）は
+    _run_idempotent より前に INVALID_ARGUMENT で拒否する（業務キー照会の
+    前に引数検査。第5節・第13節）。
     """
+    _validate_amount_units(amount_units)
     payload = {
         "root_id": root_id,
         "amount_units": amount_units,
         "payee_id": payee_id,
     }
+    zero_no_op = amount_units == 0
 
     def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
         data = ledger.parent_failure_refund_in_tx(
@@ -665,11 +2459,13 @@ def reserve_parent_refund(
         actor_id=actor_id,
         kind="refund" if payee_id is not None else "reserve",
         operation_id=operation_id,
-        business_key=f"refund:{root_id}:terminal",
+        business_key=None if zero_no_op else f"refund:{root_id}:terminal",
         payload=payload,
         apply_effects=_apply,
-        reuse_existing_payment=payee_id is not None,
-        payment_kind=PaymentKind.REFUND if payee_id is not None else None,
+        reuse_existing_payment=(payee_id is not None) and not zero_no_op,
+        payment_kind=(
+            PaymentKind.REFUND if payee_id is not None and not zero_no_op else None
+        ),
     )
 
 

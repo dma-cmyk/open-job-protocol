@@ -42,7 +42,22 @@ from .domain import (
 # Job 資金の bucket 値・business_key と衝突しない専用の名前空間を使う。
 WALLET_LEDGER_SOURCE_KEY = "wallet-ledger"
 
-_OPERATION_ID_KINDS = ("fund", "allocate", "return", "reserve", "seed", "payout", "refund")
+# operation_id の `<kind>:<suffix>` 形式で許す kind。service._KIND_PREFIXES
+# と同じ集合を維持する（片方だけの追加は形式検証の不整合になる）。
+_OPERATION_ID_KINDS = (
+    "fund",
+    "allocate",
+    "return",
+    "reserve",
+    "seed",
+    "payout",
+    "refund",
+    "create",
+    "claim",
+    "heartbeat",
+    "expiry",
+    "abandon",
+)
 
 
 def new_operation_id(kind: str) -> str:
@@ -326,10 +341,69 @@ def get_root_ledger_view(conn: sqlite3.Connection, root_id: str) -> RootLedgerVi
     )
 
 
+@dataclass(frozen=True)
+class SubcontractUsage:
+    """再委託上限（計画書 第10節）の判定材料。
+
+    U（再委託使用額）は「Child 支払い済み総額（確定済み Receipt の累計のうち
+    Child 分）+ Σ(child_work + child_payout)」。child_payout（成功 Child の
+    送金待ち）を U に含めないと、未送金の成功額を新しい Child へ再利用
+    できてしまう。返却済みの失敗 Child 額は child_work → available の戻しで
+    口座残高から自然に外れるため U には残らない。child_count は
+    jobs.parent_id = root の行数。拒否された作成は transaction ごと
+    rollback され jobs 行を残さないため、この数え方は「累計作成件数」と
+    一致する（失敗・失効した Child の行は残るため枠は戻らない。第10節）。
+    """
+
+    root_id: str
+    deposit_units: int
+    available_units: int
+    in_use_units: int
+    child_count: int
+
+
+def get_subcontract_usage(
+    conn: sqlite3.Connection, root_id: str
+) -> SubcontractUsage:
+    """Root の再委託使用状況（D / available / U / 累計 Child 数）を導出する。
+
+    D・available・locked 内訳は get_root_ledger_view（口座が正本）から、
+    Child 支払い済み総額は確定済み Receipt の累計（paid の導出方法に
+    合わせ、payment_operations.kind='payout' のうち job が Child
+    （parent_id IS NOT NULL）のものだけを取る）から導く。上限判定はこの
+    導出を呼んだ書込 transaction の中で行い、transaction 外で先に読んだ
+    残高を判断材料にしない（計画書 第10節）。
+    """
+    view = get_root_ledger_view(conn, root_id)
+    paid_row = conn.execute(
+        "SELECT COALESCE(SUM(r.amount_units), 0) AS total"
+        " FROM transfer_receipts r"
+        " JOIN payment_operations p ON p.operation_id = r.operation_id"
+        " JOIN jobs j ON j.id = p.job_id"
+        " WHERE p.root_id = ? AND p.kind = ? AND j.parent_id IS NOT NULL",
+        (root_id, PaymentKind.PAYOUT.value),
+    ).fetchone()
+    child_paid = int(paid_row["total"])
+    count_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM jobs WHERE parent_id = ?", (root_id,)
+    ).fetchone()
+    in_use = (
+        child_paid
+        + view.locked_breakdown_units[Bucket.CHILD_WORK.value]
+        + view.locked_breakdown_units[Bucket.CHILD_PAYOUT.value]
+    )
+    return SubcontractUsage(
+        root_id=root_id,
+        deposit_units=view.deposit_units,
+        available_units=view.available_units,
+        in_use_units=in_use,
+        child_count=int(count_row["c"]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 台帳不変条件の検証（テストから使える公開関数）
 # ---------------------------------------------------------------------------
-
 
 def check_accounts_non_negative(conn: sqlite3.Connection) -> list[str]:
     """全口座非負を検証する。違反口座 id の一覧を返す（空なら成立）。"""

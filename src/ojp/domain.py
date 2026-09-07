@@ -41,13 +41,40 @@ class ErrorCode(StrEnum):
     MODE_MISMATCH = "MODE_MISMATCH"
 
 
-class OjpError(Exception):
-    """ドメインエラーの基底。code は ErrorCode の値。"""
+class PolicyLimitReason(StrEnum):
+    """再委託上限の拒否理由（計画書 第10節・第11節の details.reason）。
 
-    def __init__(self, code: ErrorCode | str, message: str) -> None:
+    計画書が列挙する 5 種だけ。金額と比率を同時に超える場合は
+    MAX_AMOUNT を返す。enabled=false の拒否（第10節「Child 作成不可」）に
+    個別の reason は定められていないため、POLICY_LIMIT のみを返し
+    details は付けない。
+    """
+
+    TASK_BUDGET = "TASK_BUDGET"
+    MAX_AMOUNT = "MAX_AMOUNT"
+    MAX_RATIO = "MAX_RATIO"
+    MAX_CHILDREN = "MAX_CHILDREN"
+    MAX_DEPTH = "MAX_DEPTH"
+
+
+class OjpError(Exception):
+    """ドメインエラーの基底。code は ErrorCode の値。
+
+    details は POLICY_LIMIT の拒否理由（計画書 第10節・第11節の
+    details.reason）のような構造化された補足情報。既存の code / message の
+    契約は変えず、details は省略可能な追加情報として扱う。
+    """
+
+    def __init__(
+        self,
+        code: ErrorCode | str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = str(code)
         self.message = message
+        self.details = details
 
 
 class MoneyError(OjpError):
@@ -226,6 +253,16 @@ class TimingPolicy(_StrictModel):
     heartbeat_seconds: Annotated[int, Field(gt=0, strict=True)] = 20
     review_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
     dispute_window_seconds: Annotated[int, Field(gt=0, strict=True)] = 30
+
+
+class ArtifactAccessPolicy(_StrictModel):
+    """成果物の利用権（計画書 第5節「Actorと成果物への権限」）。
+
+    Requester が資金拠出した Child の有効成果物は、A 停止・Parent 終了後も
+    Root Requester が取得できるよう、利用権を JobVersion に事前明記する。
+    """
+
+    requester_can_read: bool = True
 
 
 MAX_TASK_INPUT_ELEMENTS = 1_000
