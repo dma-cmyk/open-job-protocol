@@ -32,7 +32,7 @@ from .domain import ErrorCode, OjpError
 DEFAULT_ACTOR_ID = "pt-system"
 
 
-def _resolve_db_path(root: Path) -> Path:
+def resolve_db_path(root: Path) -> Path:
     """プロジェクトルートから SQLite ファイルのパスを解決する。"""
     return root / "data" / "ojp.sqlite3"
 
@@ -195,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point。終了コード: 成功 0 / 入力・権限・状態違反 2 / 一時障害 3。"""
     args = _parse_args(argv)
     root = Path(args.root).expanduser()
-    db_path = _resolve_db_path(root)
+    db_path = resolve_db_path(root)
     conn: sqlite3.Connection | None = None
     try:
         # 既存 DB を開き、起動設定と DB の Clock mode を照合する（計画書

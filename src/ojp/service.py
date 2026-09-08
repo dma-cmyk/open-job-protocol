@@ -17,6 +17,7 @@ DB_BUSY は同じ operation_id で transaction 全体を再試行する。SQLite
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import random
@@ -47,6 +48,7 @@ _KIND_PREFIXES = {
     "return": "return",
     "reserve": "reserve",
     "payout": "payout",
+    "seed": "seed",
     "refund": "refund",
     "create": "create",
     "claim": "claim",
@@ -4665,3 +4667,884 @@ def retry_payment(
     （Receipt が正本。欠落・不一致は成功として返さない）。
     """
     return process_single_payment(conn, operation_id=operation_id, escrow=escrow)
+
+
+# ---------------------------------------------------------------------------
+# Query API（計画書 第13節・第14節・第15節）
+# ---------------------------------------------------------------------------
+
+
+def format_timestamp_us(us: int) -> str:
+    """整数マイクロ秒を ISO-8601 UTC 文字列（末尾 Z・小数6桁）へ変換する。
+
+    計画書 第5節「float経由の変換は禁止」に合わせ、float を経由せず
+    divmod で秒とマイクロ秒に分けて組み立てる。
+    """
+    if isinstance(us, bool) or not isinstance(us, int):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"timestamp_us must be int, got {type(us).__name__}",
+        )
+    if us < 0:
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT, f"timestamp_us must be non-negative: {us}"
+        )
+    sec, frac = divmod(us, 1_000_000)
+    d = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(
+        seconds=sec, microseconds=frac
+    )
+    return d.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac:06d}Z"
+
+
+def format_optional_timestamp_us(us: int | None) -> str | None:
+    """None を許容するタイムスタンプ変換 helper。"""
+    if us is None:
+        return None
+    return format_timestamp_us(us)
+
+
+def list_jobs(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    state: str | None = None,
+    parent_id: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Job Card 要約一覧と pagination 用 next_cursor を返す（計画書 第13節・第15節）。
+
+    権限で行を絞らず、Worker が Claim 前に OPEN な Job を閲覧できるようにする。
+    keyset pagination を使い、OFFSET は使用しない。
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 100):
+        raise OjpError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"limit must be an integer between 1 and 100, got {limit!r}",
+        )
+    if state is not None:
+        if not isinstance(state, str) or state not in {s.value for s in domain.JobState}:
+            raise OjpError(ErrorCode.INVALID_ARGUMENT, f"invalid job state: {state!r}")
+    cursor_created_at_us: int | None = None
+    cursor_job_id: str | None = None
+    if cursor is not None:
+        if not isinstance(cursor, str) or ":" not in cursor:
+            raise OjpError(ErrorCode.INVALID_ARGUMENT, f"invalid cursor format: {cursor!r}")
+        created_at_str, cursor_job_id = cursor.split(":", 1)
+        try:
+            cursor_created_at_us = int(created_at_str)
+        except ValueError:
+            raise OjpError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"invalid cursor timestamp: {created_at_str!r}",
+            )
+        if cursor_created_at_us < 0 or not cursor_job_id:
+            raise OjpError(ErrorCode.INVALID_ARGUMENT, f"invalid cursor: {cursor!r}")
+
+    try:
+        with db.transaction(conn):
+            actor = conn.execute(
+                "SELECT 1 FROM participants WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if actor is None:
+                raise OjpError(ErrorCode.FORBIDDEN, f"actor not found: {actor_id!r}")
+
+            if parent_id is not None:
+                parent = conn.execute(
+                    "SELECT 1 FROM jobs WHERE id = ?", (parent_id,)
+                ).fetchone()
+                if parent is None:
+                    raise OjpError(
+                        ErrorCode.INVALID_TARGET, f"parent job not found: {parent_id!r}"
+                    )
+
+            query = [
+                "SELECT",
+                "    j.id,",
+                "    j.root_id,",
+                "    j.parent_id,",
+                "    j.requester_id,",
+                "    j.state,",
+                "    j.version_id,",
+                "    j.task_key,",
+                "    j.active_lease_id,",
+                "    j.created_at_us,",
+                "    v.title,",
+                "    v.budget_units,",
+                "    v.asset,",
+                "    v.deadline_us",
+                "FROM jobs j",
+                "LEFT JOIN job_versions v ON v.id = j.version_id",
+            ]
+            conditions: list[str] = []
+            params: list[Any] = []
+            if state is not None:
+                conditions.append("j.state = ?")
+                params.append(state)
+            if parent_id is not None:
+                conditions.append("j.parent_id = ?")
+                params.append(parent_id)
+            if cursor_created_at_us is not None and cursor_job_id is not None:
+                conditions.append(
+                    "((j.created_at_us > ?) OR (j.created_at_us = ? AND j.id > ?))"
+                )
+                params.extend([cursor_created_at_us, cursor_created_at_us, cursor_job_id])
+            if conditions:
+                query.append("WHERE " + " AND ".join(conditions))
+            query.append("ORDER BY j.created_at_us ASC, j.id ASC")
+            query.append("LIMIT ?")
+            params.append(limit + 1)
+
+            rows = conn.execute("\n".join(query), params).fetchall()
+            has_more = len(rows) > limit
+            result_rows = rows[:limit] if has_more else rows
+
+            jobs_list = []
+            for row in result_rows:
+                jobs_list.append(
+                    {
+                        "job_id": row["id"],
+                        "root_id": row["root_id"],
+                        "parent_id": row["parent_id"],
+                        "requester_id": row["requester_id"],
+                        "state": row["state"],
+                        "version_id": row["version_id"],
+                        "title": row["title"],
+                        "budget": (
+                            domain.format_amount_units(row["budget_units"])
+                            if row["budget_units"] is not None
+                            else None
+                        ),
+                        "asset": row["asset"],
+                        "deadline": format_optional_timestamp_us(row["deadline_us"]),
+                        "task_key": row["task_key"],
+                        "active_lease_id": row["active_lease_id"],
+                        "created_at": format_timestamp_us(row["created_at_us"]),
+                    }
+                )
+
+            next_cursor = (
+                f"{result_rows[-1]['created_at_us']}:{result_rows[-1]['id']}"
+                if has_more and result_rows
+                else None
+            )
+            return {"jobs": jobs_list, "next_cursor": next_cursor}
+    except sqlite3.OperationalError as exc:
+        if db.is_db_busy(exc):
+            raise OjpError(ErrorCode.DB_BUSY, "database is busy") from exc
+        raise
+
+
+def get_job(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """Job の詳細情報（仕様、Lease公開情報、予算、成果物、期限、判定・送金状態）を取得する。
+
+    計画書 第5節「Actorと成果物への権限」に基づき、成果物本文（artifact_json /
+    verification_evidence）の読取権（artifact_readable）を厳格に判定する。
+    """
+    if not isinstance(job_id, str) or not job_id:
+        raise OjpError(ErrorCode.INVALID_TARGET, "job_id must be a non-empty string")
+
+    try:
+        with db.transaction(conn):
+            actor = conn.execute(
+                "SELECT id, kind FROM participants WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if actor is None:
+                raise OjpError(ErrorCode.FORBIDDEN, f"actor not found: {actor_id!r}")
+
+            job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job_row is None:
+                raise OjpError(ErrorCode.INVALID_TARGET, f"job not found: {job_id!r}")
+
+            now_us = clock.now_for_read_snapshot(conn)
+            now_iso = format_timestamp_us(now_us)
+
+            # JobVersion
+            version_info: dict[str, Any] | None = None
+            v_row = None
+            if job_row["version_id"] is not None:
+                v_row = conn.execute(
+                    "SELECT * FROM job_versions WHERE id = ?", (job_row["version_id"],)
+                ).fetchone()
+                if v_row is not None:
+                    subcontract_policy = (
+                        json.loads(v_row["subcontract_policy"])
+                        if v_row["subcontract_policy"]
+                        else {}
+                    )
+                    task_catalog = (
+                        json.loads(v_row["task_catalog"])
+                        if v_row["task_catalog"]
+                        else []
+                    )
+                    timing_policy = (
+                        json.loads(v_row["timing_policy"])
+                        if v_row["timing_policy"]
+                        else {}
+                    )
+                    artifact_access_policy = (
+                        json.loads(v_row["artifact_access_policy"])
+                        if v_row["artifact_access_policy"]
+                        else {"requester_can_read": True}
+                    )
+                    version_info = {
+                        "version_id": v_row["id"],
+                        "version": v_row["version"],
+                        "title": v_row["title"],
+                        "budget": domain.format_amount_units(v_row["budget_units"]),
+                        "asset": v_row["asset"],
+                        "deadline": format_timestamp_us(v_row["deadline_us"]),
+                        "input_json": v_row["input_json"],
+                        "verifier_id": v_row["verifier_id"],
+                        "verifier_hash": v_row["verifier_hash"],
+                        "conditions_json": v_row["conditions_json"],
+                        "conditions_hash": v_row["conditions_hash"],
+                        "subcontract_policy": subcontract_policy,
+                        "task_catalog": task_catalog,
+                        "timing_policy": timing_policy,
+                        "artifact_access_policy": artifact_access_policy,
+                    }
+
+            # Lease (公開情報のみ。有効 Lease が無ければ None)
+            lease_info: dict[str, Any] | None = None
+            lease_row = conn.execute(
+                "SELECT * FROM leases WHERE job_id = ? AND closed_reason IS NULL",
+                (job_id,),
+            ).fetchone()
+            if lease_row is not None:
+                lease_info = {
+                    "lease_id": lease_row["id"],
+                    "worker_id": lease_row["worker_id"],
+                    "generation": lease_row["generation"],
+                    "claimed_at": format_timestamp_us(lease_row["claimed_at_us"]),
+                    "heartbeat_at": format_timestamp_us(lease_row["heartbeat_at_us"]),
+                    "expires_at": format_timestamp_us(lease_row["expires_at_us"]),
+                    "closed_reason": lease_row["closed_reason"],
+                    "active": lease_row["closed_reason"] is None,
+                }
+
+            # Budget (Root ledger view から導出)
+            ledger_view = ledger.get_root_ledger_view(conn, job_row["root_id"])
+            budget_info = {
+                "deposit": domain.format_amount_units(ledger_view.deposit_units),
+                "escrow": domain.format_amount_units(ledger_view.escrow_units),
+                "available": domain.format_amount_units(ledger_view.available_units),
+                "locked": domain.format_amount_units(ledger_view.locked_units),
+                "locked_breakdown": {
+                    bucket: domain.format_amount_units(units)
+                    for bucket, units in sorted(
+                        ledger_view.locked_breakdown_units.items()
+                    )
+                },
+                "paid": domain.format_amount_units(ledger_view.paid_units),
+                "refunded": domain.format_amount_units(ledger_view.refunded_units),
+            }
+
+            # Children (Root 以外では空 list)
+            children_list: list[dict[str, Any]] = []
+            if job_row["parent_id"] is None:
+                child_rows = conn.execute(
+                    """
+                    SELECT
+                        j.id AS child_id,
+                        j.task_key,
+                        j.state,
+                        v.budget_units,
+                        v.deadline_us,
+                        (
+                            SELECT worker_id FROM leases
+                            WHERE job_id = j.id
+                            ORDER BY CASE WHEN closed_reason IS NULL THEN 0 ELSE 1 END, generation DESC
+                            LIMIT 1
+                        ) AS worker_id,
+                        (
+                            SELECT status FROM payment_operations
+                            WHERE job_id = j.id AND kind = 'payout'
+                            LIMIT 1
+                        ) AS payment_status
+                    FROM jobs j
+                    LEFT JOIN job_versions v ON v.id = j.version_id
+                    WHERE j.parent_id = ?
+                    ORDER BY j.created_at_us ASC, j.id ASC
+                    """,
+                    (job_id,),
+                ).fetchall()
+                for crow in child_rows:
+                    children_list.append(
+                        {
+                            "child_id": crow["child_id"],
+                            "task_key": crow["task_key"],
+                            "state": crow["state"],
+                            "budget": (
+                                domain.format_amount_units(crow["budget_units"])
+                                if crow["budget_units"] is not None
+                                else None
+                            ),
+                            "deadline": format_optional_timestamp_us(crow["deadline_us"]),
+                            "worker_id": crow["worker_id"],
+                            "payment_status": crow["payment_status"],
+                        }
+                    )
+
+            # Deadlines
+            job_deadline = (
+                format_timestamp_us(v_row["deadline_us"])
+                if (v_row is not None and v_row["deadline_us"] is not None)
+                else None
+            )
+            lease_expires_at = (
+                format_timestamp_us(lease_row["expires_at_us"])
+                if lease_row is not None
+                else None
+            )
+            sub_row = conn.execute(
+                "SELECT * FROM submissions WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            review_due_at = (
+                format_timestamp_us(sub_row["review_due_at_us"])
+                if sub_row is not None
+                else None
+            )
+            disp_row = conn.execute(
+                "SELECT * FROM disputes WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            dispute_due_at = (
+                format_timestamp_us(disp_row["due_at_us"])
+                if disp_row is not None
+                else None
+            )
+            deadlines_info = {
+                "job_deadline": job_deadline,
+                "lease_expires_at": lease_expires_at,
+                "review_due_at": review_due_at,
+                "dispute_due_at": dispute_due_at,
+            }
+
+            # Verdict
+            acc_row = conn.execute(
+                "SELECT * FROM acceptances WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            acceptance_info = (
+                {
+                    "decision": acc_row["decision"],
+                    "decided_by": acc_row["decided_by"],
+                    "reason": acc_row["reason"],
+                    "decided_at": format_timestamp_us(acc_row["decided_at_us"]),
+                }
+                if acc_row is not None
+                else None
+            )
+            dispute_info = (
+                {
+                    "dispute_id": disp_row["id"],
+                    "status": disp_row["status"],
+                    "reason_code": disp_row["reason_code"],
+                    "condition_id": disp_row["condition_id"],
+                    "opened_by": disp_row["opened_by"],
+                    "opened_at": format_timestamp_us(disp_row["opened_at_us"]),
+                    "due_at": format_timestamp_us(disp_row["due_at_us"]),
+                    "resolution": disp_row["resolution"],
+                }
+                if disp_row is not None
+                else None
+            )
+            verdict_info = {
+                "verification_result": (
+                    sub_row["verification_result"] if sub_row is not None else None
+                ),
+                "acceptance": acceptance_info,
+                "dispute": dispute_info,
+            }
+
+            # Payment
+            pay_rows = conn.execute(
+                """
+                SELECT
+                    operation_id,
+                    business_key,
+                    kind,
+                    status,
+                    amount_units,
+                    payee_id,
+                    attempt_count,
+                    next_retry_at_us,
+                    last_error,
+                    receipt_id
+                FROM payment_operations
+                WHERE job_id = ?
+                ORDER BY operation_id ASC
+                """,
+                (job_id,),
+            ).fetchall()
+            payment_list = [
+                {
+                    "operation_id": prow["operation_id"],
+                    "business_key": prow["business_key"],
+                    "kind": prow["kind"],
+                    "status": prow["status"],
+                    "amount": domain.format_amount_units(prow["amount_units"]),
+                    "payee_id": prow["payee_id"],
+                    "attempt_count": prow["attempt_count"],
+                    "next_retry_at": format_optional_timestamp_us(
+                        prow["next_retry_at_us"]
+                    ),
+                    "last_error": prow["last_error"],
+                    "receipt_id": prow["receipt_id"],
+                }
+                for prow in pay_rows
+            ]
+
+            # Submission & Artifact readability
+            submission_info: dict[str, Any] | None = None
+            if sub_row is not None:
+                artifact_readable = False
+                if actor["kind"] == domain.ParticipantKind.SYSTEM.value:
+                    artifact_readable = True
+                else:
+                    sub_lease = conn.execute(
+                        "SELECT worker_id FROM leases WHERE id = ?",
+                        (sub_row["lease_id"],),
+                    ).fetchone()
+                    if sub_lease is not None and sub_lease["worker_id"] == actor_id:
+                        artifact_readable = True
+                    else:
+                        requester_can_read = True
+                        if version_info is not None:
+                            access_pol = (
+                                version_info.get("artifact_access_policy") or {}
+                            )
+                            requester_can_read = bool(
+                                access_pol.get("requester_can_read", True)
+                            )
+                        if (
+                            job_row["requester_id"] == actor_id
+                            and requester_can_read
+                        ):
+                            artifact_readable = True
+                        else:
+                            root_job = conn.execute(
+                                "SELECT requester_id FROM jobs WHERE id = ?",
+                                (job_row["root_id"],),
+                            ).fetchone()
+                            if (
+                                root_job is not None
+                                and root_job["requester_id"] == actor_id
+                            ):
+                                artifact_readable = True
+
+                submission_info = {
+                    "submission_id": sub_row["id"],
+                    "lease_id": sub_row["lease_id"],
+                    "version_id": sub_row["version_id"],
+                    "artifact_hash": sub_row["artifact_hash"],
+                    "verification_result": sub_row["verification_result"],
+                    "submitted_at": format_timestamp_us(sub_row["submitted_at_us"]),
+                    "valid_at": format_timestamp_us(sub_row["valid_at_us"]),
+                    "review_due_at": format_timestamp_us(sub_row["review_due_at_us"]),
+                    "artifact_readable": artifact_readable,
+                }
+                if artifact_readable:
+                    submission_info["artifact_json"] = sub_row["artifact_json"]
+                    submission_info["verification_evidence"] = sub_row[
+                        "verification_evidence"
+                    ]
+
+            return {
+                "job": {
+                    "job_id": job_row["id"],
+                    "root_id": job_row["root_id"],
+                    "parent_id": job_row["parent_id"],
+                    "requester_id": job_row["requester_id"],
+                    "state": job_row["state"],
+                    "task_key": job_row["task_key"],
+                    "created_at": format_timestamp_us(job_row["created_at_us"]),
+                },
+                "version": version_info,
+                "lease": lease_info,
+                "budget": budget_info,
+                "children": children_list,
+                "deadlines": deadlines_info,
+                "verdict": verdict_info,
+                "payment": payment_list,
+                "submission": submission_info,
+                "now": now_iso,
+            }
+    except sqlite3.OperationalError as exc:
+        if db.is_db_busy(exc):
+            raise OjpError(ErrorCode.DB_BUSY, "database is busy") from exc
+        raise
+
+
+def get_ledger(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    root_id: str,
+) -> dict[str, Any]:
+    """Root Job の資金台帳詳細（D/E/available/locked内訳/paid/refunded、受取人、Operation、保存則）を返す。
+
+    対象は Root のみ。Child の id や存在しない id は INVALID_TARGET。
+    権限検査: 会計ビュー（金額・受取人一覧・口座情報を含む）の取得は、
+    計画書第14節が refund / payment retry を限定しているのと同様、
+    その Root の requester_id と一致する Actor、または system のみに限定する。
+    """
+    if not isinstance(root_id, str) or not root_id:
+        raise OjpError(ErrorCode.INVALID_TARGET, "root_id must be a non-empty string")
+
+    try:
+        with db.transaction(conn):
+            actor = conn.execute(
+                "SELECT id, kind FROM participants WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if actor is None:
+                raise OjpError(ErrorCode.FORBIDDEN, f"actor not found: {actor_id!r}")
+
+            job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (root_id,)).fetchone()
+            if job_row is None:
+                raise OjpError(ErrorCode.INVALID_TARGET, f"root job not found: {root_id!r}")
+            if job_row["parent_id"] is not None:
+                raise OjpError(
+                    ErrorCode.INVALID_TARGET,
+                    f"job {root_id!r} is a child job (parent_id={job_row['parent_id']!r}), not a root job",
+                )
+
+            # 権限検査: Root Requester または system
+            if (
+                actor["kind"] != domain.ParticipantKind.SYSTEM.value
+                and actor_id != job_row["requester_id"]
+            ):
+                raise OjpError(
+                    ErrorCode.FORBIDDEN,
+                    f"actor {actor_id!r} is not authorized to view ledger for root {root_id!r}",
+                )
+
+            now_us = clock.now_for_read_snapshot(conn)
+            now_iso = format_timestamp_us(now_us)
+
+            # Totals
+            view = ledger.get_root_ledger_view(conn, root_id)
+            totals = {
+                "deposit": domain.format_amount_units(view.deposit_units),
+                "escrow": domain.format_amount_units(view.escrow_units),
+                "available": domain.format_amount_units(view.available_units),
+                "locked": domain.format_amount_units(view.locked_units),
+                "paid": domain.format_amount_units(view.paid_units),
+                "refunded": domain.format_amount_units(view.refunded_units),
+            }
+            locked_breakdown = {
+                bucket: domain.format_amount_units(units)
+                for bucket, units in sorted(view.locked_breakdown_units.items())
+            }
+
+            # Accounts (wallet ledger 用口座は除外して totals と整合させる)
+            acc_rows = conn.execute(
+                """
+                SELECT
+                    id AS account_id,
+                    owner_job_id,
+                    bucket,
+                    purpose,
+                    amount_units,
+                    beneficiary_id,
+                    source_key
+                FROM budget_accounts
+                WHERE root_id = ? AND (source_key IS NULL OR source_key != ?)
+                ORDER BY id ASC
+                """,
+                (root_id, ledger.WALLET_LEDGER_SOURCE_KEY),
+            ).fetchall()
+            accounts = [
+                {
+                    "account_id": a["account_id"],
+                    "owner_job_id": a["owner_job_id"],
+                    "bucket": a["bucket"],
+                    "purpose": a["purpose"],
+                    "amount": domain.format_amount_units(a["amount_units"]),
+                    "beneficiary_id": a["beneficiary_id"],
+                    "source_key": a["source_key"],
+                }
+                for a in acc_rows
+            ]
+
+            # Payees (確定送金額を payee_id と kind で集計)
+            payee_rows = conn.execute(
+                """
+                SELECT
+                    r.payee_id,
+                    p.kind,
+                    SUM(r.amount_units) AS total_units
+                FROM transfer_receipts r
+                JOIN payment_operations p ON p.operation_id = r.operation_id
+                WHERE p.root_id = ?
+                GROUP BY r.payee_id, p.kind
+                ORDER BY r.payee_id ASC, p.kind ASC
+                """,
+                (root_id,),
+            ).fetchall()
+            payees = [
+                {
+                    "payee_id": r["payee_id"],
+                    "kind": r["kind"],
+                    "amount": domain.format_amount_units(int(r["total_units"])),
+                }
+                for r in payee_rows
+            ]
+
+            # Operations (Root の payment_operations)
+            op_rows = conn.execute(
+                """
+                SELECT
+                    operation_id,
+                    business_key,
+                    job_id,
+                    kind,
+                    status,
+                    amount_units,
+                    payee_id,
+                    attempt_count,
+                    next_retry_at_us,
+                    last_error,
+                    receipt_id
+                FROM payment_operations
+                WHERE root_id = ?
+                ORDER BY operation_id ASC
+                """,
+                (root_id,),
+            ).fetchall()
+            operations = [
+                {
+                    "operation_id": o["operation_id"],
+                    "business_key": o["business_key"],
+                    "job_id": o["job_id"],
+                    "kind": o["kind"],
+                    "status": o["status"],
+                    "amount": domain.format_amount_units(o["amount_units"]),
+                    "payee_id": o["payee_id"],
+                    "attempt_count": o["attempt_count"],
+                    "next_retry_at": format_optional_timestamp_us(
+                        o["next_retry_at_us"]
+                    ),
+                    "last_error": o["last_error"],
+                    "receipt_id": o["receipt_id"],
+                }
+                for o in op_rows
+            ]
+
+            # Subcontract usage
+            sub_usage = ledger.get_subcontract_usage(conn, root_id)
+            subcontract_usage = {
+                "root_id": sub_usage.root_id,
+                "deposit": domain.format_amount_units(sub_usage.deposit_units),
+                "available": domain.format_amount_units(sub_usage.available_units),
+                "in_use": domain.format_amount_units(sub_usage.in_use_units),
+                "child_count": sub_usage.child_count,
+            }
+
+            # Conservation (ledger.check_* を呼び出す)
+            is_conserved = ledger.check_conservation(conn, root_id)
+            non_negative_violations = ledger.check_accounts_non_negative(conn)
+            journal_zero_sum_violations = ledger.check_journal_zero_sum(conn)
+            conservation = {
+                "ok": bool(
+                    is_conserved
+                    and not non_negative_violations
+                    and not journal_zero_sum_violations
+                ),
+                "accounts_non_negative": non_negative_violations,
+                "journal_zero_sum": journal_zero_sum_violations,
+            }
+
+            return {
+                "root_id": root_id,
+                "totals": totals,
+                "locked_breakdown": locked_breakdown,
+                "accounts": accounts,
+                "payees": payees,
+                "operations": operations,
+                "subcontract_usage": subcontract_usage,
+                "conservation": conservation,
+                "now": now_iso,
+            }
+    except sqlite3.OperationalError as exc:
+        if db.is_db_busy(exc):
+            raise OjpError(ErrorCode.DB_BUSY, "database is busy") from exc
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Demo Initialization (計画書 第14節 `ojp demo init`)
+# ---------------------------------------------------------------------------
+
+DEMO_REQUESTER_ID = "pt-requester"
+DEMO_AGENT_A_ID = "pt-agent-a"
+DEMO_AGENT_B_ID = "pt-agent-b"
+DEMO_SYSTEM_ID = "pt-system"
+
+
+def demo_init(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: str,
+    seed_units: int,
+    operation_id: str | None = None,
+) -> CommandResult:
+    """テスト用 Requester/A/B/system と MockWallet seed を準備する（計画書 第14節 `ojp demo init`）。
+
+    既存 DB を消さず冪等に動作する。
+    - 権限: actor_id が DB に存在する場合は system Participant であることを要求。
+      DB に存在しない場合は、DB 内に kind='system' の行が 1 件もないときだけ
+      bootstrap 例外として許容し、actor_id を system として登録する。
+      既に別の system が存在する場合は FORBIDDEN。
+    - 固定 Actor 3 件（Requester, Agent A, Agent B）を INSERT ... ON CONFLICT DO NOTHING で作成。
+    - MockWallet: mock_wallets に行が存在する participant はスキップし、
+      行がないときだけ ledger.seed_mock_wallet_for_demo を呼ぶ。
+      Requester に seed_units、Agent A / B に 0。
+    - 既存 DB の行の削除・UPDATE は一切行わない。
+    """
+    if seed_units < 0:
+        raise OjpError(ErrorCode.INVALID_ARGUMENT, "seed_units must be non-negative")
+
+    payload = {"actor_id": actor_id, "seed_units": seed_units}
+
+    # 1. 権限検証と bootstrap
+    # operations.actor_id は participants(id) への FK を持つため、_run_idempotent
+    # が operations 行を挿入する前に actor_id が participants に存在する必要がある。
+    # 新規 DB では system Participant 自体が存在しないため、bootstrap の例外が必要。
+    actor_created = False
+    with db.transaction(conn, immediate=True):
+        actor_row = conn.execute(
+            "SELECT id, kind FROM participants WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if actor_row is not None:
+            if actor_row["kind"] != domain.ParticipantKind.SYSTEM.value:
+                raise OjpError(
+                    ErrorCode.FORBIDDEN,
+                    f"demo_init requires system actor, got {actor_row['kind']}: {actor_id}",
+                )
+        else:
+            existing_system = conn.execute(
+                "SELECT id FROM participants WHERE kind = ?",
+                (domain.ParticipantKind.SYSTEM.value,),
+            ).fetchone()
+            if existing_system is not None:
+                raise OjpError(
+                    ErrorCode.FORBIDDEN,
+                    f"system participant already exists ({existing_system['id']}); "
+                    f"unregistered actor {actor_id} cannot bootstrap demo_init",
+                )
+            conn.execute(
+                "INSERT INTO participants (id, label, kind) VALUES (?, ?, ?)",
+                (actor_id, actor_id, domain.ParticipantKind.SYSTEM.value),
+            )
+            actor_created = True
+
+    payload = {"actor_id": actor_id, "seed_units": seed_units}
+
+    def _apply(c: sqlite3.Connection, op_id: str, now: int) -> dict[str, Any]:
+        actor_check = c.execute(
+            "SELECT kind FROM participants WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if actor_check is None or actor_check["kind"] != domain.ParticipantKind.SYSTEM.value:
+            raise OjpError(ErrorCode.FORBIDDEN, f"demo_init requires system actor: {actor_id}")
+        fixed_actors = [
+            (DEMO_REQUESTER_ID, DEMO_REQUESTER_ID, domain.ParticipantKind.HUMAN.value),
+            (DEMO_AGENT_A_ID, DEMO_AGENT_A_ID, domain.ParticipantKind.AGENT.value),
+            (DEMO_AGENT_B_ID, DEMO_AGENT_B_ID, domain.ParticipantKind.AGENT.value),
+        ]
+
+        all_target_ids = [actor_id, DEMO_REQUESTER_ID, DEMO_AGENT_A_ID, DEMO_AGENT_B_ID]
+        seen_ids = set()
+        unique_targets = []
+        for tid in all_target_ids:
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                unique_targets.append(tid)
+
+        existing_parts = {
+            row["id"]: row["kind"]
+            for row in c.execute(
+                f"SELECT id, kind FROM participants WHERE id IN ({','.join('?' * len(unique_targets))})",
+                unique_targets,
+            ).fetchall()
+        }
+
+        participants_result: list[dict[str, Any]] = []
+        participants_result.append(
+            {
+                "id": actor_id,
+                "kind": domain.ParticipantKind.SYSTEM.value,
+                "created": actor_created,
+            }
+        )
+
+        for aid, label, kind in fixed_actors:
+            if aid == actor_id:
+                continue
+            created = aid not in existing_parts
+            if created:
+                c.execute(
+                    "INSERT INTO participants (id, label, kind) VALUES (?, ?, ?)"
+                    " ON CONFLICT (id) DO NOTHING",
+                    (aid, label, kind),
+                )
+            participants_result.append(
+                {
+                    "id": aid,
+                    "kind": kind,
+                    "created": created,
+                }
+            )
+
+        wallets_result: list[dict[str, Any]] = []
+        wallet_targets = [
+            (DEMO_REQUESTER_ID, seed_units),
+            (DEMO_AGENT_A_ID, 0),
+            (DEMO_AGENT_B_ID, 0),
+        ]
+        for pid, units in wallet_targets:
+            wallet_row = c.execute(
+                "SELECT balance_units FROM mock_wallets WHERE participant_id = ?",
+                (pid,),
+            ).fetchone()
+            if wallet_row is not None:
+                wallets_result.append(
+                    {
+                        "participant_id": pid,
+                        "balance": domain.format_amount_units(int(wallet_row["balance_units"])),
+                        "seeded": False,
+                    }
+                )
+            else:
+                ledger.seed_mock_wallet_for_demo(
+                    c,
+                    participant_id=pid,
+                    asset=domain.ASSET_MOCK_USDC,
+                    balance_units=units,
+                )
+                wallets_result.append(
+                    {
+                        "participant_id": pid,
+                        "balance": domain.format_amount_units(units),
+                        "seeded": True,
+                    }
+                )
+
+        return {
+            "participants": participants_result,
+            "wallets": wallets_result,
+        }
+
+    return _run_idempotent(
+        conn,
+        actor_id=actor_id,
+        kind="seed",
+        operation_id=operation_id,
+        business_key=None,
+        payload=payload,
+        apply_effects=_apply,
+    )
