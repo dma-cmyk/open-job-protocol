@@ -4905,7 +4905,9 @@ def get_job(
     """Job の詳細情報（仕様、Lease公開情報、予算、成果物、期限、判定・送金状態）を取得する。
 
     計画書 第5節「Actorと成果物への権限」に基づき、成果物本文（artifact_json /
-    verification_evidence）の読取権（artifact_readable）を厳格に判定する。
+    verification_evidence）と、そこから提出内容を復元・推定できる派生情報
+    （artifact_hash・裁定の resolution 詳細・acceptance.reason 本文）の読取権
+    （artifact_readable）を厳格に判定する。
     """
     if not isinstance(job_id, str) or not job_id:
         raise OjpError(ErrorCode.INVALID_TARGET, "job_id must be a non-empty string")
@@ -5122,11 +5124,15 @@ def get_job(
             acc_row = conn.execute(
                 "SELECT * FROM acceptances WHERE job_id = ?", (job_id,)
             ).fetchone()
+            # acceptance.reason は自由記述で、裁定経路では判定器の理由コードと
+            # 原因 condition（提出物由来）を本文へ埋め込む。値ごとの allowlist が
+            # 作れないため、成果物を読めない Actor には返さない。decision /
+            # decided_by / decided_at は Job state から既に導出できる公開事実。
             acceptance_info = (
                 {
                     "decision": acc_row["decision"],
                     "decided_by": acc_row["decided_by"],
-                    "reason": acc_row["reason"],
+                    "reason": acc_row["reason"] if artifact_readable else None,
                     "decided_at": format_timestamp_us(acc_row["decided_at_us"]),
                 }
                 if acc_row is not None
@@ -5140,18 +5146,21 @@ def get_job(
                     else None
                 )
                 if resolution is not None and not artifact_readable:
-                    # 未権限 Actor には公開情報だけを allowlist で返す。outcome / reason /
-                    # condition_matched は固定判定器の判断コード、condition_id は異議対象の
-                    # 公開 Version 条件、verifier_id / verifier_hash は公開 Version 由来。
-                    # failed_condition_id / actual_value / input_hash / evidence は提出物または
-                    # 検証証跡由来。expected_value も過剰キー時だけ None になるため、その
-                    # 存在自体が判定分岐を漏らす。将来 resolution にキーが増えても既定で
-                    # 非公開になるよう、除外リストではなく公開許可リストを使う。
+                    # 未権限 Actor には「値の選択が提出物に依存しない」キーだけを
+                    # allowlist で返す。condition_id は異議者が選んだ公開 Version の
+                    # 条件、verifier_id / verifier_hash は公開 Version 由来。
+                    # outcome / reason / condition_matched は固定語彙でも、どの値に
+                    # なるかを提出物が決める（verification.py の各 FAIL 分岐が
+                    # reason と failed_condition_id を選び、condition_matched は
+                    # それと公開 condition の比較結果）。裁定が成立したかどうかは
+                    # Job state（DONE / FAILED）と acceptance.decision で既に公開
+                    # されているため、ここで重ねて返す必要もない。
+                    # failed_condition_id / expected_value / actual_value /
+                    # input_hash / evidence は提出物または検証証跡そのもの。
+                    # 将来 resolution にキーが増えても既定で非公開になるよう、
+                    # 除外リストではなく公開許可リストを使う。
                     public_resolution_keys = (
-                        "outcome",
-                        "reason",
                         "condition_id",
-                        "condition_matched",
                         "verifier_id",
                         "verifier_hash",
                     )
@@ -5224,7 +5233,6 @@ def get_job(
                     "submission_id": sub_row["id"],
                     "lease_id": sub_row["lease_id"],
                     "version_id": sub_row["version_id"],
-                    "artifact_hash": sub_row["artifact_hash"],
                     "verification_result": sub_row["verification_result"],
                     "submitted_at": format_timestamp_us(sub_row["submitted_at_us"]),
                     "valid_at": format_timestamp_us(sub_row["valid_at_us"]),
@@ -5232,6 +5240,12 @@ def get_job(
                     "artifact_readable": artifact_readable,
                 }
                 if artifact_readable:
+                    # artifact_hash は canonical 成果物の SHA-256 で、PoC の
+                    # 成果物空間（固定 sum タスク）は総当たりできるほど小さい。
+                    # 未権限 Actor へ返すと候補を canonical 化して照合するだけで
+                    # 提出値を復元できるため、本文と同じ読取権を要求する
+                    # （第5節 148 行・第22節 X11「無関係Actorには非公開」）。
+                    submission_info["artifact_hash"] = sub_row["artifact_hash"]
                     submission_info["artifact_json"] = sub_row["artifact_json"]
                     submission_info["verification_evidence"] = sub_row[
                         "verification_evidence"

@@ -15,6 +15,7 @@ Contract verification according to PoC implementation plan:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -456,8 +457,8 @@ def test_get_job_artifact_permission_matrix(test_db):
     """5. get_job の成果物読取権マトリクス（Child に submit 済みの状態を作る）:
 
     system=可／提出した Worker B=可／Child の Requester A=可／Root Requester=可／
-    無関係な Actor=不可（artifact_json と verification_evidence のキーが存在しない、
-    かつ artifact_readable is False、かつ artifact_hash は返る）
+    無関係な Actor=不可（artifact_json・verification_evidence・artifact_hash の
+    キーがどれも存在しない、かつ artifact_readable is False）
     """
     _setup_world(test_db)
     root_id, root_v = _create_open_root(test_db.conn, "perm-test")
@@ -475,6 +476,7 @@ def test_get_job_artifact_permission_matrix(test_db):
     assert sub_b["artifact_readable"] is True
     assert "artifact_json" in sub_b
     assert "verification_evidence" in sub_b
+    assert "artifact_hash" in sub_b
 
     # 3. Child の Requester A=可
     v_a = service.get_job(test_db.conn, actor_id=AGENT_A_ID, job_id=child_id)
@@ -482,6 +484,7 @@ def test_get_job_artifact_permission_matrix(test_db):
     assert sub_a["artifact_readable"] is True
     assert "artifact_json" in sub_a
     assert "verification_evidence" in sub_a
+    assert "artifact_hash" in sub_a
 
     # 4. Root Requester=可
     v_req = service.get_job(test_db.conn, actor_id=REQUESTER_ID, job_id=child_id)
@@ -489,6 +492,7 @@ def test_get_job_artifact_permission_matrix(test_db):
     assert sub_req["artifact_readable"] is True
     assert "artifact_json" in sub_req
     assert "verification_evidence" in sub_req
+    assert "artifact_hash" in sub_req
 
     # 5. 無関係な Actor=不可
     v_unrelated = service.get_job(test_db.conn, actor_id=UNRELATED_ID, job_id=child_id)
@@ -496,8 +500,38 @@ def test_get_job_artifact_permission_matrix(test_db):
     assert sub_unrelated["artifact_readable"] is False
     assert "artifact_json" not in sub_unrelated
     assert "verification_evidence" not in sub_unrelated
-    assert "artifact_hash" in sub_unrelated
+    assert "artifact_hash" not in sub_unrelated
     assert sub_unrelated["verification_result"] == "PASS"
+
+
+def test_get_job_never_exposes_artifact_hash_to_unrelated_actor(test_db):
+    """X11: 未権限 Actor の get_job 応答に提出成果物の hash が現れない。
+    PoC の成果物空間は総当たりできるほど小さく、canonical hash も生バイト列
+    hash も提出値を復元する材料になる。公開 Version の conditions_hash は
+    第11節で公開される固定期待値の hash であり提出物由来ではないため、
+    比較対象からは version 節を除く。"""
+    _setup_world(test_db)
+    root_id, root_v = _create_open_root(test_db.conn, "hash-leak")
+    child_info = _create_and_submit_child(test_db.conn, root_id, root_v, "c-hash-leak")
+    child_id = child_info["child_id"]
+
+    stored_hash = test_db.conn.execute(
+        "SELECT artifact_hash FROM submissions WHERE id = ?",
+        (child_info["submission_id"],),
+    ).fetchone()["artifact_hash"]
+    raw_hash = hashlib.sha256(json.dumps({"sum": 6}).encode("utf-8")).hexdigest()
+    assert stored_hash != raw_hash  # canonical と生バイト列は別 hash
+
+    # 権限のある Actor には保存済み canonical hash がそのまま返る。
+    readable_view = service.get_job(test_db.conn, actor_id=REQUESTER_ID, job_id=child_id)
+    assert readable_view["submission"]["artifact_hash"] == stored_hash
+
+    unrelated_view = service.get_job(test_db.conn, actor_id=UNRELATED_ID, job_id=child_id)
+    unrelated_json = json.dumps(
+        {key: value for key, value in unrelated_view.items() if key != "version"}
+    )
+    assert stored_hash not in unrelated_json
+    assert raw_hash not in unrelated_json
 
 
 def test_get_job_dispute_resolution_artifact_permission_matrix(test_db):
@@ -524,67 +558,86 @@ def test_get_job_dispute_resolution_artifact_permission_matrix(test_db):
         ).fetchone()["resolution"]
     )
 
-    system_resolution = service.get_job(
-        test_db.conn, actor_id=SYSTEM_ID, job_id=child_id
-    )["verdict"]["dispute"]["resolution"]
+    system_view = service.get_job(test_db.conn, actor_id=SYSTEM_ID, job_id=child_id)
+    system_resolution = system_view["verdict"]["dispute"]["resolution"]
     assert isinstance(system_resolution, dict)
     assert system_resolution == stored_resolution
     assert system_resolution["evidence"] is not None
     assert system_resolution["actual_value"] == 7
+    assert "ARTIFACT_VALUE_MISMATCH" in system_view["verdict"]["acceptance"]["reason"]
 
     # 提出 Worker、Child Requester、Root Requester は完全な裁定根拠を取得する。
     for actor_id in (AGENT_B_ID, AGENT_A_ID, REQUESTER_ID):
-        resolution = service.get_job(
-            test_db.conn, actor_id=actor_id, job_id=child_id
-        )["verdict"]["dispute"]["resolution"]
+        view = service.get_job(test_db.conn, actor_id=actor_id, job_id=child_id)
+        resolution = view["verdict"]["dispute"]["resolution"]
         assert isinstance(resolution, dict)
         assert resolution == system_resolution
         assert "evidence" in resolution
         assert "actual_value" in resolution
+        assert view["verdict"]["acceptance"] == system_view["verdict"]["acceptance"]
 
-    unrelated_resolution = service.get_job(
+    # 未権限 Actor には、値の選択が提出物に依存しないキーだけを返す。
+    unrelated_view = service.get_job(
         test_db.conn, actor_id=UNRELATED_ID, job_id=child_id
-    )["verdict"]["dispute"]["resolution"]
-    assert unrelated_resolution == {
+    )
+    assert unrelated_view["verdict"]["dispute"]["resolution"] == {
         key: system_resolution[key]
-        for key in (
-            "outcome",
-            "reason",
-            "condition_id",
-            "condition_matched",
-            "verifier_id",
-            "verifier_hash",
-        )
+        for key in ("condition_id", "verifier_id", "verifier_hash")
     }
+    # 裁定が成立したこと自体は Job state と decision で既に公開されている。
+    unrelated_acceptance = unrelated_view["verdict"]["acceptance"]
+    assert unrelated_view["job"]["state"] == JobState.FAILED.value
+    assert unrelated_acceptance["decision"] == "REJECTED"
+    assert unrelated_acceptance["reason"] is None
 
 
-def test_get_job_dispute_resolution_hides_extra_artifact_key(test_db):
-    """未権限 Actor には裁定で検出した過剰な提出キー名を公開しない。"""
+def test_unrelated_actor_cannot_distinguish_dispute_fail_scenarios(test_db):
+    """提出値の違う 2 つの裁定 FAIL（値不一致・過剰キー）で、未権限 Actor が
+    得る resolution と acceptance.reason が区別できない。区別できるのは
+    Job state と decision だけで、これは第6節の状態機械が公開する事実。"""
     _setup_world(test_db)
-    root_id, root_v = _create_open_root(test_db.conn, "resolution-extra-key")
-    child_info = _create_disputed_child(
-        test_db.conn, root_id, root_v, "resolution-extra-key"
+
+    mismatch_root, mismatch_v = _create_open_root(test_db.conn, "indistinct-mismatch")
+    mismatch_child = _create_disputed_child(
+        test_db.conn, mismatch_root, mismatch_v, "indistinct-mismatch"
+    )
+    _resolve_dispute_with_value_mismatch(test_db.conn)
+
+    extra_root, extra_v = _create_open_root(test_db.conn, "indistinct-extra")
+    extra_child = _create_disputed_child(
+        test_db.conn, extra_root, extra_v, "indistinct-extra"
     )
     _resolve_dispute_with_extra_artifact_key(test_db.conn)
 
-    system_resolution = service.get_job(
-        test_db.conn, actor_id=SYSTEM_ID, job_id=child_info["child_id"]
+    # system は 2 つの裁定を区別できる（判定分岐も原因キーも異なる）。
+    mismatch_system = service.get_job(
+        test_db.conn, actor_id=SYSTEM_ID, job_id=mismatch_child["child_id"]
     )["verdict"]["dispute"]["resolution"]
-    assert system_resolution["failed_condition_id"] == "confidential_name"
-    assert system_resolution["actual_value"] == 1
+    extra_system = service.get_job(
+        test_db.conn, actor_id=SYSTEM_ID, job_id=extra_child["child_id"]
+    )["verdict"]["dispute"]["resolution"]
+    assert mismatch_system["outcome"] == "FAIL"
+    assert mismatch_system["reason"] == "ARTIFACT_VALUE_MISMATCH"
+    assert extra_system["outcome"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
+    assert extra_system["reason"] == "ARTIFACT_KEY_MISMATCH"
+    assert extra_system["failed_condition_id"] == "confidential_name"
 
-    unrelated_resolution = service.get_job(
-        test_db.conn, actor_id=UNRELATED_ID, job_id=child_info["child_id"]
-    )["verdict"]["dispute"]["resolution"]
-    assert "confidential_name" not in json.dumps(unrelated_resolution)
-    assert set(unrelated_resolution) == {
-        "outcome",
-        "reason",
-        "condition_id",
-        "condition_matched",
-        "verifier_id",
-        "verifier_hash",
-    }
+    mismatch_unrelated = service.get_job(
+        test_db.conn, actor_id=UNRELATED_ID, job_id=mismatch_child["child_id"]
+    )
+    extra_unrelated = service.get_job(
+        test_db.conn, actor_id=UNRELATED_ID, job_id=extra_child["child_id"]
+    )
+    assert (
+        mismatch_unrelated["verdict"]["dispute"]["resolution"]
+        == extra_unrelated["verdict"]["dispute"]["resolution"]
+    )
+    assert "confidential_name" not in json.dumps(extra_unrelated)
+    for view in (mismatch_unrelated, extra_unrelated):
+        assert view["verdict"]["acceptance"]["reason"] is None
+    # Job state と decision の差だけが残る（第6節の公開された状態遷移）。
+    assert mismatch_unrelated["job"]["state"] == JobState.FAILED.value
+    assert extra_unrelated["job"]["state"] == JobState.DONE.value
 
 
 def test_get_job_dispute_resolution_respects_requester_policy(test_db):

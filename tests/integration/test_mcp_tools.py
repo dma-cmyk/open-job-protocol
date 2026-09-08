@@ -658,12 +658,14 @@ async def test_authorized_get_job_artifact_permission(tmp_path: Path) -> None:
         assert sub_other is not None
         assert sub_other["artifact_readable"] is False
         assert "artifact_json" not in sub_other
+        assert "artifact_hash" not in sub_other
 
 
 @pytest.mark.anyio
 async def test_get_job_filters_dispute_resolution_over_mcp(tmp_path: Path) -> None:
     """MCP の共通応答封筒でも resolution は JSON object であり、
-    成果物を読めない Actor には evidence と actual_value を返さない。"""
+    成果物を読めない Actor には提出物由来の判定結果（outcome / reason /
+    condition_matched / 実値 / 証跡）を返さない。"""
     _init_db(tmp_path)
     root_id = _create_and_fund_root(tmp_path, "resolution")
 
@@ -735,10 +737,18 @@ async def test_get_job_filters_dispute_resolution_over_mcp(tmp_path: Path) -> No
         payload = _parse_content_payload(result)
         resolution = payload["data"]["verdict"]["dispute"]["resolution"]
         assert isinstance(resolution, dict)
-        assert resolution["outcome"] == "FAIL"
-        assert resolution["reason"] == "ARTIFACT_VALUE_MISMATCH"
-        assert "evidence" not in resolution
-        assert "actual_value" not in resolution
+        assert resolution["condition_id"] == "sum"
+        for hidden in (
+            "outcome",
+            "reason",
+            "condition_matched",
+            "evidence",
+            "actual_value",
+            "failed_condition_id",
+            "input_hash",
+        ):
+            assert hidden not in resolution
+        assert payload["data"]["verdict"]["acceptance"]["reason"] is None
 
 
 # ---------------------------------------------------------------------------
