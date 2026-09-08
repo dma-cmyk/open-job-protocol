@@ -26,13 +26,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock, db, domain, ledger, service
+from . import clock, db, domain, ledger, response, service
 from .domain import ErrorCode, OjpError
 
 DEFAULT_ACTOR_ID = "pt-system"
 
 
-def _resolve_db_path(root: Path) -> Path:
+def resolve_db_path(root: Path) -> Path:
     """プロジェクトルートから SQLite ファイルのパスを解決する。"""
     return root / "data" / "ojp.sqlite3"
 
@@ -67,11 +67,10 @@ def tick_once(
     actor_id: str,
     escrow: ledger.EscrowPort | None = None,
 ) -> dict[str, Any]:
-    """1 回分の期限処理（第15節 Lifecycle をこの順序で呼ぶ）。
+    """Run lifecycle operations once, preserving non-authorization progress.
 
-    戻り値は各 Lifecycle の件数・結果の dict。1 つの Lifecycle が
-    OjpError で失敗しても、先に確定した Lifecycle の結果は失われない
-    （呼び出し側は error を参照して終了コードを決める）。
+    A FORBIDDEN result is fail-fast: no later lifecycle is invoked. Other
+    OjpError values retain the existing best-effort behavior.
     """
     expired: list[Any] = []
     approved: list[Any] = []
@@ -79,10 +78,38 @@ def tick_once(
     reserved: list[Any] = []
     payments: list[Any] = []
     error: dict[str, str] | None = None
+
+    def _result() -> dict[str, Any]:
+        return {
+            "expired_leases": [r.data for r in expired],
+            "approved_submissions": [r.data for r in approved],
+            "resolved_disputes": [r.data for r in resolved],
+            "reserved_refunds": [r.data for r in reserved],
+            "processed_payments": [r.data for r in payments],
+            "counts": {
+                "expired_leases": len(expired),
+                "approved_submissions": len(approved),
+                "resolved_disputes": len(resolved),
+                "reserved_refunds": len(reserved),
+                "processed_payments": len(payments),
+            },
+            "error": error,
+        }
+
+    # Return the normal tick envelope on authorization failure so `tick --json`
+    # keeps its established shape and main can map the embedded error to exit 2.
+    try:
+        service._require_system_actor(conn, actor_id)
+    except OjpError as exc:
+        error = {"code": exc.code, "message": exc.message}
+        return _result()
+
     try:
         expired = service.expire_due_leases(conn, actor_id=actor_id, escrow=escrow)
     except OjpError as exc:
         error = {"code": exc.code, "message": exc.message}
+        if exc.code == ErrorCode.FORBIDDEN.value:
+            return _result()
     try:
         approved = service.approve_due_submissions(
             conn, actor_id=actor_id, escrow=escrow
@@ -93,6 +120,8 @@ def tick_once(
     except OjpError as exc:
         if error is None:
             error = {"code": exc.code, "message": exc.message}
+        if exc.code == ErrorCode.FORBIDDEN.value:
+            return _result()
     try:
         for root_id in _refundable_root_ids(conn):
             reserved.append(
@@ -100,25 +129,13 @@ def tick_once(
                     conn, actor_id=actor_id, root_id=root_id
                 )
             )
-        payments = service.process_payments(conn, escrow=escrow)
+        payments = service.process_payments(
+            conn, actor_id=actor_id, escrow=escrow
+        )
     except OjpError as exc:
         if error is None:
             error = {"code": exc.code, "message": exc.message}
-    return {
-        "expired_leases": [r.data for r in expired],
-        "approved_submissions": [r.data for r in approved],
-        "resolved_disputes": [r.data for r in resolved],
-        "reserved_refunds": [r.data for r in reserved],
-        "processed_payments": [r.data for r in payments],
-        "counts": {
-            "expired_leases": len(expired),
-            "approved_submissions": len(approved),
-            "resolved_disputes": len(resolved),
-            "reserved_refunds": len(reserved),
-            "processed_payments": len(payments),
-        },
-        "error": error,
-    }
+    return _result()
 
 
 def watch(
@@ -195,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point。終了コード: 成功 0 / 入力・権限・状態違反 2 / 一時障害 3。"""
     args = _parse_args(argv)
     root = Path(args.root).expanduser()
-    db_path = _resolve_db_path(root)
+    db_path = resolve_db_path(root)
     conn: sqlite3.Connection | None = None
     try:
         # 既存 DB を開き、起動設定と DB の Clock mode を照合する（計画書
@@ -214,11 +231,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         error = result.get("error") if isinstance(result, dict) else None
         if error is not None:
-            code = error.get("code")
-            if code in (ErrorCode.DB_BUSY.value,):
-                return 3
-            return 2
-        return 0
+            return response.exit_code(str(error.get("code")))
+        return response.EXIT_OK
     except OjpError as exc:
         if args.json:
             print(
@@ -228,19 +242,19 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-        if exc.code in (ErrorCode.DB_BUSY,):
-            return 3
-        return 2
+        return response.exit_code(exc.code)
     except sqlite3.Error as exc:
+        is_busy = db.is_db_busy(exc)
+        payload = response.db_error_payload(exc, busy=is_busy)
         if args.json:
             print(
                 json.dumps(
-                    {"error": {"code": "DB_ERROR", "message": str(exc)}},
+                    payload,
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
-        return 3
+        return response.exit_code(payload["error"]["code"])
     finally:
         if conn is not None:
             conn.close()

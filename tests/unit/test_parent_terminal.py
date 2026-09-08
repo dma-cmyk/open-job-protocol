@@ -775,7 +775,7 @@ def test_n13_additional_refund_after_parent_refund(demo_db):
     assert return_ops == 0
 
     # settle: 返金累計は入金額 100 と一致する（超えない）
-    results = service.process_payments(demo_db.conn)
+    results = service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 2
     view = _view(demo_db, root_id)
     assert view.refunded_units == ROOT_BUDGET_UNITS
@@ -816,7 +816,7 @@ def test_n13_child_success_keeps_refund_at_90(demo_db):
         payee_id=AGENT_B_ID,
         operation_id="payout:n13ok-c1",
     )
-    service.process_payments(demo_db.conn)
+    service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     view = _view(demo_db, root_id)
     assert view.refunded_units == ROOT_BUDGET_UNITS - TEN  # 累計 90 のまま
     assert view.paid_units == TEN
@@ -1282,7 +1282,7 @@ def test_x12_part3_success(demo_db):
         payee_id=AGENT_B_ID,
         operation_id="payout:x12-part-3",
     )
-    service.process_payments(demo_db.conn)
+    service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
     view = _view(demo_db, root_id)
@@ -1311,7 +1311,7 @@ def test_x12_part3_failure(demo_db):
     assert returned.data["funds"]["combined"] is True
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
 
-    service.process_payments(demo_db.conn)
+    service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     view = _view(demo_db, root_id)
     assert view.paid_units == TEN  # B 累計 10
     assert view.refunded_units == ROOT_BUDGET_UNITS - TEN  # 返金 90

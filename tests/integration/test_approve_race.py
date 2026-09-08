@@ -46,6 +46,7 @@ from tests.conftest import (
     REQUESTER_ID,
     ROOT_BUDGET_UNITS,
     TEST_T0_US,
+    SYSTEM_ID,
     default_subcontract_policy,
     insert_demo_participants,
     load_poc_catalog,
@@ -410,7 +411,7 @@ def test_settlement_after_concurrent_approve_single_receipt(test_db, tmp_path):
 
         # 共通 settlement 処理（計画書 第9節「共通settlement処理が
         # PENDING/RETRYABLEを取得し、同じoperation_idでMock.transferを呼ぶ」）
-        results = service.process_payments(conn)
+        results = service.process_payments(conn, actor_id=SYSTEM_ID)
         assert len(results) == 1
 
         # Receipt は 1 件・受取人は B・金額は 10.000000
@@ -454,7 +455,7 @@ def test_settlement_after_concurrent_approve_single_receipt(test_db, tmp_path):
         # 送金を二度実行しても Receipt は 1 件のまま・Wallet も増えない
         # （Receipt が正本。第16節「Receipt作成後の再実行: 既存Receiptで
         # 照合し、WalletもJournalも増やさない」）
-        again = service.process_payments(conn)
+        again = service.process_payments(conn, actor_id=SYSTEM_ID)
         assert again == []
         assert (
             conn.execute(

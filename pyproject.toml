@@ -8,6 +8,9 @@ dependencies = [
     "pydantic>=2.5,<3",
 ]
 
+[project.scripts]
+ojp = "ojp.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0,<9",

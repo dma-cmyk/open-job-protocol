@@ -7,9 +7,11 @@ paid/refunded が増える、バックオフ 1/2/4/8/30…、終端へ落ちな�
 
 from __future__ import annotations
 
+import sqlite3
+import inspect
 import pytest
 
-from ojp import ledger, service
+from ojp import ledger, response, service
 from ojp.domain import ErrorCode, JobState, OjpError, PaymentStatus
 from tests.conftest import (
     AGENT_A_ID,
@@ -98,6 +100,89 @@ class FlakyEscrow(ledger.MockEscrow):
         return super().transfer(conn, operation_id, payload)
 
 
+class SqliteFailingEscrow(ledger.MockEscrow):
+    """決済 transaction 内から指定した SQLite エラーを送出する port。"""
+
+    def __init__(self, error: sqlite3.Error) -> None:
+        self.error = error
+
+    def transfer(self, conn, operation_id, payload):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["process_single_payment", "retry_payment", "process_payments"],
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.OperationalError("disk I/O error"),
+        sqlite3.DatabaseError("database disk image is malformed"),
+    ],
+)
+def test_non_busy_sqlite_errors_from_settlement_are_deterministic(
+    test_db, entrypoint, error
+):
+    """決済経路の非 busy SQLite 障害は DB_BUSY に変換せず exit 2 相当。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    escrow = SqliteFailingEscrow(error)
+
+    with pytest.raises(type(error)) as exc_info:
+        if entrypoint == "process_single_payment":
+            service.process_single_payment(
+                test_db.conn, operation_id=PAYMENT_OP_ID, escrow=escrow
+            )
+        elif entrypoint == "retry_payment":
+            service.retry_payment(
+                test_db.conn,
+                actor_id=AGENT_B_ID,
+                operation_id=PAYMENT_OP_ID,
+                escrow=escrow,
+            )
+        else:
+            service.process_payments(
+                test_db.conn, actor_id=SYSTEM_ID, escrow=escrow
+            )
+
+    payload = response.db_error_payload(exc_info.value, busy=False)
+    assert payload["error"]["code"] == response.DB_ERROR_CODE
+    assert payload["error"]["retryable"] is False
+    assert response.exit_code(payload["error"]["code"]) == response.EXIT_VIOLATION
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.attempt_count == 0
+
+
+def test_busy_operational_error_keeps_retries_and_backoff(test_db, monkeypatch):
+    """busy は既存回数だけ再試行し、attempt_count は決済失敗として増やさない。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    escrow = SqliteFailingEscrow(sqlite3.OperationalError("database is locked"))
+    delays: list[float] = []
+    monkeypatch.setattr(service, "DB_BUSY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(service.time, "sleep", delays.append)
+    monkeypatch.setattr(service.random, "random", lambda: 0.5)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.process_single_payment(
+            test_db.conn, operation_id=PAYMENT_OP_ID, escrow=escrow
+        )
+
+    assert exc_info.value.code == ErrorCode.DB_BUSY.value
+    assert len(delays) == 2
+    assert delays == [
+        service.DB_BUSY_BASE_DELAY_SECONDS,
+        service.DB_BUSY_BASE_DELAY_SECONDS * 2,
+    ]
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.attempt_count == 0
+
+
 # ---------------------------------------------------------------------------
 # 送金成功（完了条件1・7）
 # ---------------------------------------------------------------------------
@@ -112,7 +197,7 @@ def test_payout_success_conservation_and_wallet(test_db):
     # 予約時点では paid は 0（Receipt が無い）
     assert _view(test_db).paid_units == 0
 
-    results = service.process_payments(test_db.conn)
+    results = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
     assert results[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
 
@@ -141,7 +226,7 @@ def test_refund_success_conservation_and_wallet(test_db):
     assert reserved.data["payment_status"] == PaymentStatus.PENDING.value
     assert _view(test_db).refunded_units == 0  # 予約時点では 0
 
-    results = service.process_payments(test_db.conn)
+    results = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
     assert results[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
 
@@ -169,7 +254,7 @@ def test_journal_zero_sum_holds_after_transfers(test_db):
         payee_id=REQUESTER_ID,
         operation_id="refund:terminal-1",
     )
-    service.process_payments(test_db.conn)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert ledger.check_journal_zero_sum(test_db.conn) == []
     assert ledger.check_cumulative_journal_zero_sum(test_db.conn) == 0
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
@@ -185,18 +270,18 @@ def test_settlement_after_receipt_is_reconciled_without_double_count(test_db):
     Wallet も Journal も増えない。"""
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
-    service.process_payments(test_db.conn)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     wallet_after_first = _wallet(test_db.conn, AGENT_B_ID)
     journal_count = test_db.conn.execute(
         "SELECT COUNT(*) AS c FROM journal_transactions"
     ).fetchone()["c"]
 
     # SUCCEEDED 済みの再処理（retry_payment 経路）
-    again = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    again = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert again.replayed is True
     assert again.data["already_succeeded"] is True
     # 期限到来分の再処理（process_payments は SUCCEEDED を拾わないので 0 件）
-    assert service.process_payments(test_db.conn) == []
+    assert service.process_payments(test_db.conn, actor_id=SYSTEM_ID) == []
     assert _wallet(test_db.conn, AGENT_B_ID) == wallet_after_first
     assert (
         test_db.conn.execute(
@@ -263,7 +348,7 @@ def test_receipt_mismatch_with_reservation_is_recorded(test_db):
     _reserve_child_payout(test_db)
     _inject_mismatched_receipt(test_db, amount=1)
 
-    results = service.process_payments(test_db.conn)
+    results = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
     data = results[0].data
     # 例外でバッチが落ちるのではなく、件ごとの結果として失敗が返る
@@ -298,10 +383,10 @@ def test_retry_of_mismatched_receipt_records_again_without_success(test_db):
     _reserve_child_payout(test_db)
     _inject_mismatched_receipt(test_db, amount=1)
 
-    first = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    first = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert first.data["payment_status"] == PaymentStatus.RETRYABLE.value
     assert first.data["attempt_count"] == 1
-    second = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    second = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert second.data["payment_status"] == PaymentStatus.RETRYABLE.value
     assert second.data["attempt_count"] == 2
     assert "does not match" in second.data["last_error"]
@@ -353,7 +438,7 @@ def test_same_business_effect_with_different_operation_ids_pays_once(test_db):
         == refund_first.data["payment_operation_id"]
     )
 
-    results = service.process_payments(test_db.conn)
+    results = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 2  # payout 1 + refund 1（別 ID 分は作られていない）
     view = _view(test_db)
     assert view.paid_units == CHILD_BUDGET_UNITS
@@ -381,7 +466,9 @@ def test_retry_backoff_sequence_and_no_terminal_fallback(test_db):
     expected_delays = [1, 2, 4, 8, 30, 30]
     current_us = TEST_T0_US
     for i, delay in enumerate(expected_delays):
-        result = service.process_payments(test_db.conn, escrow=escrow)
+        result = service.process_payments(
+            test_db.conn, actor_id=SYSTEM_ID, escrow=escrow
+        )
         assert len(result) == 1
         data = result[0].data
         assert data["payment_status"] == PaymentStatus.RETRYABLE.value
@@ -407,7 +494,9 @@ def test_retry_backoff_sequence_and_no_terminal_fallback(test_db):
     )
 
     # 復旧後の再試行で 1 回だけ送金される（時計は既に期限まで進んでいる）
-    result = service.process_payments(test_db.conn, escrow=escrow)
+    result = service.process_payments(
+        test_db.conn, actor_id=SYSTEM_ID, escrow=escrow
+    )
     assert len(result) == 1
     assert result[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
     assert _view(test_db).paid_units == CHILD_BUDGET_UNITS
@@ -424,11 +513,13 @@ def test_retry_not_due_is_not_processed(test_db):
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
     escrow = FlakyEscrow(fail_times=1)
-    service.process_payments(test_db.conn, escrow=escrow)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID, escrow=escrow)
     # まだ t0 のまま（next_retry_at_us = t0+1s）→ 対象外
-    assert service.process_payments(test_db.conn, escrow=escrow) == []
+    assert service.process_payments(
+        test_db.conn, actor_id=SYSTEM_ID, escrow=escrow
+    ) == []
     # 手動 retry は期限を無視して即時再試行できる
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert result.data["payment_status"] == PaymentStatus.SUCCEEDED.value
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
@@ -453,7 +544,7 @@ def test_zero_amount_reserve_creates_no_payment_operation(test_db):
     assert result.data.get("no_op") is True
     assert "payment_operation_id" not in result.data
     assert ledger.get_payment_operation(test_db.conn, "payout:zero") is None
-    assert service.process_payments(test_db.conn) == []
+    assert service.process_payments(test_db.conn, actor_id=SYSTEM_ID) == []
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
 
@@ -796,7 +887,7 @@ def test_reserve_parent_payout_zero_noop_then_real_creates_one_payment(test_db):
     assert _payment_count(test_db.conn, f"payout:{ROOT_ID}") == 1
 
     # settlement は 2 件（Child payout + Parent payout）を 1 回ずつ送金する
-    results = service.process_payments(test_db.conn)
+    results = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 2
     assert all(
         r.data["payment_status"] == PaymentStatus.SUCCEEDED.value for r in results
@@ -992,7 +1083,9 @@ def test_every_transfer_failure_is_recorded_regardless_of_kind(test_db):
 
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
-    results = service.process_payments(test_db.conn, escrow=AlwaysFailEscrow())
+    results = service.process_payments(
+        test_db.conn, actor_id=SYSTEM_ID, escrow=AlwaysFailEscrow()
+    )
     assert len(results) == 1
     data = results[0].data
     assert data["payment_status"] == PaymentStatus.RETRYABLE.value
@@ -1043,7 +1136,7 @@ def test_batch_continues_after_one_failure_and_records_reason(test_db):
             return super().transfer(conn, operation_id, payload)
 
     results = service.process_payments(
-        test_db.conn, escrow=FailChildPayoutEscrow()
+        test_db.conn, actor_id=SYSTEM_ID, escrow=FailChildPayoutEscrow()
     )
     assert len(results) == 2
     by_id = {r.operation_id: r for r in results}
@@ -1070,7 +1163,7 @@ def test_batch_continues_after_one_failure_and_records_reason(test_db):
     from ojp import clock as clockmod
 
     clockmod.set_test_now(test_db.conn, TEST_T0_US + SECOND)
-    retried = service.process_payments(test_db.conn)
+    retried = service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     assert len(retried) == 1
     assert retried[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
     assert _wallet(test_db.conn, AGENT_B_ID) == CHILD_BUDGET_UNITS
@@ -1093,7 +1186,7 @@ def test_succeeded_reprocess_fails_when_receipt_is_missing(test_db):
     """
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
-    service.process_payments(test_db.conn)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
     assert payment is not None
     assert payment.status == PaymentStatus.SUCCEEDED
@@ -1112,7 +1205,7 @@ def test_succeeded_reprocess_fails_when_receipt_is_missing(test_db):
             "DELETE FROM transfer_receipts WHERE operation_id = ?", (PAYMENT_OP_ID,)
         )
 
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     # 成功としては返さない（already_succeeded は返らず、整合性エラーが返る）
     assert "already_succeeded" not in result.data
     assert result.data["consistency_error"] is True
@@ -1136,7 +1229,7 @@ def test_succeeded_reprocess_detects_receipt_amount_mismatch(test_db):
     場合も成功として返さない。"""
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
-    service.process_payments(test_db.conn)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
     payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
     assert payment is not None
     assert payment.status == PaymentStatus.SUCCEEDED
@@ -1147,7 +1240,7 @@ def test_succeeded_reprocess_detects_receipt_amount_mismatch(test_db):
         " WHERE operation_id = ?",
         (PAYMENT_OP_ID,),
     )
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert "already_succeeded" not in result.data
     assert result.data["consistency_error"] is True
     assert "does not match" in result.data["last_error"]
@@ -1165,7 +1258,7 @@ def test_payment_failure_view_exposes_reason_and_locked_reservation(test_db):
     _setup_funded_child(test_db)
     _reserve_child_payout(test_db)
     escrow = FlakyEscrow(fail_times=1)
-    service.process_payments(test_db.conn, escrow=escrow)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID, escrow=escrow)
 
     failure = ledger.get_payment_failure_view(test_db.conn, PAYMENT_OP_ID)
     assert failure is not None
@@ -1315,3 +1408,9 @@ def test_bool_and_non_int_amount_units_are_invalid_argument(test_db):
         assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
         assert _audit_snapshot(test_db.conn) == before
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+def test_retry_payment_requires_explicit_actor_id() -> None:
+    """retry_payment の actor_id が既定値を持たず、呼出元の明示指定を強制することの回帰テスト。"""
+    sig = inspect.signature(service.retry_payment)
+    assert "actor_id" in sig.parameters
+    assert sig.parameters["actor_id"].default is inspect.Parameter.empty
