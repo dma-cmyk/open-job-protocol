@@ -67,11 +67,10 @@ def tick_once(
     actor_id: str,
     escrow: ledger.EscrowPort | None = None,
 ) -> dict[str, Any]:
-    """1 回分の期限処理（第15節 Lifecycle をこの順序で呼ぶ）。
+    """Run lifecycle operations once, preserving non-authorization progress.
 
-    戻り値は各 Lifecycle の件数・結果の dict。1 つの Lifecycle が
-    OjpError で失敗しても、先に確定した Lifecycle の結果は失われない
-    （呼び出し側は error を参照して終了コードを決める）。
+    A FORBIDDEN result is fail-fast: no later lifecycle is invoked. Other
+    OjpError values retain the existing best-effort behavior.
     """
     expired: list[Any] = []
     approved: list[Any] = []
@@ -79,10 +78,38 @@ def tick_once(
     reserved: list[Any] = []
     payments: list[Any] = []
     error: dict[str, str] | None = None
+
+    def _result() -> dict[str, Any]:
+        return {
+            "expired_leases": [r.data for r in expired],
+            "approved_submissions": [r.data for r in approved],
+            "resolved_disputes": [r.data for r in resolved],
+            "reserved_refunds": [r.data for r in reserved],
+            "processed_payments": [r.data for r in payments],
+            "counts": {
+                "expired_leases": len(expired),
+                "approved_submissions": len(approved),
+                "resolved_disputes": len(resolved),
+                "reserved_refunds": len(reserved),
+                "processed_payments": len(payments),
+            },
+            "error": error,
+        }
+
+    # Return the normal tick envelope on authorization failure so `tick --json`
+    # keeps its established shape and main can map the embedded error to exit 2.
+    try:
+        service._require_system_actor(conn, actor_id)
+    except OjpError as exc:
+        error = {"code": exc.code, "message": exc.message}
+        return _result()
+
     try:
         expired = service.expire_due_leases(conn, actor_id=actor_id, escrow=escrow)
     except OjpError as exc:
         error = {"code": exc.code, "message": exc.message}
+        if exc.code == ErrorCode.FORBIDDEN.value:
+            return _result()
     try:
         approved = service.approve_due_submissions(
             conn, actor_id=actor_id, escrow=escrow
@@ -93,6 +120,8 @@ def tick_once(
     except OjpError as exc:
         if error is None:
             error = {"code": exc.code, "message": exc.message}
+        if exc.code == ErrorCode.FORBIDDEN.value:
+            return _result()
     try:
         for root_id in _refundable_root_ids(conn):
             reserved.append(
@@ -100,25 +129,13 @@ def tick_once(
                     conn, actor_id=actor_id, root_id=root_id
                 )
             )
-        payments = service.process_payments(conn, escrow=escrow)
+        payments = service.process_payments(
+            conn, actor_id=actor_id, escrow=escrow
+        )
     except OjpError as exc:
         if error is None:
             error = {"code": exc.code, "message": exc.message}
-    return {
-        "expired_leases": [r.data for r in expired],
-        "approved_submissions": [r.data for r in approved],
-        "resolved_disputes": [r.data for r in resolved],
-        "reserved_refunds": [r.data for r in reserved],
-        "processed_payments": [r.data for r in payments],
-        "counts": {
-            "expired_leases": len(expired),
-            "approved_submissions": len(approved),
-            "resolved_disputes": len(resolved),
-            "reserved_refunds": len(reserved),
-            "processed_payments": len(payments),
-        },
-        "error": error,
-    }
+    return _result()
 
 
 def watch(

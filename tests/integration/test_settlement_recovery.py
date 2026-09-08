@@ -27,6 +27,7 @@ from tests.conftest import (
     CHILD_BUDGET_UNITS,
     REQUESTER_ID,
     ROOT_BUDGET_UNITS,
+    SYSTEM_ID,
     TEST_T0_US,
     insert_child_job,
     setup_ledger_demo_world,
@@ -410,7 +411,7 @@ def test_failpoints_are_rejected_in_realtime_mode(realtime_db, seam):
 
     # process_payments 経路: T1 開始前に拒否され、送金は行われない
     with pytest.raises(OjpError, match="test mode"):
-        service.process_payments(realtime_db.conn)
+        service.process_payments(realtime_db.conn, actor_id=SYSTEM_ID)
     _assert_nothing_moved_for_rejection(realtime_db.conn)
 
     # retry_payment 経路も同じ前置検査で拒否され、送金は行われない
@@ -426,7 +427,7 @@ def test_realtime_settles_normally_after_failpoints_cleared(realtime_db):
     assert ledger.failpoint_after_commit is None
     assert ledger.failpoint_after_receipt is None
 
-    results = service.process_payments(realtime_db.conn)
+    results = service.process_payments(realtime_db.conn, actor_id=SYSTEM_ID)
     assert len(results) == 1
     assert results[0].data["payment_status"] == PaymentStatus.SUCCEEDED.value
     _assert_converged(realtime_db.conn)

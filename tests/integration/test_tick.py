@@ -41,6 +41,7 @@ from ojp.domain import (
     PaymentStatus,
     TaskCatalogEntry,
     TimingPolicy,
+    ParticipantKind,
 )
 from tests.conftest import (
     AGENT_A_ID,
@@ -51,6 +52,7 @@ from tests.conftest import (
     TEST_T0_US,
     default_subcontract_policy,
     insert_demo_participants,
+    insert_participant,
     load_poc_catalog,
 )
 
@@ -296,6 +298,54 @@ def test_tick_advances_approval_and_payment(demo_db):
     payment = _payment(demo_db.conn, f"payout:{child_id}")
     assert payment["status"] == PaymentStatus.SUCCEEDED.value
     ledger.assert_ledger_invariants(demo_db.conn, root_id)
+
+
+def test_tick_and_payment_batch_reject_unrelated_actor_without_fund_effects(demo_db):
+    """A forbidden tick and direct batch call cannot execute a pending payout."""
+    root_id, child_id, submission_id = _submitted_child(demo_db, suffix="auth")
+    service.approve(
+        demo_db.conn,
+        actor_id=AGENT_A_ID,
+        job_id=child_id,
+        submission_id=submission_id,
+        operation_id="approve:auth",
+    )
+    with db.transaction(demo_db.conn, immediate=True):
+        insert_participant(demo_db.conn, "pt-unrelated", ParticipantKind.AGENT)
+
+    payment_before = demo_db.conn.execute(
+        "SELECT status, attempt_count FROM payment_operations WHERE business_key = ?",
+        (f"payout:{child_id}",),
+    ).fetchone()
+    receipts_before = demo_db.conn.execute(
+        "SELECT COUNT(*) FROM transfer_receipts"
+    ).fetchone()[0]
+    wallet_before = _wallets(demo_db.conn)[AGENT_B_ID]
+    journal_before = demo_db.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries"
+    ).fetchone()[0]
+
+    forbidden = scheduler.tick_once(demo_db.conn, actor_id="pt-unrelated")
+    assert forbidden["error"]["code"] == ErrorCode.FORBIDDEN.value
+    assert all(count == 0 for count in forbidden["counts"].values())
+    payment_after = demo_db.conn.execute(
+        "SELECT status, attempt_count FROM payment_operations WHERE business_key = ?",
+        (f"payout:{child_id}",),
+    ).fetchone()
+    assert tuple(payment_after) == tuple(payment_before)
+    assert demo_db.conn.execute("SELECT COUNT(*) FROM transfer_receipts").fetchone()[0] == receipts_before
+    assert _wallets(demo_db.conn)[AGENT_B_ID] == wallet_before
+    assert demo_db.conn.execute("SELECT COUNT(*) FROM journal_entries").fetchone()[0] == journal_before
+
+    with pytest.raises(service.OjpError) as exc_info:
+        service.process_payments(demo_db.conn, actor_id="pt-unrelated")
+    assert exc_info.value.code == ErrorCode.FORBIDDEN.value
+    assert demo_db.conn.execute("SELECT COUNT(*) FROM transfer_receipts").fetchone()[0] == receipts_before
+
+    allowed = scheduler.tick_once(demo_db.conn, actor_id=SYSTEM_ID)
+    assert allowed["counts"]["processed_payments"] == 1
+    assert demo_db.conn.execute("SELECT COUNT(*) FROM transfer_receipts").fetchone()[0] == receipts_before + 1
+    assert _wallets(demo_db.conn)[AGENT_B_ID] == wallet_before + TEN
 
 
 # ---------------------------------------------------------------------------

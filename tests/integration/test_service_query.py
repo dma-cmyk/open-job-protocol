@@ -549,7 +549,7 @@ def test_get_ledger_full_lifecycle_and_conservation(test_db):
     )
 
     # 送金処理 (process_payments)
-    service.process_payments(test_db.conn)
+    service.process_payments(test_db.conn, actor_id=SYSTEM_ID)
 
     # get_ledger 呼び出し
     ledger_data = service.get_ledger(test_db.conn, actor_id=REQUESTER_ID, root_id=root_id)

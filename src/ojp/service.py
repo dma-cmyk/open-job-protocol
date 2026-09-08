@@ -4625,18 +4625,18 @@ def process_single_payment(
 def process_payments(
     conn: sqlite3.Connection,
     *,
+    actor_id: str,
     escrow: ledger.EscrowPort | None = None,
     limit: int | None = None,
 ) -> list[CommandResult]:
-    """共通 settlement 処理（計画書 第15節 Lifecycle: process_payments）。
+    """System-only settlement lifecycle (plan sections 14 and 15).
 
-    PENDING / RETRYABLE（期限到来分）を取得し、同じ operation_id で Escrow
-    port の transfer を呼ぶ。1 件ずつ独立した transaction で処理し、1 件の
-    失敗で他の PaymentOperation の処理を止めない。送金失敗は
-    process_single_payment 内で RETRYABLE として記録されて件ごとの結果へ
-    反映される。記録不能な予期せぬ失敗（RuntimeError 等）だけが
-    呼出側へ伝播する。
+    Authorization is checked before reading due operations, so a non-system
+    actor cannot use even an otherwise empty batch as a settlement entrypoint.
+    ``process_single_payment`` remains authorization-neutral because the
+    separately authorized ``retry_payment`` command also delegates to it.
     """
+    _require_system_actor(conn, actor_id)
     escrow_port = escrow if escrow is not None else ledger.MockEscrow()
     now_us = clock.now_for_read_snapshot(conn)
     due = ledger.list_due_payment_operations(conn, now_us=now_us)
@@ -5075,6 +5075,38 @@ def get_job(
                 if disp_row is not None
                 else None
             )
+            # Compute the existing artifact permission once so both Submission
+            # and dispute resolution evidence use exactly the same policy.
+            artifact_readable = False
+            if sub_row is not None:
+                if actor["kind"] == domain.ParticipantKind.SYSTEM.value:
+                    artifact_readable = True
+                else:
+                    sub_lease = conn.execute(
+                        "SELECT worker_id FROM leases WHERE id = ?",
+                        (sub_row["lease_id"],),
+                    ).fetchone()
+                    if sub_lease is not None and sub_lease["worker_id"] == actor_id:
+                        artifact_readable = True
+                    else:
+                        requester_can_read = True
+                        if version_info is not None:
+                            access_pol = version_info.get("artifact_access_policy") or {}
+                            requester_can_read = bool(
+                                access_pol.get("requester_can_read", True)
+                            )
+                        if job_row["requester_id"] == actor_id and requester_can_read:
+                            artifact_readable = True
+                        else:
+                            root_job = conn.execute(
+                                "SELECT requester_id FROM jobs WHERE id = ?",
+                                (job_row["root_id"],),
+                            ).fetchone()
+                            if (
+                                root_job is not None
+                                and root_job["requester_id"] == actor_id
+                            ):
+                                artifact_readable = True
             deadlines_info = {
                 "job_deadline": job_deadline,
                 "lease_expires_at": lease_expires_at,
@@ -5096,8 +5128,30 @@ def get_job(
                 if acc_row is not None
                 else None
             )
-            dispute_info = (
-                {
+            dispute_info = None
+            if disp_row is not None:
+                resolution = (
+                    json.loads(disp_row["resolution"])
+                    if disp_row["resolution"] is not None
+                    else None
+                )
+                if resolution is not None and not artifact_readable:
+                    # Public: outcome/reason are stable decision codes;
+                    # condition_id, failed_condition_id, expected_value and
+                    # condition_matched describe public Version conditions;
+                    # verifier_id/verifier_hash and input_hash identify the
+                    # already-public Version verifier/input. Private: evidence
+                    # is the verifier trace (and in fallback the complete saved
+                    # verification_evidence); actual_value is derived from the
+                    # submitted artifact. Stored reason values are codes such as
+                    # OK/ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK and contain
+                    # no artifact-derived value.
+                    resolution = {
+                        key: value
+                        for key, value in resolution.items()
+                        if key not in {"evidence", "actual_value"}
+                    }
+                dispute_info = {
                     "dispute_id": disp_row["id"],
                     "status": disp_row["status"],
                     "reason_code": disp_row["reason_code"],
@@ -5105,11 +5159,8 @@ def get_job(
                     "opened_by": disp_row["opened_by"],
                     "opened_at": format_timestamp_us(disp_row["opened_at_us"]),
                     "due_at": format_timestamp_us(disp_row["due_at_us"]),
-                    "resolution": disp_row["resolution"],
+                    "resolution": resolution,
                 }
-                if disp_row is not None
-                else None
-            )
             verdict_info = {
                 "verification_result": (
                     sub_row["verification_result"] if sub_row is not None else None
@@ -5156,44 +5207,10 @@ def get_job(
                 for prow in pay_rows
             ]
 
-            # Submission & Artifact readability
+            # Submission (artifact_readable was computed before Verdict so the
+            # same decision also filters resolution evidence).
             submission_info: dict[str, Any] | None = None
             if sub_row is not None:
-                artifact_readable = False
-                if actor["kind"] == domain.ParticipantKind.SYSTEM.value:
-                    artifact_readable = True
-                else:
-                    sub_lease = conn.execute(
-                        "SELECT worker_id FROM leases WHERE id = ?",
-                        (sub_row["lease_id"],),
-                    ).fetchone()
-                    if sub_lease is not None and sub_lease["worker_id"] == actor_id:
-                        artifact_readable = True
-                    else:
-                        requester_can_read = True
-                        if version_info is not None:
-                            access_pol = (
-                                version_info.get("artifact_access_policy") or {}
-                            )
-                            requester_can_read = bool(
-                                access_pol.get("requester_can_read", True)
-                            )
-                        if (
-                            job_row["requester_id"] == actor_id
-                            and requester_can_read
-                        ):
-                            artifact_readable = True
-                        else:
-                            root_job = conn.execute(
-                                "SELECT requester_id FROM jobs WHERE id = ?",
-                                (job_row["root_id"],),
-                            ).fetchone()
-                            if (
-                                root_job is not None
-                                and root_job["requester_id"] == actor_id
-                            ):
-                                artifact_readable = True
-
                 submission_info = {
                     "submission_id": sub_row["id"],
                     "lease_id": sub_row["lease_id"],

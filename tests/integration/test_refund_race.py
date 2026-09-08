@@ -471,7 +471,7 @@ def _assert_refund_totals(conn, root_id, *, child_state):
 
 def _process_refunds_and_assert_final(conn, root_id):
     """返金予約を送金まで完了させ、返金累計 = 入金額 100・口座 0 を確認。"""
-    service.process_payments(conn)
+    service.process_payments(conn, actor_id=SYSTEM_ID)
     view = ledger.get_root_ledger_view(conn, root_id)
     assert view.refunded_units == ROOT_BUDGET_UNITS  # 返金累計 = 入金額
     assert view.refunded_units <= view.deposit_units

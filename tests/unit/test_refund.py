@@ -468,7 +468,7 @@ def test_refund_zero_balance_with_reservation_returns_result(demo_db):
         operation_id="abandon:zero-c1",
     )
     # 送金を済ませて口座残高（refund bucket）を 0 にする
-    service.process_payments(demo_db.conn)
+    service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     view = ledger.get_root_ledger_view(demo_db.conn, root_id)
     assert view.locked_breakdown_units["refund"] == 0
     assert view.refunded_units == ROOT_BUDGET_UNITS

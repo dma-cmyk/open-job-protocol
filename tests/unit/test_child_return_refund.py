@@ -188,7 +188,7 @@ def _assert_conservation(demo_db, root_id):
 
 def _settle_and_assert_final(demo_db, root_id, *, expected_refunded, expected_paid):
     """送金まで完了させ、返金累計・支払い累計・最終 Escrow を照合する。"""
-    service.process_payments(demo_db.conn)
+    service.process_payments(demo_db.conn, actor_id=SYSTEM_ID)
     view = ledger.get_root_ledger_view(demo_db.conn, root_id)
     assert view.refunded_units == expected_refunded
     assert view.paid_units == expected_paid
