@@ -27,8 +27,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
-from ojp import cli, domain, response, service
+from ojp import cli, domain, mcp_server, response, scheduler, service
 from ojp.domain import ErrorCode, OjpError
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -405,6 +406,57 @@ def test_exit_code_3_transient_error(tmp_path: Path, capsys, monkeypatch):
     assert out["ok"] is False
     assert out["error"]["code"] == "DB_BUSY"
     assert out["error"]["retryable"] is True
+
+def test_verification_unavailable_is_retryable_for_cli_mcp_and_tick(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """共通分類を通常 CLI・MCP 封筒・tick の全経路で使う。"""
+    root = tmp_path / "proj"
+    _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "demo", "init", "--json"],
+    )
+
+    def unavailable(*args, **kwargs):
+        raise OjpError(
+            ErrorCode.VERIFICATION_UNAVAILABLE,
+            "fixed verifier temporarily unavailable",
+        )
+
+    monkeypatch.setattr(service, "list_jobs", unavailable)
+    cli_code, cli_payload, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "job", "list", "--json"],
+    )
+    assert cli_code == response.EXIT_RETRYABLE
+    assert cli_payload["error"]["retryable"] is True
+    mcp_config = mcp_server.ServerConfig(
+        actor_id="pt-system", db_path=root / "data" / "ojp.sqlite3"
+    )
+    with pytest.raises(ToolError) as mcp_exc:
+        with mcp_server._open_session(mcp_config):
+            unavailable()
+    mcp_payload = json.loads(str(mcp_exc.value))
+    assert mcp_payload["error"]["code"] == ErrorCode.VERIFICATION_UNAVAILABLE.value
+    assert mcp_payload["error"]["retryable"] is True
+
+    monkeypatch.setattr(
+        scheduler,
+        "tick_once",
+        lambda *args, **kwargs: {
+            "error": {
+                "code": ErrorCode.VERIFICATION_UNAVAILABLE.value,
+                "message": "fixed verifier temporarily unavailable",
+            }
+        },
+    )
+    tick_code = scheduler.main(
+        ["--root", str(root), "--clock-mode", "test", "--once", "--json"]
+    )
+    tick_payload = json.loads(capsys.readouterr().out)
+    assert tick_code == response.EXIT_RETRYABLE
+    assert tick_payload["error"]["code"] == ErrorCode.VERIFICATION_UNAVAILABLE.value
+
 
 
 # ---------------------------------------------------------------------------

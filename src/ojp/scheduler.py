@@ -231,11 +231,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         error = result.get("error") if isinstance(result, dict) else None
         if error is not None:
-            code = error.get("code")
-            if code in (ErrorCode.DB_BUSY.value,):
-                return 3
-            return 2
-        return 0
+            return response.exit_code(str(error.get("code")))
+        return response.EXIT_OK
     except OjpError as exc:
         if args.json:
             print(
@@ -245,9 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
-        if exc.code in (ErrorCode.DB_BUSY,):
-            return 3
-        return 2
+        return response.exit_code(exc.code)
     except sqlite3.Error as exc:
         is_busy = db.is_db_busy(exc)
         payload = response.db_error_payload(exc, busy=is_busy)

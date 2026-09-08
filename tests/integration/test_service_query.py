@@ -182,6 +182,17 @@ def _resolve_dispute_with_value_mismatch(conn):
     assert len(results) == 1
     assert results[0].data["resolution"] == "FAIL"
 
+def _resolve_dispute_with_extra_artifact_key(conn):
+    """裁定時の過剰な提出キー名を持つ FAIL を再現する。"""
+    verification.arbiter_stored_artifact_override = (
+        lambda label: '{"sum":6,"confidential_name":1}'
+    )
+    try:
+        results = service.resolve_due_disputes(conn, actor_id=SYSTEM_ID)
+    finally:
+        verification.arbiter_stored_artifact_override = None
+    assert len(results) == 1
+    assert results[0].data["resolution"] == "FAIL_NOT_ON_DISPUTED_CONDITION"
 
 
 def _db_fingerprint(conn: sqlite3.Connection):
@@ -534,21 +545,46 @@ def test_get_job_dispute_resolution_artifact_permission_matrix(test_db):
     unrelated_resolution = service.get_job(
         test_db.conn, actor_id=UNRELATED_ID, job_id=child_id
     )["verdict"]["dispute"]["resolution"]
-    assert isinstance(unrelated_resolution, dict)
-    assert "evidence" not in unrelated_resolution
-    assert "actual_value" not in unrelated_resolution
-    for key in (
+    assert unrelated_resolution == {
+        key: system_resolution[key]
+        for key in (
+            "outcome",
+            "reason",
+            "condition_id",
+            "condition_matched",
+            "verifier_id",
+            "verifier_hash",
+        )
+    }
+
+
+def test_get_job_dispute_resolution_hides_extra_artifact_key(test_db):
+    """未権限 Actor には裁定で検出した過剰な提出キー名を公開しない。"""
+    _setup_world(test_db)
+    root_id, root_v = _create_open_root(test_db.conn, "resolution-extra-key")
+    child_info = _create_disputed_child(
+        test_db.conn, root_id, root_v, "resolution-extra-key"
+    )
+    _resolve_dispute_with_extra_artifact_key(test_db.conn)
+
+    system_resolution = service.get_job(
+        test_db.conn, actor_id=SYSTEM_ID, job_id=child_info["child_id"]
+    )["verdict"]["dispute"]["resolution"]
+    assert system_resolution["failed_condition_id"] == "confidential_name"
+    assert system_resolution["actual_value"] == 1
+
+    unrelated_resolution = service.get_job(
+        test_db.conn, actor_id=UNRELATED_ID, job_id=child_info["child_id"]
+    )["verdict"]["dispute"]["resolution"]
+    assert "confidential_name" not in json.dumps(unrelated_resolution)
+    assert set(unrelated_resolution) == {
         "outcome",
         "reason",
         "condition_id",
-        "failed_condition_id",
-        "expected_value",
         "condition_matched",
         "verifier_id",
         "verifier_hash",
-        "input_hash",
-    ):
-        assert unrelated_resolution[key] == system_resolution[key]
+    }
 
 
 def test_get_job_dispute_resolution_respects_requester_policy(test_db):

@@ -7,10 +7,11 @@ paid/refunded が増える、バックオフ 1/2/4/8/30…、終端へ落ちな�
 
 from __future__ import annotations
 
+import sqlite3
 import inspect
 import pytest
 
-from ojp import ledger, service
+from ojp import ledger, response, service
 from ojp.domain import ErrorCode, JobState, OjpError, PaymentStatus
 from tests.conftest import (
     AGENT_A_ID,
@@ -97,6 +98,89 @@ class FlakyEscrow(ledger.MockEscrow):
                 f"injected transfer failure #{self.calls}"
             )
         return super().transfer(conn, operation_id, payload)
+
+
+class SqliteFailingEscrow(ledger.MockEscrow):
+    """決済 transaction 内から指定した SQLite エラーを送出する port。"""
+
+    def __init__(self, error: sqlite3.Error) -> None:
+        self.error = error
+
+    def transfer(self, conn, operation_id, payload):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["process_single_payment", "retry_payment", "process_payments"],
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.OperationalError("disk I/O error"),
+        sqlite3.DatabaseError("database disk image is malformed"),
+    ],
+)
+def test_non_busy_sqlite_errors_from_settlement_are_deterministic(
+    test_db, entrypoint, error
+):
+    """決済経路の非 busy SQLite 障害は DB_BUSY に変換せず exit 2 相当。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    escrow = SqliteFailingEscrow(error)
+
+    with pytest.raises(type(error)) as exc_info:
+        if entrypoint == "process_single_payment":
+            service.process_single_payment(
+                test_db.conn, operation_id=PAYMENT_OP_ID, escrow=escrow
+            )
+        elif entrypoint == "retry_payment":
+            service.retry_payment(
+                test_db.conn,
+                actor_id=AGENT_B_ID,
+                operation_id=PAYMENT_OP_ID,
+                escrow=escrow,
+            )
+        else:
+            service.process_payments(
+                test_db.conn, actor_id=SYSTEM_ID, escrow=escrow
+            )
+
+    payload = response.db_error_payload(exc_info.value, busy=False)
+    assert payload["error"]["code"] == response.DB_ERROR_CODE
+    assert payload["error"]["retryable"] is False
+    assert response.exit_code(payload["error"]["code"]) == response.EXIT_VIOLATION
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.attempt_count == 0
+
+
+def test_busy_operational_error_keeps_retries_and_backoff(test_db, monkeypatch):
+    """busy は既存回数だけ再試行し、attempt_count は決済失敗として増やさない。"""
+    _setup_funded_child(test_db)
+    _reserve_child_payout(test_db)
+    escrow = SqliteFailingEscrow(sqlite3.OperationalError("database is locked"))
+    delays: list[float] = []
+    monkeypatch.setattr(service, "DB_BUSY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(service.time, "sleep", delays.append)
+    monkeypatch.setattr(service.random, "random", lambda: 0.5)
+
+    with pytest.raises(OjpError) as exc_info:
+        service.process_single_payment(
+            test_db.conn, operation_id=PAYMENT_OP_ID, escrow=escrow
+        )
+
+    assert exc_info.value.code == ErrorCode.DB_BUSY.value
+    assert len(delays) == 2
+    assert delays == [
+        service.DB_BUSY_BASE_DELAY_SECONDS,
+        service.DB_BUSY_BASE_DELAY_SECONDS * 2,
+    ]
+    payment = ledger.get_payment_operation(test_db.conn, PAYMENT_OP_ID)
+    assert payment is not None
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.attempt_count == 0
 
 
 # ---------------------------------------------------------------------------

@@ -4609,7 +4609,11 @@ def process_single_payment(
                     operation_id=operation_id,
                 )
         except sqlite3.OperationalError as exc:
-            if db.is_db_busy(exc) and attempt < DB_BUSY_MAX_ATTEMPTS - 1:
+            if not db.is_db_busy(exc):
+                # transport 共通分類に渡し、確定的 DB_ERROR / exit 2 とする。
+                # 決済予約の attempt_count とバックオフは変更しない。
+                raise
+            if attempt < DB_BUSY_MAX_ATTEMPTS - 1:
                 delay = min(
                     DB_BUSY_BASE_DELAY_SECONDS * (2**attempt),
                     DB_BUSY_MAX_DELAY_SECONDS,
@@ -5136,20 +5140,25 @@ def get_job(
                     else None
                 )
                 if resolution is not None and not artifact_readable:
-                    # Public: outcome/reason are stable decision codes;
-                    # condition_id, failed_condition_id, expected_value and
-                    # condition_matched describe public Version conditions;
-                    # verifier_id/verifier_hash and input_hash identify the
-                    # already-public Version verifier/input. Private: evidence
-                    # is the verifier trace (and in fallback the complete saved
-                    # verification_evidence); actual_value is derived from the
-                    # submitted artifact. Stored reason values are codes such as
-                    # OK/ARBITER_UNRESPONSIVE_STORED_PASS_FALLBACK and contain
-                    # no artifact-derived value.
+                    # 未権限 Actor には公開情報だけを allowlist で返す。outcome / reason /
+                    # condition_matched は固定判定器の判断コード、condition_id は異議対象の
+                    # 公開 Version 条件、verifier_id / verifier_hash は公開 Version 由来。
+                    # failed_condition_id / actual_value / input_hash / evidence は提出物または
+                    # 検証証跡由来。expected_value も過剰キー時だけ None になるため、その
+                    # 存在自体が判定分岐を漏らす。将来 resolution にキーが増えても既定で
+                    # 非公開になるよう、除外リストではなく公開許可リストを使う。
+                    public_resolution_keys = (
+                        "outcome",
+                        "reason",
+                        "condition_id",
+                        "condition_matched",
+                        "verifier_id",
+                        "verifier_hash",
+                    )
                     resolution = {
-                        key: value
-                        for key, value in resolution.items()
-                        if key not in {"evidence", "actual_value"}
+                        key: resolution[key]
+                        for key in public_resolution_keys
+                        if key in resolution
                     }
                 dispute_info = {
                     "dispute_id": disp_row["id"],
