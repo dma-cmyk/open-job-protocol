@@ -7,6 +7,7 @@ paid/refunded が増える、バックオフ 1/2/4/8/30…、終端へ落ちな�
 
 from __future__ import annotations
 
+import inspect
 import pytest
 
 from ojp import ledger, service
@@ -192,7 +193,7 @@ def test_settlement_after_receipt_is_reconciled_without_double_count(test_db):
     ).fetchone()["c"]
 
     # SUCCEEDED 済みの再処理（retry_payment 経路）
-    again = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    again = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert again.replayed is True
     assert again.data["already_succeeded"] is True
     # 期限到来分の再処理（process_payments は SUCCEEDED を拾わないので 0 件）
@@ -298,10 +299,10 @@ def test_retry_of_mismatched_receipt_records_again_without_success(test_db):
     _reserve_child_payout(test_db)
     _inject_mismatched_receipt(test_db, amount=1)
 
-    first = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    first = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert first.data["payment_status"] == PaymentStatus.RETRYABLE.value
     assert first.data["attempt_count"] == 1
-    second = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    second = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert second.data["payment_status"] == PaymentStatus.RETRYABLE.value
     assert second.data["attempt_count"] == 2
     assert "does not match" in second.data["last_error"]
@@ -428,7 +429,7 @@ def test_retry_not_due_is_not_processed(test_db):
     # まだ t0 のまま（next_retry_at_us = t0+1s）→ 対象外
     assert service.process_payments(test_db.conn, escrow=escrow) == []
     # 手動 retry は期限を無視して即時再試行できる
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert result.data["payment_status"] == PaymentStatus.SUCCEEDED.value
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
 
@@ -1112,7 +1113,7 @@ def test_succeeded_reprocess_fails_when_receipt_is_missing(test_db):
             "DELETE FROM transfer_receipts WHERE operation_id = ?", (PAYMENT_OP_ID,)
         )
 
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     # 成功としては返さない（already_succeeded は返らず、整合性エラーが返る）
     assert "already_succeeded" not in result.data
     assert result.data["consistency_error"] is True
@@ -1147,7 +1148,7 @@ def test_succeeded_reprocess_detects_receipt_amount_mismatch(test_db):
         " WHERE operation_id = ?",
         (PAYMENT_OP_ID,),
     )
-    result = service.retry_payment(test_db.conn, operation_id=PAYMENT_OP_ID)
+    result = service.retry_payment(test_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     assert "already_succeeded" not in result.data
     assert result.data["consistency_error"] is True
     assert "does not match" in result.data["last_error"]
@@ -1315,3 +1316,9 @@ def test_bool_and_non_int_amount_units_are_invalid_argument(test_db):
         assert exc_info.value.code == ErrorCode.INVALID_ARGUMENT.value
         assert _audit_snapshot(test_db.conn) == before
     ledger.assert_ledger_invariants(test_db.conn, ROOT_ID)
+
+def test_retry_payment_requires_explicit_actor_id() -> None:
+    """retry_payment の actor_id が既定値を持たず、呼出元の明示指定を強制することの回帰テスト。"""
+    sig = inspect.signature(service.retry_payment)
+    assert "actor_id" in sig.parameters
+    assert sig.parameters["actor_id"].default is inspect.Parameter.empty

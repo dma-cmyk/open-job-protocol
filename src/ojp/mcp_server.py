@@ -41,13 +41,19 @@ class ServerConfig:
 
 @contextlib.contextmanager
 def _open_session(config: ServerConfig) -> Iterator[sqlite3.Connection]:
-    """DB 接続を開き、終了時に確実に閉じる。OjpError は ToolError へ変換する。"""
+    """DB 接続を開き、終了時に確実に閉じる。OjpError と sqlite3.Error は ToolError へ変換する。"""
     conn = db.connect(config.db_path)
     try:
         yield conn
     except OjpError as exc:
         raise ToolError(
             json.dumps(response.failure(exc), ensure_ascii=False, sort_keys=True)
+        ) from exc
+    except sqlite3.Error as exc:
+        is_busy = db.is_db_busy(exc)
+        payload = response.db_error_payload(exc, busy=is_busy)
+        raise ToolError(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True)
         ) from exc
     finally:
         conn.close()

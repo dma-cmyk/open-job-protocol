@@ -641,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.group == "payment" and args.subcommand == "retry":
             result = service.retry_payment(
                 conn,
+                actor_id=args.actor,
                 operation_id=args.operation,
             )
 
@@ -675,27 +676,13 @@ def main(argv: list[str] | None = None) -> int:
         return response.exit_code(exc.code)
 
     except sqlite3.Error as exc:
+        is_busy = db.is_db_busy(exc)
+        payload = response.db_error_payload(exc, busy=is_busy)
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": {
-                            "code": ErrorCode.DB_BUSY.value
-                            if db.is_db_busy(exc)
-                            else "DB_ERROR",
-                            "message": str(exc),
-                            "retryable": True,
-                            "details": None,
-                        },
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         else:
-            print(f"Database error: {exc}", file=sys.stderr)
-        return response.EXIT_RETRYABLE
+            print(f"Database error ({payload['error']['code']}): {exc}", file=sys.stderr)
+        return response.exit_code(payload["error"]["code"])
 
     finally:
         if conn is not None:

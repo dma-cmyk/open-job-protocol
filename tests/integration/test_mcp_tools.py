@@ -4,7 +4,7 @@
 1. tools/list が第13節の8件と完全一致
 2. 返金・任意 fail/cancel tool が存在しない
 3. 8 tools すべてを一つのセッション等で実際に呼び出せる
-4. Actor 引数（actor_id, payee_id）を受け付けず、余分な引数が渡された呼出が失敗する
+4. Actor 引数（actor_id, payee_id）を受け付けず、注入された actor_id が実効 Actor にならないこと
 5. operation_id が書込6件で必須、読取2件に存在しない
 6. 同一 Actor・同一 payload の再送が同一結果（replayed=True）を返す
 7. ドメインエラーが SDK の tool エラー（is_error=True）かつ {"ok": false, "error": {...}} として識別できる
@@ -172,7 +172,7 @@ async def test_tools_list_exact_match(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Actor 引数を受け付けず、余分な引数が渡された呼出が失敗する
+# 4. Actor 引数を受け付けず、注入された actor_id が実効 Actor にならないこと
 # 5. operation_id が書込6件で必須、読取2件に存在しない
 # ---------------------------------------------------------------------------
 
@@ -226,20 +226,18 @@ async def test_schema_constraints_and_actor_rejection(tmp_path: Path) -> None:
                 "actor_id": "pt-agent-b",
             },
         )
-        # 余分引数を SDK が拒否して is_error=True になるか、無視して起動 Actor で実行されるかのいずれかを許容する。
-        # 不変条件は「注入された actor_id（pt-agent-b）が実効 Actor にならないこと」である。
-        if res_claim.is_error:
-            assert True
-        else:
-            payload = _parse_content_payload(res_claim)
-            assert payload["ok"] is True
-            # 当該 Job を取得し、実効 Worker が起動 Actor（pt-agent-a）であり注入した pt-agent-b ではないことを検証
-            res_after = await session.call_tool("ojp_get_job", arguments={"job_id": root_id})
-            assert not res_after.is_error
-            lease = _parse_content_payload(res_after)["data"]["lease"]
-            assert lease is not None
-            assert lease["worker_id"] == "pt-agent-a"
-            assert lease["worker_id"] != "pt-agent-b"
+        # 注入された actor_id（pt-agent-b）が実効 Actor にならないことを検証する。
+        # 現行 SDK は schema 外の余分引数を無視して起動 Actor (pt-agent-a) で実行する。
+        assert res_claim.is_error is False
+        payload = _parse_content_payload(res_claim)
+        assert payload["ok"] is True
+        # 当該 Job を取得し、実効 Worker が起動 Actor（pt-agent-a）であり注入した pt-agent-b ではないことを検証
+        res_after = await session.call_tool("ojp_get_job", arguments={"job_id": root_id})
+        assert not res_after.is_error
+        lease = _parse_content_payload(res_after)["data"]["lease"]
+        assert lease is not None
+        assert lease["worker_id"] == "pt-agent-a"
+        assert lease["worker_id"] != "pt-agent-b"
 
 # ---------------------------------------------------------------------------
 # 3. 8 tools すべてを実際に呼べる（一つのセッションで7件順次 + dispute実呼）

@@ -5,7 +5,7 @@ CLI と MCP が同じ応答構造を返し、再試行可能な一時障害と
 """
 
 from __future__ import annotations
-
+import sqlite3
 from typing import Any
 
 from .domain import ErrorCode, OjpError
@@ -13,6 +13,8 @@ from .domain import ErrorCode, OjpError
 EXIT_OK = 0
 EXIT_VIOLATION = 2
 EXIT_RETRYABLE = 3
+
+DB_ERROR_CODE = "DB_ERROR"   # busy でない確定的な DB エラー。retryable ではない
 
 RETRYABLE_CODES: frozenset[str] = frozenset(
     {
@@ -45,17 +47,33 @@ def success(
     return res
 
 
-def failure(exc: OjpError) -> dict[str, Any]:
-    """失敗時の共通応答封筒を構築する。"""
+def failure_payload(
+    code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """失敗封筒を code/message から組む。retryable は is_retryable(code) で導出する。"""
     return {
         "ok": False,
         "error": {
-            "code": exc.code,
-            "message": exc.message,
-            "retryable": is_retryable(exc.code),
-            "details": exc.details,
+            "code": code,
+            "message": message,
+            "retryable": is_retryable(code),
+            "details": details,
         },
     }
+
+
+def failure(exc: OjpError) -> dict[str, Any]:
+    """失敗時の共通応答封筒を構築する（failure_payload へ委譲）。"""
+    return failure_payload(exc.code, exc.message, details=exc.details)
+
+
+def db_error_payload(exc: sqlite3.Error, *, busy: bool) -> dict[str, Any]:
+    """sqlite3.Error を封筒へ。busy なら DB_BUSY、そうでなければ DB_ERROR。"""
+    code = ErrorCode.DB_BUSY.value if busy else DB_ERROR_CODE
+    return failure_payload(code, str(exc))
 
 
 def exit_code(code: str) -> int:

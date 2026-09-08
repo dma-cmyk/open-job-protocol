@@ -415,7 +415,7 @@ def test_failpoints_are_rejected_in_realtime_mode(realtime_db, seam):
 
     # retry_payment 経路も同じ前置検査で拒否され、送金は行われない
     with pytest.raises(OjpError, match="test mode"):
-        service.retry_payment(realtime_db.conn, operation_id=PAYMENT_OP_ID)
+        service.retry_payment(realtime_db.conn, actor_id=AGENT_B_ID, operation_id=PAYMENT_OP_ID)
     _assert_nothing_moved_for_rejection(realtime_db.conn)
 
 

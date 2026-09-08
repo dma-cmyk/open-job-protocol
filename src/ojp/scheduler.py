@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock, db, domain, ledger, service
+from . import clock, db, domain, ledger, response, service
 from .domain import ErrorCode, OjpError
 
 DEFAULT_ACTOR_ID = "pt-system"
@@ -232,15 +232,17 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         return 2
     except sqlite3.Error as exc:
+        is_busy = db.is_db_busy(exc)
+        payload = response.db_error_payload(exc, busy=is_busy)
         if args.json:
             print(
                 json.dumps(
-                    {"error": {"code": "DB_ERROR", "message": str(exc)}},
+                    payload,
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
-        return 3
+        return response.exit_code(payload["error"]["code"])
     finally:
         if conn is not None:
             conn.close()

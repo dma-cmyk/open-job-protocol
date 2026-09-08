@@ -4655,19 +4655,76 @@ def process_payments(
 def retry_payment(
     conn: sqlite3.Connection,
     *,
+    actor_id: str,
     operation_id: str,
     escrow: ledger.EscrowPort | None = None,
 ) -> CommandResult:
-    """CLI `ojp payment retry OPERATION` 相当: 同じ支払い ID を再処理する。
+    """CLI `ojp payment retry OPERATION` 相当: 同じ支払い ID を再処理する（計画書 第14節）。
 
-    金額・受取人・原資は PaymentOperation 作成時の固定値からしか取らない
-    （payload を外部から受け取らない）。next_retry_at_us を無視して即時
-    再試行する手動経路であり、バックオフ自体は変えない。SUCCEEDED 済み
-    なら Receipt の存在と金額・受取人・原資の一致を照合する
-    （Receipt が正本。欠落・不一致は成功として返さない）。
+    認可の導出根拠（計画書 第14節「payment retry は予約の支払元 Requester・受取 Worker・system に限定する」）:
+    無関係な第三者が資金効果の実行契機を操作することを防ぐため、本コマンドは次の4条件の
+    いずれかを満たす正当な関係者 Actor に限定して即時再試行を許可する:
+    1. system Actor: 運用者または自動デーモンによる回復処理。
+    2. 受取 Worker (payment_operations.payee_id): 送金を受け取る権利を持つ当事者。
+    3. 支払元 Requester (job_id の jobs.requester_id): 当該 Job の発注・承認を行った支払元。
+    4. Root Requester (root_id の jobs.requester_id): 全体予算の拠出者（第14節で refund が
+       Root Requester に許可されているのと同等の範囲）。
+
+    検査順序:
+    1. actor_id が participants に登録されていなければ FORBIDDEN
+    2. payment_operations に operation_id の行が存在しなければ INVALID_TARGET
+    3. 上記4条件のいずれにも合致しなければ FORBIDDEN
+    4. 認可成立後、process_single_payment へ委譲して決済を再処理する
     """
-    return process_single_payment(conn, operation_id=operation_id, escrow=escrow)
+    with db.transaction(conn, immediate=False):
+        actor_row = conn.execute(
+            "SELECT id, kind FROM participants WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if actor_row is None:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor not registered as participant: {actor_id}",
+            )
 
+        payment_row = conn.execute(
+            "SELECT operation_id, root_id, job_id, payee_id FROM payment_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if payment_row is None:
+            raise OjpError(
+                ErrorCode.INVALID_TARGET,
+                f"payment operation not found: {operation_id}",
+            )
+
+        is_authorized = False
+        if actor_row["kind"] == domain.ParticipantKind.SYSTEM.value:
+            is_authorized = True
+        elif actor_id == payment_row["payee_id"]:
+            is_authorized = True
+        else:
+            job_row = conn.execute(
+                "SELECT id, requester_id FROM jobs WHERE id = ?",
+                (payment_row["job_id"],),
+            ).fetchone()
+            root_row = conn.execute(
+                "SELECT id, requester_id FROM jobs WHERE id = ?",
+                (payment_row["root_id"],),
+            ).fetchone()
+
+            job_requester = job_row["requester_id"] if job_row is not None else None
+            root_requester = root_row["requester_id"] if root_row is not None else None
+
+            if actor_id in (job_requester, root_requester):
+                is_authorized = True
+
+        if not is_authorized:
+            raise OjpError(
+                ErrorCode.FORBIDDEN,
+                f"actor {actor_id} is not authorized to retry payment {operation_id} "
+                f"(must be system, payee {payment_row['payee_id']}, job requester, or root requester)",
+            )
+
+    return process_single_payment(conn, operation_id=operation_id, escrow=escrow)
 
 # ---------------------------------------------------------------------------
 # Query API（計画書 第13節・第14節・第15節）

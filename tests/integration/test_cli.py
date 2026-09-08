@@ -1116,4 +1116,202 @@ def test_payment_retry_argument_propagation(tmp_path: Path, capsys):
     )
     assert code == 2
     assert out["ok"] is False
-    assert out["error"]["code"] == "INVALID_STATE"
+    assert out["error"]["code"] == "INVALID_TARGET"
+
+
+def test_payment_retry_authorization_matrix(tmp_path: Path, capsys):
+    """R1: payment retry の認可マトリクス検証（計画書 第14節）。
+
+    検証手法の選択:
+    test mode DB において failpoint を用いた不安定なエラー注入を避け、
+    E2E フロー（approve -> tick）で正常に SUCCEEDED 済みに収束した PaymentOperation に対する
+    再試行経路を選択した。
+    理由:
+    service.retry_payment の認可検査は process_single_payment の前段で走るため、
+    PaymentOperation が PENDING/RETRYABLE/SUCCEEDED のいずれであっても同一の認可判定ロジックが
+    実行される。SUCCEEDED 済みの経路は決定論的であり、Receipt との一致確認を経て exit 0 を返す
+    ことが保証されているため、認可マトリクス（4条件の正当 Actor と無関係 Actor の拒否）を
+    最も確実かつ高速に検証できる。
+
+    検証内容:
+    - 受取 Worker (payee_id = pt-agent-b) -> exit 0
+    - Child Requester (job_id requester = pt-agent-a) -> exit 0
+    - Root Requester (root_id requester = pt-requester) -> exit 0
+    - system (pt-system) -> exit 0
+    - 無関係 Actor (pt-unrelated) -> exit 2 かつ error.code == "FORBIDDEN"
+    - 無関係 Actor の拒否呼び出しの前後で status と attempt_count が変化しないこと
+    - 存在しない operation_id -> exit 2 かつ INVALID_TARGET
+    """
+    root = tmp_path / "proj"
+    # 前準備: E2E で Child 送金を SUCCEEDED まで完了させる
+    _run_cli(capsys, ["--root", str(root), "--clock-mode", "test", "demo", "init", "--json"])
+    _, create_out, _ = _run_cli(
+        capsys,
+        [
+            "--root", str(root), "--clock-mode", "test", "--actor", "pt-requester",
+            "job", "create", "--card", str(ROOT_CARD_PATH), "--json",
+        ],
+    )
+    root_id = create_out["data"]["job_id"]
+    root_v_id = create_out["data"]["version_id"]
+    _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "--actor", "pt-requester", "job", "fund", root_id, "--amount", "100.000000", "--json"],
+    )
+    _, claim_out, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "--actor", "pt-agent-a", "job", "claim", root_id, "--version", root_v_id, "--json"],
+    )
+    root_lease_id = claim_out["data"]["lease_id"]
+    _, child_out, _ = _run_cli(
+        capsys,
+        [
+            "--root", str(root), "--clock-mode", "test", "--actor", "pt-agent-a",
+            "child", "create", root_id, "--lease", root_lease_id, "--task", "part-1",
+            "--budget", "10.000000", "--deadline", "2027-01-16T00:00:00.000000Z", "--json",
+        ],
+    )
+    child_id = child_out["data"]["child_id"]
+    child_v_id = child_out["data"]["version_id"]
+    _, cclaim_out, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "--actor", "pt-agent-b", "job", "claim", child_id, "--version", child_v_id, "--json"],
+    )
+    child_lease_id = cclaim_out["data"]["lease_id"]
+    artifact_path = tmp_path / "art.json"
+    artifact_path.write_text(json.dumps({"sum": 6}), encoding="utf-8")
+    _, submit_out, _ = _run_cli(
+        capsys,
+        [
+            "--root", str(root), "--clock-mode", "test", "--actor", "pt-agent-b",
+            "job", "submit", child_id, "--lease", child_lease_id, "--version", child_v_id,
+            "--artifact", str(artifact_path), "--json",
+        ],
+    )
+    sub_id = submit_out["data"]["submission_id"]
+    _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "--actor", "pt-agent-a", "job", "approve", child_id, "--submission", sub_id, "--json"],
+    )
+    # tick で送金確定
+    _run_cli(capsys, ["--root", str(root), "--clock-mode", "test", "tick", "--once", "--json"])
+
+    # DB から Child payout の PaymentOperation を取得
+    conn = sqlite3.connect(root / "data" / "ojp.sqlite3")
+    op_row = conn.execute(
+        "SELECT operation_id, status, attempt_count, payee_id, job_id, root_id FROM payment_operations WHERE job_id = ? AND kind = 'payout'",
+        (child_id,),
+    ).fetchone()
+    assert op_row is not None
+    op_id = op_row[0]
+    initial_status = op_row[1]
+    initial_attempts = op_row[2]
+    assert initial_status == "SUCCEEDED"
+
+    # 無関係 Actor (pt-unrelated) を登録
+    conn.execute("INSERT INTO participants (id, label, kind) VALUES ('pt-unrelated', 'pt-unrelated', 'agent')")
+    conn.commit()
+    conn.close()
+
+    # 1. 無関係 Actor による拒否検証
+    code_unrel, out_unrel, _ = _run_cli(
+        capsys,
+        [
+            "--root", str(root), "--clock-mode", "test", "--actor", "pt-unrelated",
+            "payment", "retry", op_id, "--json",
+        ],
+    )
+    assert code_unrel == 2
+    assert out_unrel["ok"] is False
+    assert out_unrel["error"]["code"] == "FORBIDDEN"
+
+    # 拒否呼び出しの前後で status と attempt_count が不変であることを検証
+    conn = sqlite3.connect(root / "data" / "ojp.sqlite3")
+    check_row = conn.execute(
+        "SELECT status, attempt_count FROM payment_operations WHERE operation_id = ?",
+        (op_id,),
+    ).fetchone()
+    conn.close()
+    assert check_row[0] == initial_status
+    assert check_row[1] == initial_attempts
+
+    # 2. 認可された Actor 4種による再試行検証（すべて exit 0）
+    authorized_actors = [
+        "pt-agent-b",    # 受取 Worker (payee_id)
+        "pt-agent-a",    # Child Requester (jobs.requester_id)
+        "pt-requester",  # Root Requester (root.requester_id)
+        "pt-system",     # system Actor
+    ]
+    for actor in authorized_actors:
+        code_auth, out_auth, _ = _run_cli(
+            capsys,
+            [
+                "--root", str(root), "--clock-mode", "test", "--actor", actor,
+                "payment", "retry", op_id, "--json",
+            ],
+        )
+        assert code_auth == 0, f"actor {actor} should be authorized to retry payment"
+        assert out_auth["ok"] is True
+
+
+def test_db_error_classification_and_exit_codes(tmp_path: Path, capsys, monkeypatch):
+    """R2: DB エラーの分類（busy=3, 非busy=2）と exit code 一致の検証。"""
+    # response 定義の直接検証
+    assert response.exit_code(response.DB_ERROR_CODE) == 2
+    assert response.is_retryable(response.DB_ERROR_CODE) is False
+    assert response.exit_code("DB_BUSY") == 3
+    assert response.is_retryable("DB_BUSY") is True
+
+    root = tmp_path / "proj"
+    _run_cli(capsys, ["--root", str(root), "--clock-mode", "test", "demo", "init", "--json"])
+
+    # 1. 非 busy な sqlite3.Error (例: OperationalError("no such table: jobs"))
+    def mock_non_busy_db_error(*args, **kwargs):
+        raise sqlite3.OperationalError("no such table: jobs")
+
+    monkeypatch.setattr(service, "list_jobs", mock_non_busy_db_error)
+
+    code_non_busy, out_non_busy, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "job", "list", "--json"],
+    )
+    assert code_non_busy == 2
+    assert out_non_busy["ok"] is False
+    assert out_non_busy["error"]["code"] == response.DB_ERROR_CODE
+    assert out_non_busy["error"]["retryable"] is False
+
+    # 2. busy な sqlite3.Error (例: OperationalError("database is locked"))
+    def mock_busy_db_error(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "list_jobs", mock_busy_db_error)
+
+    code_busy, out_busy, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "job", "list", "--json"],
+    )
+    assert code_busy == 3
+    assert out_busy["ok"] is False
+    assert out_busy["error"]["code"] == "DB_BUSY"
+    assert out_busy["error"]["retryable"] is True
+
+    # 3. ojp tick 経路でも同一分類になること
+    monkeypatch.setattr(service, "expire_due_leases", mock_non_busy_db_error)
+    code_tick_non_busy, out_tick_non_busy, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "tick", "--once", "--json"],
+    )
+    assert code_tick_non_busy == 2
+    assert out_tick_non_busy["ok"] is False
+    assert out_tick_non_busy["error"]["code"] == response.DB_ERROR_CODE
+    assert out_tick_non_busy["error"]["retryable"] is False
+
+    monkeypatch.setattr(service, "expire_due_leases", mock_busy_db_error)
+    code_tick_busy, out_tick_busy, _ = _run_cli(
+        capsys,
+        ["--root", str(root), "--clock-mode", "test", "tick", "--once", "--json"],
+    )
+    assert code_tick_busy == 3
+    assert out_tick_busy["ok"] is False
+    assert out_tick_busy["error"]["code"] == "DB_BUSY"
+    assert out_tick_busy["error"]["retryable"] is True
