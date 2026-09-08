@@ -29,7 +29,7 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from ojp import cli, db, domain, scheduler, service
+from ojp import cli, db, domain, scheduler, service, verification
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 ROOT_CARD_PATH = FIXTURES_DIR / "poc_root_card.json"
@@ -658,6 +658,87 @@ async def test_authorized_get_job_artifact_permission(tmp_path: Path) -> None:
         assert sub_other is not None
         assert sub_other["artifact_readable"] is False
         assert "artifact_json" not in sub_other
+
+
+@pytest.mark.anyio
+async def test_get_job_filters_dispute_resolution_over_mcp(tmp_path: Path) -> None:
+    """MCP の共通応答封筒でも resolution は JSON object であり、
+    成果物を読めない Actor には evidence と actual_value を返さない。"""
+    _init_db(tmp_path)
+    root_id = _create_and_fund_root(tmp_path, "resolution")
+
+    conn = db.connect(scheduler.resolve_db_path(tmp_path))
+    try:
+        conn.execute(
+            "INSERT INTO participants (id, label, kind) VALUES (?, ?, ?)",
+            ("pt-agent-c", "pt-agent-c", "agent"),
+        )
+        conn.commit()
+        root_version = service.get_job(
+            conn, actor_id="pt-agent-a", job_id=root_id
+        )["version"]["version_id"]
+        root_claim = service.claim(
+            conn,
+            actor_id="pt-agent-a",
+            job_id=root_id,
+            expected_version_id=root_version,
+            operation_id="claim:resolution-root",
+        )
+        child = service.create_child(
+            conn,
+            actor_id="pt-agent-a",
+            parent_job_id=root_id,
+            lease_id=root_claim.data["lease_id"],
+            task_key="part-1",
+            budget_units=10_000_000,
+            deadline_us=1_800_003_600_000_000,
+            operation_id="create:resolution-child",
+        )
+        child_id = child.data["child_id"]
+        child_claim = service.claim(
+            conn,
+            actor_id="pt-agent-b",
+            job_id=child_id,
+            expected_version_id=child.data["version_id"],
+            operation_id="claim:resolution-child",
+        )
+        submission = service.submit(
+            conn,
+            actor_id="pt-agent-b",
+            job_id=child_id,
+            lease_id=child_claim.data["lease_id"],
+            version_id=child.data["version_id"],
+            artifact_json=json.dumps({"sum": 6}),
+            operation_id="submit:resolution-child",
+        )
+        service.dispute(
+            conn,
+            actor_id="pt-agent-a",
+            job_id=child_id,
+            submission_id=submission.data["submission_id"],
+            condition_id="sum",
+            reason_code="CONDITION_MISMATCH",
+            operation_id="dispute:resolution-child",
+        )
+        verification.arbiter_stored_artifact_override = lambda label: '{"sum": 7}'
+        try:
+            resolved = service.resolve_due_disputes(conn, actor_id="pt-system")
+        finally:
+            verification.arbiter_stored_artifact_override = None
+        assert resolved[0].data["resolution"] == "FAIL"
+    finally:
+        conn.close()
+
+    async with _connect_mcp(tmp_path, "pt-agent-c") as session:
+        result = await session.call_tool("ojp_get_job", arguments={"job_id": child_id})
+        assert not result.is_error
+        payload = _parse_content_payload(result)
+        resolution = payload["data"]["verdict"]["dispute"]["resolution"]
+        assert isinstance(resolution, dict)
+        assert resolution["outcome"] == "FAIL"
+        assert resolution["reason"] == "ARTIFACT_VALUE_MISMATCH"
+        assert "evidence" not in resolution
+        assert "actual_value" not in resolution
 
 
 # ---------------------------------------------------------------------------

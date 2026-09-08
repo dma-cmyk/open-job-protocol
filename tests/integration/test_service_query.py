@@ -64,7 +64,14 @@ def _setup_world(handle, *, seed_balance=ROOT_BUDGET_UNITS * 50):
             )
 
 
-def _create_open_root(conn, suffix, *, budget="100.000000", budget_units=ROOT_BUDGET_UNITS):
+def _create_open_root(
+    conn,
+    suffix,
+    *,
+    budget="100.000000",
+    budget_units=ROOT_BUDGET_UNITS,
+    requester_can_read=True,
+):
     root_def, task_catalog = load_poc_catalog()
     created = service.create_root(
         conn,
@@ -78,6 +85,9 @@ def _create_open_root(conn, suffix, *, budget="100.000000", budget_units=ROOT_BU
         verifier_id=verification.VERIFIER_ID,
         verifier_hash=verification.verifier_hash(),
         conditions_json=ledger.canonical_json_dumps(root_def.expected),
+        artifact_access_policy=domain.ArtifactAccessPolicy(
+            requester_can_read=requester_can_read
+        ),
         operation_id=f"create:root:{suffix}",
     )
     root_id = created.data["job_id"]
@@ -145,6 +155,33 @@ def _create_and_submit_child(conn, root_id, root_version_id, suffix):
         "child_lease_id": child_lease_id,
         "submission_id": sub_id,
     }
+
+
+def _create_disputed_child(conn, root_id, root_version_id, suffix):
+    """Child の有効提出へ異議を作成し、OPEN の dispute 情報を返す。"""
+    child_info = _create_and_submit_child(conn, root_id, root_version_id, suffix)
+    disputed = service.dispute(
+        conn,
+        actor_id=AGENT_A_ID,
+        job_id=child_info["child_id"],
+        submission_id=child_info["submission_id"],
+        condition_id="sum",
+        reason_code="CONDITION_MISMATCH",
+        operation_id=f"dispute:child:{suffix}",
+    )
+    return {**child_info, "dispute_id": disputed.data["dispute_id"]}
+
+
+def _resolve_dispute_with_value_mismatch(conn):
+    """裁定時の保存成果物を差し替え、actual_value を持つ FAIL を再現する。"""
+    verification.arbiter_stored_artifact_override = lambda label: '{"sum": 7}'
+    try:
+        results = service.resolve_due_disputes(conn, actor_id=SYSTEM_ID)
+    finally:
+        verification.arbiter_stored_artifact_override = None
+    assert len(results) == 1
+    assert results[0].data["resolution"] == "FAIL"
+
 
 
 def _db_fingerprint(conn: sqlite3.Connection):
@@ -450,6 +487,97 @@ def test_get_job_artifact_permission_matrix(test_db):
     assert "verification_evidence" not in sub_unrelated
     assert "artifact_hash" in sub_unrelated
     assert sub_unrelated["verification_result"] == "PASS"
+
+
+def test_get_job_dispute_resolution_artifact_permission_matrix(test_db):
+    """5a. 裁定根拠は成果物と同じ読取権を使い、権限保持者だけが証跡と
+    実値を取得する。OPEN 中は None、RESOLVED 後は canonical JSON を parse
+    済みの dict として返す。"""
+    _setup_world(test_db)
+    root_id, root_v = _create_open_root(test_db.conn, "resolution-perm")
+    child_info = _create_disputed_child(
+        test_db.conn, root_id, root_v, "resolution-perm"
+    )
+    child_id = child_info["child_id"]
+
+    open_resolution = service.get_job(
+        test_db.conn, actor_id=SYSTEM_ID, job_id=child_id
+    )["verdict"]["dispute"]["resolution"]
+    assert open_resolution is None
+
+    _resolve_dispute_with_value_mismatch(test_db.conn)
+    stored_resolution = json.loads(
+        test_db.conn.execute(
+            "SELECT resolution FROM disputes WHERE id = ?",
+            (child_info["dispute_id"],),
+        ).fetchone()["resolution"]
+    )
+
+    system_resolution = service.get_job(
+        test_db.conn, actor_id=SYSTEM_ID, job_id=child_id
+    )["verdict"]["dispute"]["resolution"]
+    assert isinstance(system_resolution, dict)
+    assert system_resolution == stored_resolution
+    assert system_resolution["evidence"] is not None
+    assert system_resolution["actual_value"] == 7
+
+    # 提出 Worker、Child Requester、Root Requester は完全な裁定根拠を取得する。
+    for actor_id in (AGENT_B_ID, AGENT_A_ID, REQUESTER_ID):
+        resolution = service.get_job(
+            test_db.conn, actor_id=actor_id, job_id=child_id
+        )["verdict"]["dispute"]["resolution"]
+        assert isinstance(resolution, dict)
+        assert resolution == system_resolution
+        assert "evidence" in resolution
+        assert "actual_value" in resolution
+
+    unrelated_resolution = service.get_job(
+        test_db.conn, actor_id=UNRELATED_ID, job_id=child_id
+    )["verdict"]["dispute"]["resolution"]
+    assert isinstance(unrelated_resolution, dict)
+    assert "evidence" not in unrelated_resolution
+    assert "actual_value" not in unrelated_resolution
+    for key in (
+        "outcome",
+        "reason",
+        "condition_id",
+        "failed_condition_id",
+        "expected_value",
+        "condition_matched",
+        "verifier_id",
+        "verifier_hash",
+        "input_hash",
+    ):
+        assert unrelated_resolution[key] == system_resolution[key]
+
+
+def test_get_job_dispute_resolution_respects_requester_policy(test_db):
+    """5b. requester_can_read=false では Child Requester の提出物と裁定根拠を
+    非公開にする一方、Root Requester の読取権は実装どおり維持する。"""
+    _setup_world(test_db)
+    root_id, root_v = _create_open_root(
+        test_db.conn, "resolution-policy", requester_can_read=False
+    )
+    child_info = _create_disputed_child(
+        test_db.conn, root_id, root_v, "resolution-policy"
+    )
+    _resolve_dispute_with_value_mismatch(test_db.conn)
+    child_requester_view = service.get_job(
+        test_db.conn, actor_id=AGENT_A_ID, job_id=child_info["child_id"]
+    )
+    assert child_requester_view["submission"]["artifact_readable"] is False
+    child_requester_resolution = child_requester_view["verdict"]["dispute"]["resolution"]
+    assert "evidence" not in child_requester_resolution
+    assert "actual_value" not in child_requester_resolution
+
+    # Root Requester は requester_can_read の分岐とは独立して常に読取可能。
+    root_requester_view = service.get_job(
+        test_db.conn, actor_id=REQUESTER_ID, job_id=child_info["child_id"]
+    )
+    assert root_requester_view["submission"]["artifact_readable"] is True
+    root_requester_resolution = root_requester_view["verdict"]["dispute"]["resolution"]
+    assert root_requester_resolution["evidence"] is not None
+    assert root_requester_resolution["actual_value"] == 7
 
 
 # ---------------------------------------------------------------------------
