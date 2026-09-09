@@ -186,6 +186,10 @@ class Snapshot:
     receipts: list[dict[str, Any]]
     wallet_units: dict[str, int]
     journal: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+    submission_attempts: list[dict[str, Any]]
+    disputes: list[dict[str, Any]]
+    child_budget_units: dict[str, int]
 
     # -- 導出 -------------------------------------------------------------
 
@@ -240,6 +244,16 @@ class Snapshot:
                 if lease["id"] == lease_id:
                     return str(lease["worker_id"])
         return None
+
+    def events_for(self, job_id: str, action: str) -> list[dict[str, Any]]:
+        return [
+            event
+            for event in self.events
+            if event["job_id"] == job_id and event["action"] == action
+        ]
+
+    def attempts_for(self, job_id: str) -> list[dict[str, Any]]:
+        return [a for a in self.submission_attempts if a["job_id"] == job_id]
 
     def journal_moves(self, bucket: str) -> list[dict[str, Any]]:
         """指定 bucket の口座に対する Journal 明細（reason 付き）を古い順に返す。
@@ -364,6 +378,105 @@ def check_payee_entitlement(snapshot: Snapshot) -> list[str]:
     return violations
 
 
+def check_no_double_counting(snapshot: Snapshot) -> list[str]:
+    """親子で同じ資金を二重計上していないことを検証する（計画書 第18節 N14）。
+
+    保存則（D = E + paid + refunded）は総額しか見ないため、同じ 10 が
+    「Child の payout」と「Parent の payout」の両方に数えられていても、
+    どこかで相殺されていれば成立してしまう。ここでは総額ではなく
+    **Child ごとの原資の行き先**を、集計済み locked 内訳とは独立に
+    `accounts`（owner_job_id + bucket）・`journal`（口座別 delta）・
+    `receipts`（job_id 別の確定送金）から導出して照合する:
+
+    1. `allocated(c)`（Child 口座 child_work への総流入）は公開 Version の
+       予算と一致する（allocate は Child 1 件につき 1 回だけ）
+    2. `moved_to_payout(c)`（child_payout への総流入）== `child_payout` 残高
+       ＋ その Child への確定 payout（同じ 10 を予約と送金で二重に数えない）
+    3. `returned(c)` = allocated − child_work 残高 − moved_to_payout は非負
+       （承認と返却の両方へ同時に流れていない）
+    4. D は owner 別に導出した口座残高と job_id 別の Receipt へ過不足なく
+       分解できる（親側と子側で同じ額を二重に数えていない）
+    """
+    violations: list[str] = []
+
+    # -- 口座残高を owner_job_id + bucket から独立に導出する ---------------
+    by_owner_bucket: dict[tuple[str, str], int] = {}
+    for account in snapshot.accounts:
+        key = (str(account["owner_job_id"]), str(account["bucket"]))
+        by_owner_bucket[key] = by_owner_bucket.get(key, 0) + parse_amount_string(
+            account["amount"]
+        )
+
+    def balance(owner: str, bucket: str) -> int:
+        return by_owner_bucket.get((owner, bucket), 0)
+
+    # -- Journal の口座別流入を owner + bucket から独立に導出する -----------
+    inflow: dict[tuple[str, str], int] = {}
+    for entry in snapshot.journal:
+        delta = int(entry["delta_units"])
+        if delta <= 0:
+            continue
+        key = (str(entry["owner_job_id"]), str(entry["bucket"]))
+        inflow[key] = inflow.get(key, 0) + delta
+
+    child_ids = [
+        job_id
+        for job_id in snapshot.job_states
+        if job_id != snapshot.root_id
+    ]
+    for child_id in child_ids:
+        budget = snapshot.child_budget_units.get(child_id)
+        allocated = inflow.get((child_id, "child_work"), 0)
+        # 1. Child への拘束は公開予算ちょうど 1 回だけ
+        if budget is not None and allocated not in (0, budget):
+            violations.append(
+                f"child {child_id}: allocated {allocated} != budget {budget}"
+                " (child_work への流入は予算 1 回分のみ)"
+            )
+        moved_to_payout = inflow.get((child_id, "child_payout"), 0)
+        child_paid = sum(
+            int(receipt["amount_units"])
+            for receipt in snapshot.receipts
+            if receipt["job_id"] == child_id and receipt["kind"] == "payout"
+        )
+        # 2. 予約と確定送金で同じ額を二重に数えていない
+        if balance(child_id, "child_payout") + child_paid != moved_to_payout:
+            violations.append(
+                f"child {child_id}: child_payout balance"
+                f" {balance(child_id, 'child_payout')} + paid {child_paid}"
+                f" != moved to payout {moved_to_payout}"
+            )
+        # 3. 承認側と返却側の両方へ同時に流れていない
+        returned = allocated - balance(child_id, "child_work") - moved_to_payout
+        if returned < 0:
+            violations.append(
+                f"child {child_id}: negative returned amount {returned}"
+                f" (allocated={allocated} child_work={balance(child_id, 'child_work')}"
+                f" child_payout_in={moved_to_payout}). 同じ原資が承認と返却へ"
+                "二重に流れている"
+            )
+
+    # 4. D の分解（親側 = Root 所有口座 + Root の Receipt、
+    #    子側 = Child 所有口座 + Child の Receipt）
+    root_side = (
+        balance(snapshot.root_id, "available")
+        + balance(snapshot.root_id, "parent_payout")
+        + balance(snapshot.root_id, "refund")
+    )
+    child_side = sum(
+        balance(child_id, "child_work") + balance(child_id, "child_payout")
+        for child_id in child_ids
+    )
+    settled = sum(int(receipt["amount_units"]) for receipt in snapshot.receipts)
+    if root_side + child_side + settled != snapshot.deposit_units:
+        violations.append(
+            f"D decomposition mismatch: root_side={root_side}"
+            f" child_side={child_side} settled={settled}"
+            f" != D={snapshot.deposit_units}"
+        )
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # 実プロセス E2E 環境
 # ---------------------------------------------------------------------------
@@ -401,7 +514,7 @@ class E2EWorld:
 
     # -- CLI（実プロセス） -------------------------------------------------
 
-    def _cli_argv(
+    def cli_argv(
         self,
         args: list[str],
         *,
@@ -426,7 +539,7 @@ class E2EWorld:
         return argv
 
     @staticmethod
-    def _parse_stdout_json(stdout: str) -> dict[str, Any] | None:
+    def parse_stdout_json(stdout: str) -> dict[str, Any] | None:
         text = stdout.strip()
         if not text:
             return None
@@ -450,7 +563,7 @@ class E2EWorld:
         `cli.main()` の直呼びはしない。stdout の単一 JSON を共通封筒
         （`ok` / `data` / `error`）として構造化して返す。
         """
-        argv = self._cli_argv(args, actor=actor, operation_id=operation_id)
+        argv = self.cli_argv(args, actor=actor, operation_id=operation_id)
         completed = subprocess.run(
             argv,
             capture_output=True,
@@ -462,7 +575,7 @@ class E2EWorld:
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
-            payload=self._parse_stdout_json(completed.stdout),
+            payload=self.parse_stdout_json(completed.stdout),
         )
         self.report.add_operation(
             channel="cli",
@@ -487,14 +600,14 @@ class E2EWorld:
         tick の stdout は共通封筒ではなく lifecycle の集計 JSON
         （`counts` / `error`）なので、run_cli とは別に解釈する。
         """
-        argv = self._cli_argv(["tick", "--once"], actor=SYSTEM_ID, operation_id=None)
+        argv = self.cli_argv(["tick", "--once"], actor=SYSTEM_ID, operation_id=None)
         completed = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=PROCESS_TIMEOUT_SECONDS,
         )
-        payload = self._parse_stdout_json(completed.stdout) or {}
+        payload = self.parse_stdout_json(completed.stdout) or {}
         ok = completed.returncode == 0 and payload.get("error") is None
         self.report.add_operation(
             channel="tick",
@@ -749,6 +862,31 @@ class E2EWorld:
                 " ORDER BY t.created_at_us ASC, t.operation_id ASC, e.entry_no ASC",
                 (self.root_id,),
             ).fetchall()
+            event_rows = conn.execute(
+                "SELECT e.id, e.job_id, e.actor_id, e.action, e.object_id,"
+                " e.at_us FROM events e WHERE e.root_id = ? ORDER BY e.id",
+                (self.root_id,),
+            ).fetchall()
+            attempt_rows = conn.execute(
+                "SELECT t.id, t.job_id, t.lease_id, t.outcome, t.reason,"
+                " t.attempted_at_us FROM submission_attempts t"
+                " JOIN jobs j ON j.id = t.job_id"
+                " WHERE j.root_id = ? ORDER BY t.id",
+                (self.root_id,),
+            ).fetchall()
+            dispute_rows = conn.execute(
+                "SELECT d.id, d.job_id, d.submission_id, d.opened_by, d.status,"
+                " d.reason_code, d.condition_id, d.due_at_us, d.resolution"
+                " FROM disputes d JOIN jobs j ON j.id = d.job_id"
+                " WHERE j.root_id = ? ORDER BY d.id",
+                (self.root_id,),
+            ).fetchall()
+            child_budget_rows = conn.execute(
+                "SELECT j.id, v.budget_units FROM jobs j"
+                " JOIN job_versions v ON v.id = j.version_id"
+                " WHERE j.root_id = ? ORDER BY j.id",
+                (self.root_id,),
+            ).fetchall()
 
         return Snapshot(
             label=label,
@@ -776,6 +914,12 @@ class E2EWorld:
                 str(r["participant_id"]): int(r["balance_units"]) for r in wallet_rows
             },
             journal=[dict(r) for r in journal_rows],
+            events=[dict(r) for r in event_rows],
+            submission_attempts=[dict(r) for r in attempt_rows],
+            disputes=[dict(r) for r in dispute_rows],
+            child_budget_units={
+                str(r["id"]): int(r["budget_units"]) for r in child_budget_rows
+            },
         )
 
     # -- commit ごとの観測 -------------------------------------------------
@@ -784,12 +928,15 @@ class E2EWorld:
         """スナップショットを取り、不変条件を検査してレポートへ履歴として蓄積する。
 
         各書込操作の完了後（および tick の各ラウンド後）に呼ぶ。保存則・非負・
-        受取権者一致のいずれかが破れていれば即座に失敗させる。
+        受取権者一致・親子二重計上なしのいずれかが破れていれば即座に失敗させる
+        （計画書 第18節 N14「各 commit を観測。D=E+paid+refunded、口座非負、
+        親子二重計上なし」）。
         """
         snap = self.snapshot(label)
         conservation_violations = check_conservation(snap)
         entitlement_violations = check_payee_entitlement(snap)
         negatives = negative_accounts(snap)
+        double_counting_violations = check_no_double_counting(snap)
         self.report.add_observation(
             ObservationRecord(
                 label=label,
@@ -812,6 +959,8 @@ class E2EWorld:
                     payee: format_amount_units(units)
                     for payee, units in sorted(snap.refunded_by_payee_units.items())
                 },
+                no_double_counting_ok=not double_counting_violations,
+                double_counting_violations=double_counting_violations,
             )
         )
         self.snapshots.append(snap)
@@ -822,6 +971,11 @@ class E2EWorld:
         if entitlement_violations:
             raise HarnessError(
                 f"payee entitlement violated at {label!r}: {entitlement_violations}"
+            )
+        if double_counting_violations:
+            raise HarnessError(
+                f"parent/child double counting at {label!r}:"
+                f" {double_counting_violations}"
             )
         return snap
 
@@ -963,6 +1117,38 @@ def create_world(tmp_path: Path, scenario_id: str) -> E2EWorld:
     if not world.db_path.exists():
         raise HarnessError(f"database file was not created: {world.db_path}")
     return world
+
+
+def write_root_card(
+    world: E2EWorld,
+    name: str,
+    *,
+    subcontract_policy: dict[str, Any] | None = None,
+    timing_policy: dict[str, Any] | None = None,
+    catalog_timing_policy: dict[str, Any] | None = None,
+    deadline: str | None = None,
+) -> Path:
+    """第11節の固定カタログはそのままに、policy / timing / deadline だけを
+    差し替えた Root カードを書き出す（N07・N08 の専用 fixture 用）。
+
+    `catalog_timing_policy` はカタログ全 entry の timing_policy を差し替える
+    （Child だけ別の Lease 長・検収窓を持たせるための Root Requester の
+    事前許可。第8節・TaskCatalogEntry.timing_policy）。カードは Root 公開
+    （`job create`）より前に書くため、policy は Root 公開前の設定になる。
+    """
+    card = json.loads(ROOT_CARD_PATH.read_text(encoding="utf-8"))
+    if subcontract_policy is not None:
+        card["subcontract_policy"] = subcontract_policy
+    if timing_policy is not None:
+        card["timing_policy"] = timing_policy
+    if deadline is not None:
+        card["deadline"] = deadline
+    if catalog_timing_policy is not None:
+        for entry in card["catalog"]:
+            entry["timing_policy"] = catalog_timing_policy
+    path = world.project_root / f"root-card-{name}.json"
+    path.write_text(json.dumps(card, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 def create_and_fund_root(

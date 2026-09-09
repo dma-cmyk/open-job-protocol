@@ -44,7 +44,7 @@ class OperationRecord:
 
 @dataclass(frozen=True)
 class ObservationRecord:
-    """1 観測点での保存則・非負・受取権者一致の結果。"""
+    """1 観測点での保存則・非負・受取権者一致・親子二重計上なしの結果。"""
 
     label: str
     totals: dict[str, str]
@@ -57,6 +57,8 @@ class ObservationRecord:
     job_states: dict[str, str]
     paid_by_payee: dict[str, str]
     refunded_by_payee: dict[str, str]
+    no_double_counting_ok: bool
+    double_counting_violations: list[str]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,8 @@ class ObservationRecord:
             "job_states": self.job_states,
             "paid_by_payee": self.paid_by_payee,
             "refunded_by_payee": self.refunded_by_payee,
+            "no_double_counting_ok": self.no_double_counting_ok,
+            "double_counting_violations": self.double_counting_violations,
         }
 
 
@@ -134,6 +138,7 @@ class ScenarioReport:
                 obs.conservation_ok
                 and obs.accounts_non_negative
                 and obs.payee_entitlement_ok
+                and obs.no_double_counting_ok
                 for obs in self.observations
             )
             if self.observations
@@ -179,6 +184,7 @@ def assert_report_contents(
         obs["conservation_ok"]
         and obs["accounts_non_negative"]
         and obs["payee_entitlement_ok"]
+        and obs["no_double_counting_ok"]
         for obs in data["conservation"]
     )
     return data
