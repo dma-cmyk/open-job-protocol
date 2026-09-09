@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from . import harness
+from . import harness, report
 from .harness import AGENT_A_ID, AGENT_B_ID, REQUESTER_ID
 
 SCENARIO_ID = "E01"
@@ -41,7 +41,7 @@ async def test_e01_child_ok_parent_ok(tmp_path: Path) -> None:
     world = harness.create_world(tmp_path, SCENARIO_ID)
     failed = False
     try:
-        await _run_e01(world)
+        expected = await _run_e01(world)
     except BaseException:
         failed = True
         raise
@@ -50,10 +50,10 @@ async def test_e01_child_ok_parent_ok(tmp_path: Path) -> None:
         report_path = world.report.write()
         assert report_path.exists()
     if not failed:
-        _assert_report_contents(report_path)
+        report.assert_report_contents(report_path, **expected)
 
 
-async def _run_e01(world: harness.E2EWorld) -> None:
+async def _run_e01(world: harness.E2EWorld) -> dict:
     # ------------------------------------------------------------------
     # 1. Requester が CLI で Root を作成・入金して OPEN にする
     # ------------------------------------------------------------------
@@ -301,31 +301,15 @@ async def _run_e01(world: harness.E2EWorld) -> None:
         assert snap.conservation_ok_reported, snap.label
 
     world.report.note("E01: Child 成功・Parent 成功。A=90 / B=10 / 返金=0 / Escrow=0")
-
-
-def _assert_report_contents(report_path: Path) -> None:
-    """レポートが第17節の6項目（scenario_id / operation_id / 終端 Job 状態 /
-    受取人別金額 / locked 内訳 / 保存則の結果）を含むこと。"""
-    data = json.loads(report_path.read_text(encoding="utf-8"))
-
-    assert data["scenario_id"] == SCENARIO_ID
-    assert data["operation_ids"], "operation_id が 1 件も記録されていない"
-    assert set(data["terminal_job_states"].values()) == {"DONE"}
-    assert data["amounts_by_payee"]["paid"] == {
-        AGENT_A_ID: "90.000000",
-        AGENT_B_ID: "10.000000",
+    return {
+        "scenario_id": SCENARIO_ID,
+        "terminal_job_states": {root_id: "DONE", child_id: "DONE"},
+        "paid": {AGENT_A_ID: "90.000000", AGENT_B_ID: "10.000000"},
+        "refunded": {},
+        "locked_breakdown": {
+            "child_payout": "0.000000",
+            "child_work": "0.000000",
+            "parent_payout": "0.000000",
+            "refund": "0.000000",
+        },
     }
-    assert data["amounts_by_payee"]["refunded"] == {}
-    assert data["locked_breakdown"] == {
-        "child_payout": "0.000000",
-        "child_work": "0.000000",
-        "parent_payout": "0.000000",
-        "refund": "0.000000",
-    }
-    assert data["conservation_ok"] is True
-    assert all(
-        obs["conservation_ok"]
-        and obs["accounts_non_negative"]
-        and obs["payee_entitlement_ok"]
-        for obs in data["conservation"]
-    )
