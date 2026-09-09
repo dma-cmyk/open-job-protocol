@@ -210,7 +210,7 @@ def _run_n07(
     assert after.locked_units == expected_in_use_units
     assert after.available_units == ROOT_BUDGET_UNITS - expected_in_use_units
     assert after.child_budget_units[child_id] == expected_in_use_units
-    subcontract = _subcontract_usage(world, root_id)
+    subcontract = harness.subcontract_usage(world, root_id)
     assert harness.parse_amount_string(subcontract["in_use"]) == expected_in_use_units
     assert harness.parse_amount_string(subcontract["available"]) == (
         ROOT_BUDGET_UNITS - expected_in_use_units
@@ -242,13 +242,3 @@ def _run_n07(
             "refund": "0.000000",
         },
     }
-
-
-def _subcontract_usage(world: harness.E2EWorld, root_id: str) -> dict:
-    """`ojp ledger show ROOT --json` の subcontract_usage（U と available の正本）。"""
-    result = world.run_cli(
-        ["ledger", "show", root_id],
-        actor=harness.REQUESTER_ID,
-        action="ledger show (subcontract usage)",
-    )
-    return result.data["subcontract_usage"]

@@ -805,6 +805,21 @@ class E2EWorld:
         finally:
             conn.close()
 
+    @contextlib.contextmanager
+    def observing_root(self, root_id: str) -> Iterator[None]:
+        """観測対象の Root を一時的に切り替える（1 DB に複数 Root があるシナリオ用）。
+
+        `snapshot` / `observe` は `root_id` を基準に台帳と Job を集めるため、
+        別 Root（X15 の「別Root からの操作」など）を同じ不変条件で観測する
+        ときにこの context manager で切り替える。抜けると元の Root へ戻る。
+        """
+        previous = self.root_id
+        self.root_id = root_id
+        try:
+            yield
+        finally:
+            self.root_id = previous
+
     def snapshot(self, label: str) -> Snapshot:
         """`ojp ledger show ROOT --json`（実プロセス）＋ 読取接続でスナップショットを取る。"""
         if self.root_id is None:
@@ -1013,6 +1028,19 @@ class AgentSession:
         tools = await self._session.list_tools()
         return sorted(tool.name for tool in tools.tools)
 
+    async def list_tool_argument_names(self) -> dict[str, list[str]]:
+        """tool 名 → 宣言済み引数名（inputSchema の properties）の対応。
+
+        「MCP 引数に actor_id・payee_id を受け付けない」「期待結果・テスト・
+        判定器を引数で渡せない」（第5節・第13節）を、公開されている引数の
+        集合そのもので照合するために使う。
+        """
+        tools = await self._session.list_tools()
+        return {
+            tool.name: sorted((tool.input_schema or {}).get("properties", {}))
+            for tool in tools.tools
+        }
+
     async def call(
         self,
         tool: str,
@@ -1151,15 +1179,15 @@ def write_root_card(
     return path
 
 
-def create_and_fund_root(
+def create_root_job(
     world: E2EWorld,
     *,
-    amount: str = "100.000000",
     card_path: Path = ROOT_CARD_PATH,
 ) -> tuple[str, str]:
-    """Requester が CLI で Root を作成し、全額入金して OPEN にする。
+    """Requester が CLI で Root（DRAFT）と公開候補 Version を作るだけで、入金しない。
 
-    戻り値は (root_id, published_version_id)。
+    未入金 Root（X01）を観測するために fund と分離してある。戻り値は
+    (root_id, published_version_id) で、`world.root_id` も設定する。
     """
     create = world.run_cli(
         ["job", "create", "--card", str(card_path)],
@@ -1170,13 +1198,39 @@ def create_and_fund_root(
     root_id = str(create.data["job_id"])
     version_id = str(create.data["version_id"])
     world.root_id = root_id
+    return root_id, version_id
 
-    world.run_cli(
+
+def fund_root(
+    world: E2EWorld,
+    root_id: str,
+    *,
+    amount: str = "100.000000",
+    label: str = "root",
+    expect_ok: bool = True,
+) -> CliResult:
+    """Requester が CLI で Root へ入金する（`expect_ok=False` で拒否の観測にも使う）。"""
+    return world.run_cli(
         ["job", "fund", root_id, "--amount", amount],
         actor=REQUESTER_ID,
-        operation_id=world.next_operation_id("fund", "root"),
+        operation_id=world.next_operation_id("fund", label),
+        expect_ok=expect_ok,
         action="job fund",
     )
+
+
+def create_and_fund_root(
+    world: E2EWorld,
+    *,
+    amount: str = "100.000000",
+    card_path: Path = ROOT_CARD_PATH,
+) -> tuple[str, str]:
+    """Requester が CLI で Root を作成し、全額入金して OPEN にする。
+
+    戻り値は (root_id, published_version_id)。
+    """
+    root_id, version_id = create_root_job(world, card_path=card_path)
+    fund_root(world, root_id, amount=amount)
     return root_id, version_id
 
 
@@ -1277,3 +1331,19 @@ def write_artifact(world: E2EWorld, name: str, payload: dict[str, Any]) -> Path:
     path = world.project_root / f"artifact-{name}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def subcontract_usage(
+    world: E2EWorld, root_id: str, *, label: str = "subcontract usage"
+) -> dict[str, Any]:
+    """`ojp ledger show ROOT --json` の subcontract_usage（U と available の正本）。
+
+    U は「Child 支払い済み総額 + Σ(child_work + child_payout)」（第10節）。
+    上限判定と同じ導出をアプリ側から読み、テスト側の再計算と突き合わせる。
+    """
+    result = world.run_cli(
+        ["ledger", "show", root_id],
+        actor=REQUESTER_ID,
+        action=f"ledger show ({label})",
+    )
+    return result.data["subcontract_usage"]
