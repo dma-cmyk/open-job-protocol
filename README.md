@@ -99,6 +99,58 @@ E2E テストはシナリオごとに `data/work/e2e-reports/<scenario_id>.json`
 レポートはシナリオ固有の期待値を持たず、各テストがレポートの内容を期待値と照合します
 （`report.assert_report_contents`）。
 
+## E01 シナリオ（MCP stdio 実プロセス）の再現実行
+
+「最小実行手順」は人間の運用者が CLI で操作する流れです。一方で Agent A / B が
+MCP stdio 経由で自律的にプロトコルを操作する構成は、E2E テストの E01
+（Child 成功・Parent 成功）がそのまま再現手順になります:
+
+```bash
+uv run pytest tests/e2e/test_e01_child_ok_parent_ok.py
+```
+
+この 1 コマンドで、次の 4 種類の実プロセスが起動・連携します
+（`tests/e2e/harness.py` の `create_world` / `agent_session` / `settle`）:
+
+1. **Requester（CLI 子プロセス）**: `demo init`・Root の作成・入金・Root の検収承認・
+   台帳表示を実行する（人間運用者の責任境界。計画書 第14節）。
+2. **Agent A（MCP stdio サーバー実プロセス）**: MCP Python SDK の `stdio_client` から
+   `ojp mcp --actor pt-agent-a` を別プロセスで起動し、MCP `ClientSession` で接続。
+   8 tools の `ojp_claim_job`（Root Claim）→ `ojp_create_child_job`（part-1 を予算 10
+   で発注）→ `ojp_approve`（Child の検収承認）→ `ojp_submit`（Root への成果物提出）
+   を自律的に呼び出す。自己資金の引落しは発生しない（Child 予算は Root Escrow 内部で拘束）。
+3. **Agent B（MCP stdio サーバー実プロセス）**: 同様に `ojp mcp --actor pt-agent-b`
+   を別プロセスで起動。`ojp_claim_job`（Child Claim）→ `ojp_submit`
+   （`{"sum": 6}` を提出）を呼び出す。
+4. **独立 tick プロセス**: `ojp tick --watch`（および確定用の `tick --once`）を
+   system Actor として別プロセスで起動し、承認済み支払い（Child 10 → B、Root 90 → A）
+   を決済する。
+
+つまり E01 の実行は「Requester CLI・A/B の MCP stdio・独立 tick」の実プロセス構成で
+8 tools 経由の Child 発注・Claim・成果物提出・検収承認・決済までを完遂し、各観測点で
+保存則・非負・受取権者一致・親子二重計上なしを検証します。
+
+### E01 実行後の確認
+
+テストは一時ディレクトリ（pytest の `tmp_path`）に DB を作るため、終了後にそのまま
+`ojp ledger show` を実行できる実 DB は残りません。代わりに、テスト自身が最終状態を
+検証したうえで機械可読レポートを書き出します:
+
+```bash
+# レポートの確認（E01 の最終状態がそのまま入っている）
+cat data/work/e2e-reports/E01.json
+```
+
+`E01.json` の読み方（`terminal_job_states`・`amounts_by_payee`・`locked_breakdown`・
+`conservation_ok` など）は[テストレポートの読み方](#テストレポートの読み方)を参照。
+E01 では最終的に Root / Child とも `DONE`、`paid` が A=90.000000・B=10.000000、
+返金 0、Escrow 0、`conservation_ok` が `true` になります。
+
+なお、永続 DB で同じ流れを手元の MCP クライアントから試す場合は、先の
+「MCP サーバー起動（stdio）」の A / B を別プロセスで起動する例のサーバーに対して
+クライアントから 8 tools を呼び、送金は CLI の `ojp tick --once`（または `--watch`）
+で確定させてから `ojp ledger show <ROOT_JOB_ID>` で台帳を確認します。
+
 ## CLI の使い方
 
 すべてのコマンドで `--root <project-root>` を指定し、同一のプロジェクトルート（`data/ojp.sqlite3`）を解決します。
@@ -195,6 +247,16 @@ uv run ojp --root <project-root> mcp --actor pt-agent-b
 
 各プロセスが `--actor` で指定した操作主体として 8 tools を呼び出します。
 E2E テスト（`tests/e2e/`）もこの構成で A / B を検証します。
+
+E01 シナリオ（[E01 シナリオ（MCP stdio 実プロセス）の再現実行](#e01-シナリオmcp-stdio-実プロセスの再現実行)）
+では、MCP Python SDK の `stdio_client` が上記の `ojp mcp --actor pt-agent-a` /
+`--actor pt-agent-b` をそれぞれ別プロセスで起動し、`ClientSession` 経由で
+`ojp_claim_job`・`ojp_create_child_job`・`ojp_submit`・`ojp_approve` などを呼び出します。
+つまり「Agent A / B の MCP stdio プロセス」はテストハーネスから spawn される本物の
+サーバープロセスで、A は Root の Claim と Child の発注・検収を、B は Child の Claim と
+成果物提出を、どちらも 8 tools だけを使って自律操作します。入金・返金・tick は
+MCP に公開されないため（下記「返金・tick・入金が MCP にない理由」）、Requester CLI と
+独立 tick プロセスが担います。
 
 ### 公開される 8 Tools
 

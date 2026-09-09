@@ -27,7 +27,7 @@
 | 13 | 4結果と必須異常系14項目・追加テストが自動E2Eで再現される。 | 4結果: `tests/e2e/test_e01_child_ok_parent_ok.py::test_e01_child_ok_parent_ok` / `test_e02_child_fail_parent_ok.py::test_e02_child_fail_parent_ok` / `test_e03_child_ok_parent_fail.py::test_e03_child_ok_parent_fail` / `test_e04_child_fail_parent_fail.py::test_e04_child_fail_parent_fail`。異常系 14 項目: `tests/e2e/test_n01_*` 〜 `test_n14_*`（N01=Child失敗内部返却、N02=Child支払い済みParent失敗、N03=Parent失敗でもChild存続、N04=提出後の拒否操作、N05=二重承認、N06=同時Claim、N07=上限同時超過、N08=提出後Lease失効、N09=Parent停止後のChild、N10=無効な提出、N11=検収者/裁定無応答、N12=送金失敗回復、N13=先行返金後のChild、N14=各commit会計不変条件）。追加テスト: `tests/e2e/test_x01_*` 〜 `test_x15_*` と `tests/e2e/test_sequence.py::test_sequence_matches_reference_accounting_model`（固定 seed 操作列×参照会計モデル） |
 | 14 | すべての確定会計操作で保存則・非負性・正しい受取人を検証する。 | `tests/e2e/test_n14_accounting_invariants.py::test_n14_invariants_hold_at_every_commit`（中間 commit を含む全 commit 直後で検査）・`test_n14_checkers_detect_violations`・`test_n14_commit_history_detects_violations_hidden_by_the_final_state`・`test_n14_every_scenario_report_enforces_the_invariants`（全シナリオがレポート検証を強制）。チェッカー実装: `tests/e2e/harness.py`（`check_conservation` / `check_payee_entitlement` / `check_no_double_counting` / `check_commit_history`）。実装側: `src/ojp/ledger.py::assert_ledger_invariants`（`check_accounts_non_negative` / `check_journal_zero_sum` / `check_conservation`）。`tests/integration/test_ledger.py::test_journal_zero_sum_per_operation_and_cumulative`。全 E2E の `conservation_ok` が最終照合 |
 | 15 | MCPの8 toolsとCLI、独立tick、DB再起動復旧を実プロセスで確認する。 | MCP 8 tools: `tests/integration/test_mcp_stdio.py::test_stdio_initialize_and_tools_list`・`tests/integration/test_mcp_tools.py::test_tools_list_exact_match`・`test_all_eight_tools_in_single_session` ほか。CLI/MCP 等価性: `tests/integration/test_cli_mcp_parity.py::test_cli_and_mcp_parity`・`test_shared_db_clock_across_cli_mcp_tick`・`test_exit_code_and_mcp_error_correspondence`。CLI 全コマンド: `tests/integration/test_cli.py::test_cli_full_lifecycle_e2e` ほか。独立 tick: `tests/integration/test_tick.py::test_subprocess_tick_once_json`・`test_watch_single_iteration_equals_tick_once`。DB 再起動復旧: `tests/e2e/test_x10_restart_processes_overdue_work.py`（実プロセス停止→再起動）・`tests/integration/test_tick.py::test_overdue_processed_after_restart`・`tests/integration/test_settlement_recovery.py`（failpoint クラッシュ→新プロセス回復）・`tests/integration/test_ledger.py::test_persistence_with_fresh_connection`。E2E 全体（E01〜X15・Sequence）が CLI 子プロセス・A/B の MCP stdio・独立 tick プロセスの実プロセス構成で動く |
-| 16 | READMEの手順で依存lockから起動・実行・台帳確認・テストを再現できる。 | 本ファイル末尾「再現確認」のとおり、クリーンな clone と空の DB から README の手順だけで `uv sync --locked --group dev`・`demo init`〜`ledger show`・`uv run pytest`（全 584 テスト・`data/work/e2e-reports/` へシナリオ別 JSON 生成）を確認済み |
+| 16 | READMEの手順で依存lockから起動・実行・台帳確認・テストを再現できる。 | 本ファイル末尾「再現確認」のとおり、クリーンな clone と空の DB から README の手順だけで `uv sync --locked --group dev`・`demo init`〜`ledger show`・E01 の MCP stdio 実プロセス再現（`uv run pytest tests/e2e/test_e01_child_ok_parent_ok.py` と `data/work/e2e-reports/E01.json` の確認）・`uv run pytest`（全 584 テスト・シナリオ別 JSON 生成）を確認済み |
 | 17 | 除外機能を実装せず、docsと作業記録に実装済み／保留が正しく記録される。 | 除外 8 項目の未実装確認は下の表のとおり。実装状況の記録: README「現在の実装状況」（Phase 1〜8 を実装済みとして明記）と本ファイル（17 項目の根拠・除外の確認方法）。Phase 1〜7 の完了条件は計画書 第20節に対応する各 Phase のコミットで達成済み |
 
 ## 第23節 除外 8 項目の未実装確認
@@ -54,8 +54,18 @@ README の手順だけをなぞって確認した:
 
 1. `uv sync --locked --group dev` — README「セットアップ」どおりに成功。
 2. README「最小実行手順」1〜12（`demo init` から `ledger show` まで）— すべて到達。
-3. `uv run pytest -q` — 全 584 テストが通過し、`data/work/e2e-reports/` に
+   最終台帳は `available=90 / deposit=100 / paid=10 / refunded=0 / locked=0` で
+   `conservation.ok == true`。
+3. README「E01 シナリオ（MCP stdio 実プロセス）の再現実行」—
+   `uv run pytest tests/e2e/test_e01_child_ok_parent_ok.py` が通過し、
+   Requester CLI・Agent A（MCP stdio）・Agent B（MCP stdio）・独立 tick の
+   4 プロセス構成で 8 tools 経由の Child 発注・Claim・成果物提出・検収承認・決済が
+   完遂されることを確認。`data/work/e2e-reports/E01.json` が生成され、
+   `terminal_job_states` が Root/Child とも `DONE`、`amounts_by_payee.paid` が
+   `pt-agent-a: 90.000000` / `pt-agent-b: 10.000000`、`refunded` が空、
+   `locked_breakdown` がすべて `0.000000`、`conservation_ok` が `true` であることを確認。
+4. `uv run pytest -q` — 全 584 テストが通過し、`data/work/e2e-reports/` に
    シナリオごとの JSON レポート（`E01` 〜 `E04`、`N01A` 〜 `N14`、`X01` 〜 `X15` の
-   枝番、`SEQ*`）が生成されることを確認。
+   枝番、`SEQ*`、計 56 件）が生成されることを確認。
 
 レポートの各フィールドの意味は README「テストレポートの読み方」を参照。
