@@ -6,18 +6,27 @@
 
 不変条件そのものは全シナリオの `world.observe()` が**各 commit 後に**検査して
 いる（`harness.check_conservation` / `negative_accounts` /
-`harness.check_payee_entitlement` / `harness.check_no_double_counting`）。
-違反があればその場で `HarnessError` になるため、E01〜E04・N01〜N13 が pass
-している事実そのものが「各 commit で成立している」ことの証拠になる。
+`harness.check_payee_entitlement` / `harness.check_no_double_counting` /
+`harness.check_commit_history`）。違反があればその場で `HarnessError` になる
+ため、E01〜E04・N01〜N13 が pass している事実そのものが「各 commit で
+成立している」ことの証拠になる。
 
-このファイルはその機構が**形だけになっていない**ことを 3 点で確認する:
+観測点のスナップショットは外部操作や tick の**完了後**しか写せないが、
+`scheduler.tick_once` は失効処理・自動承認・裁定・返金予約・送金 1 件ずつを
+別々の DB commit で確定する。その中間 commit は
+`harness.check_commit_history` が `journal_transactions` の commit 列を
+再生して検査する。
+
+このファイルはその機構が**形だけになっていない**ことを 4 点で確認する:
 
 1. 代表的な進行（Root 入金 → Child 拘束 → Child 承認 → 送金 → Parent 承認
-   → 送金）を実プロセスで通し、各 commit で 4 条件が成立する
+   → 送金）を実プロセスで通し、各 commit で 5 条件が成立する
 2. チェッカーが**実際に破れを検出できる**（既知の破れを渡すと報告する）。
    とくに親子二重計上は、総額しか見ない保存則が成立したままでも検出される
    ことを示す
-3. 各シナリオの終了時に通る `report.assert_report_contents` が 4 条件を
+3. 中間 commit の破れが、完了後のスナップショットしか見ないチェッカーでは
+   素通りする一方で `check_commit_history` では検出される
+4. 各シナリオの終了時に通る `report.assert_report_contents` が 5 条件を
    **すべて要求している**（1 つでも落とすと失敗する）
 """
 
@@ -78,6 +87,9 @@ def _synthetic_report() -> dict[str, Any]:
                 "payee_entitlement_violations": [],
                 "no_double_counting_ok": True,
                 "double_counting_violations": [],
+                "commit_count": 1,
+                "commits_ok": True,
+                "commit_violations": [],
             }
         ],
         "conservation_ok": True,
@@ -146,12 +158,63 @@ def test_n14_checkers_detect_violations() -> None:
     assert violations, "親子二重計上が検出されていない"
 
 
+def test_n14_commit_history_detects_violations_hidden_by_the_final_state() -> None:
+    """中間 commit の破れは、完了後のスナップショットだけでは見えない。
+
+    `observe()` は外部操作や tick の**完了後**しか観測できないが、
+    `scheduler.tick_once` は失効処理・自動承認・裁定・返金予約・送金 1 件ずつを
+    別々の commit で確定する。ここでは「途中の commit で保存則が破れ、最後の
+    commit で辻褄が合う」Journal を作り、最終状態しか見ない既存チェッカーが
+    素通りする一方で `check_commit_history` が中間 commit を報告することを
+    確認する。
+    """
+    healthy = _commit_log_snapshot(
+        [
+            _commit("op:fund", "fund", [(ROOT, "available", ROOT_BUDGET_UNITS)]),
+            _commit(
+                "op:allocate",
+                "allocate",
+                [
+                    (ROOT, "available", -CHILD_BUDGET_UNITS),
+                    (CHILD, "child_work", CHILD_BUDGET_UNITS),
+                ],
+            ),
+        ]
+    )
+    assert harness.check_commit_history(healthy) == []
+
+    hidden = _commit_log_snapshot(
+        [
+            _commit("op:fund", "fund", [(ROOT, "available", ROOT_BUDGET_UNITS)]),
+            # 拘束だけを先に commit し、available の引落しを同じ commit に
+            # 含めない（この時点では E = 110 で D = 100 を超える）
+            _commit(
+                "op:allocate", "allocate", [(CHILD, "child_work", CHILD_BUDGET_UNITS)]
+            ),
+            # 最後の commit で辻褄が合うので、完了後の状態は健全に見える
+            _commit(
+                "op:late", "allocate", [(ROOT, "available", -CHILD_BUDGET_UNITS)]
+            ),
+        ]
+    )
+    assert harness.check_conservation(hidden) == [], (
+        "この fixture は完了後の状態では保存則が成立している"
+    )
+    assert harness.negative_accounts(hidden) == []
+    assert harness.check_no_double_counting(hidden) == []
+
+    violations = harness.check_commit_history(hidden)
+    assert violations, "中間 commit の保存則違反が検出されていない"
+    assert any("commit #2" in violation for violation in violations), violations
+
+
 def test_n14_every_scenario_report_enforces_the_invariants() -> None:
-    """レポート検証の入口が 4 条件すべてを要求していることを確認する。
+    """レポート検証の入口が 5 条件すべてを要求していることを確認する。
 
     各シナリオは終了時に `report.assert_report_contents` を通す。そこが
     `conservation_ok` / `accounts_non_negative` / `payee_entitlement_ok` /
-    `no_double_counting_ok` のどれか 1 つでも落としていると、E01〜N13 の
+    `no_double_counting_ok` / `commits_ok` のどれか 1 つでも落としていると、
+    E01〜N13 の
     「各 commit を観測」は形だけになる。ここでは条件を 1 つずつ落とした
     レポートを渡し、入口が確実に失敗することを確かめる（ディスク上の
     既存レポートを読むと実行順に依存するため、合成レポートで検査する）。
@@ -161,6 +224,7 @@ def test_n14_every_scenario_report_enforces_the_invariants() -> None:
         "accounts_non_negative",
         "payee_entitlement_ok",
         "no_double_counting_ok",
+        "commits_ok",
     )
     with tempfile.TemporaryDirectory() as tmpdir:
         base_path = Path(tmpdir) / "healthy.json"
@@ -295,6 +359,82 @@ def _journal(owner_job_id: str, bucket: str, delta_units: int, reason: str) -> d
         "owner_job_id": owner_job_id,
         "beneficiary_id": None,
     }
+
+
+def _commit(
+    operation_id: str, reason: str, entries: list[tuple[str, str, int]]
+) -> list[dict]:
+    """1 つの DB commit（journal_transactions 1 行）にあたる Journal 明細。"""
+    return [
+        {
+            "operation_id": operation_id,
+            "reason": reason,
+            "created_at_us": 0,
+            "entry_no": entry_no,
+            "delta_units": delta_units,
+            "bucket": bucket,
+            "owner_job_id": owner_job_id,
+            "beneficiary_id": None,
+        }
+        for entry_no, (owner_job_id, bucket, delta_units) in enumerate(entries)
+    ]
+
+
+def _commit_log_snapshot(commits: list[list[dict]]) -> harness.Snapshot:
+    """commit 列から観測スナップショットを導出する（完了後の状態だけを写す）。
+
+    残高・D・locked 内訳は Journal を畳んで導出するので、`check_commit_history`
+    の再生妥当性チェックが通る「実際にありうる観測」になる。
+    """
+    journal = [entry for commit in commits for entry in commit]
+    balances: dict[tuple[str, str], int] = {}
+    deposit_units = 0
+    for entry in journal:
+        key = (entry["owner_job_id"], entry["bucket"])
+        balances[key] = balances.get(key, 0) + entry["delta_units"]
+        if (
+            entry["reason"] == "fund"
+            and entry["bucket"] == "available"
+            and entry["delta_units"] > 0
+        ):
+            deposit_units += entry["delta_units"]
+    available_units = sum(
+        units for (_owner, bucket), units in balances.items() if bucket == "available"
+    )
+    breakdown = {bucket: 0 for bucket in harness.LOCKED_BUCKETS}
+    for (_owner, bucket), units in balances.items():
+        if bucket in breakdown:
+            breakdown[bucket] += units
+    locked_units = sum(breakdown.values())
+    return harness.Snapshot(
+        label="commit log",
+        root_id=ROOT,
+        deposit_units=deposit_units,
+        escrow_units=available_units + locked_units,
+        available_units=available_units,
+        locked_units=locked_units,
+        locked_breakdown_units=breakdown,
+        paid_units=0,
+        refunded_units=0,
+        accounts=[
+            _account(owner, bucket, harness.format_amount_units(units))
+            for (owner, bucket), units in sorted(balances.items())
+        ],
+        operations=[],
+        conservation_ok_reported=True,
+        job_states={ROOT: "LEASED", CHILD: "LEASED"},
+        job_requesters={ROOT: REQUESTER_ID, CHILD: AGENT_A_ID},
+        leases=[],
+        submissions=[],
+        acceptances=[],
+        receipts=[],
+        wallet_units={REQUESTER_ID: 0, AGENT_A_ID: 0, AGENT_B_ID: 0},
+        journal=journal,
+        events=[],
+        submission_attempts=[],
+        disputes=[],
+        child_budget_units={ROOT: ROOT_BUDGET_UNITS, CHILD: CHILD_BUDGET_UNITS},
+    )
 
 
 ROOT = "job:root"

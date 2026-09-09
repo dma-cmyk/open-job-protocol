@@ -19,9 +19,14 @@ MCP stdio・独立 tick）へ流しながら、同じ操作列を Python 内の�
   deposit / available / locked 4 口座 / 受取人別 paid / 受取人別 refunded /
   全 Job 状態を完全一致で照合する。第10節の U と累計 Child 数は
   `ojp ledger show` の `subcontract_usage` と照合する。
-- 保存則（`D = E + paid + refunded`）・口座非負・受取権者一致・親子二重計上
-  なしは `world.observe()` が全観測点で検査し、`conservation_ok` /
-  `no_double_counting_ok` としてレポートへ残る。
+- **commit 単位の観測**: 送金は `ojp payment retry OPERATION`（第14節）で
+  1 件ずつ確定させるので、送金 commit ごとに観測と照合が入る。tick が複数
+  commit に分かれる期限処理では、想定した commit 件数だけが起きたことを
+  固定したうえで、`observe()` が呼ぶ `harness.check_commit_history` が
+  `journal_transactions` の commit 列を再生して**中間 commit も含めた全
+  commit 直後**の保存則・非負・受取権者一致・親子二重計上なしを検査する。
+  結果は `conservation_ok` / `no_double_counting_ok` / `commits_ok` として
+  レポートへ残る。
 
 seed を固定しているため操作列は再現可能で、`test_sequence_plans_are_reproducible`
 が同じ seed から同じ操作列が出ることと、採用した seed 群が Parent 成功・失敗の
@@ -34,6 +39,7 @@ import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -246,20 +252,48 @@ class ReferenceLedger:
                 _PendingTransfer("refund", self.requester_id, amount_units, False)
             )
 
+    def _apply_transfer(self, transfer: _PendingTransfer) -> None:
+        self.locked_units[transfer.bucket] -= transfer.amount_units
+        totals = (
+            self.refunded_units if transfer.bucket == "refund" else self.paid_units
+        )
+        totals[transfer.payee_id] = (
+            totals.get(transfer.payee_id, 0) + transfer.amount_units
+        )
+        if transfer.is_child_payout:
+            self.child_paid_units += transfer.amount_units
+
+    def settle_operation(
+        self, *, job_id: str, kind: str, payee_id: str, amount_units: int
+    ) -> None:
+        """確定した送金 1 件（commit 1 件ぶん）を反映する。
+
+        予約していない受取人・金額・原資の送金が現れたらその場で失敗させる。
+        """
+        if kind == "refund":
+            bucket = "refund"
+        elif job_id == self.root_id:
+            bucket = "parent_payout"
+        else:
+            bucket = "child_payout"
+        wanted = (bucket, payee_id, amount_units)
+        for index, transfer in enumerate(self.pending):
+            if (
+                transfer.bucket,
+                transfer.payee_id,
+                transfer.amount_units,
+            ) == wanted:
+                self._apply_transfer(self.pending.pop(index))
+                return
+        raise AssertionError(
+            f"予約していない送金が確定した: job={job_id} kind={kind}"
+            f" payee={payee_id} amount={amount_units} pending={self.pending}"
+        )
+
     def settle_pending(self) -> None:
-        """送金成功: locked -x（確定 Receipt により paid / refunded 累計 +x）。"""
+        """予約済みの送金をすべて確定させる（独立 tick 1 回ぶん）。"""
         for transfer in self.pending:
-            self.locked_units[transfer.bucket] -= transfer.amount_units
-            totals = (
-                self.refunded_units
-                if transfer.bucket == "refund"
-                else self.paid_units
-            )
-            totals[transfer.payee_id] = (
-                totals.get(transfer.payee_id, 0) + transfer.amount_units
-            )
-            if transfer.is_child_payout:
-                self.child_paid_units += transfer.amount_units
+            self._apply_transfer(transfer)
         self.pending.clear()
 
     # -- 照合 -------------------------------------------------------------
@@ -575,8 +609,16 @@ async def _run_sequence(world: harness.E2EWorld, plan: SequencePlan) -> dict:
                 )
 
     _settle(world, model, "final settlement")
+    # 全件解決後は独立 tick を回しても新しい commit が 1 件も起きない
+    settled = world.observe("after final settlement")
+    model.assert_matches(settled)
+    world.tick_once(label="tick --once (quiescence check)")
     final = world.observe("final")
     model.assert_matches(final)
+    assert _commit_count(final) == _commit_count(settled), (
+        "全件解決後の tick が新しい会計 commit を作っている"
+    )
+    assert world.pending_payment_count() == 0
     _assert_usage(world, model, root_id, label="final")
 
     # 決済完了後の判定（第17節「4結果は決済完了後に判定する」と同じ観測点）
@@ -780,10 +822,23 @@ async def _expire_child_lease(
         world.advance_clock_to(target_us)
     assert world.current_clock_us() >= child_due_us
 
+    # tick は「失効処理の確定」と「予約済み送金 1 件ごと」を別 commit で
+    # 確定する。commit ごとの不変条件は observe() の check_commit_history が
+    # Journal の commit 列を再生して検査するため、ここでは想定した件数の
+    # commit だけが起きたことを固定する。
+    parent_terminal = model.states[root_id] in harness.TERMINAL_JOB_STATES
+    expected_commits = 1 + len(model.pending) + (1 if parent_terminal else 0)
+    before_commits = _commit_count(world.snapshots[-1])
+
     world.tick_once(label=f"tick --once ({label} lease expiry)")
     _apply_lease_expiry(model, child_id)
     snapshot = world.observe(f"after {label} lease expiry")
     model.assert_matches(snapshot)
+    assert _commit_count(snapshot) - before_commits == expected_commits, (
+        f"{label}: tick の commit 件数が想定と異なる"
+        f" observed={_commit_count(snapshot) - before_commits}"
+        f" expected={expected_commits}"
+    )
     assert snapshot.job_states[child_id] == "EXPIRED"
     child_leases = [
         lease for lease in snapshot.leases if lease["job_id"] == child_id
@@ -944,16 +999,58 @@ async def _finish_parent_failure(
 
 
 def _settle(world: harness.E2EWorld, model: ReferenceLedger, label: str) -> int:
-    """独立 tick を回して決済を確定させ、各 tick の commit 後に照合する。"""
-    for round_no in range(1, _MAX_SETTLE_ROUNDS + 1):
-        world.tick_once(label=f"tick --once ({label} round {round_no})")
-        model.settle_pending()
-        model.assert_matches(world.observe(f"after {label} tick {round_no}"))
-        if world.pending_payment_count() == 0:
-            return round_no
-    raise AssertionError(
-        f"{label}: {_MAX_SETTLE_ROUNDS} 回の tick で決済が確定しなかった"
-    )
+    """予約済みの送金を 1 件ずつ確定させ、**各 commit 直後**に照合する。
+
+    独立 tick（`ojp tick --once`）は予約ごとに `process_single_payment` を
+    呼ぶため 1 回の tick が複数 commit になり、commit の間を観測できない。
+    ここでは既存の `ojp payment retry OPERATION`（第14節）を使って
+    1 commit ずつ確定させ、その都度スナップショットと参照モデルを突き合わせる。
+    """
+    processed = 0
+    while True:
+        operations = _pending_payment_operations(world)
+        if not operations:
+            return processed
+        if processed >= _MAX_SETTLE_ROUNDS:
+            raise AssertionError(
+                f"{label}: {_MAX_SETTLE_ROUNDS} 件処理しても決済が確定しなかった"
+            )
+        operation = operations[0]
+        before_commits = _commit_count(world.snapshots[-1])
+        world.run_cli(
+            ["payment", "retry", str(operation["operation_id"])],
+            actor=harness.SYSTEM_ID,
+            action=f"payment retry ({label})",
+        )
+        model.settle_operation(
+            job_id=str(operation["job_id"]),
+            kind=str(operation["kind"]),
+            payee_id=str(operation["payee_id"]),
+            amount_units=int(operation["amount_units"]),
+        )
+        snapshot = world.observe(f"after {label} payment {processed + 1}")
+        model.assert_matches(snapshot)
+        # 送金 1 件は commit 1 件（locked 減額・Wallet 増額・Journal・Receipt を
+        # 1 transaction で確定する。第9節 手順3）
+        assert _commit_count(snapshot) - before_commits == 1, snapshot.label
+        processed += 1
+
+
+def _pending_payment_operations(world: harness.E2EWorld) -> list[dict[str, Any]]:
+    """未確定（PENDING / RETRYABLE）の PaymentOperation を作成順に読む。"""
+    with world.read_only_connection() as conn:
+        rows = conn.execute(
+            "SELECT operation_id, job_id, kind, payee_id, amount_units"
+            " FROM payment_operations"
+            " WHERE root_id = ? AND status <> 'SUCCEEDED' ORDER BY rowid",
+            (world.root_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _commit_count(snapshot: harness.Snapshot) -> int:
+    """そのスナップショット時点までに確定した会計 commit の件数。"""
+    return len(harness.replay_commits(snapshot))
 
 
 def _assert_usage(
