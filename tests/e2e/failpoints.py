@@ -110,6 +110,52 @@ _PAYMENT_CRASH_SCRIPT = textwrap.dedent(
     """
 )
 
+# 裁定の再検証へ渡す保存成果物を差し替える tick（第12節「FAIL 経路は判定器
+# 不具合等を模した専用 fixture で検証する」・第18節 X14「証拠付き FAIL」）。
+# verdict ではなく成果物データだけを差し替え、FAIL の理由と原因 condition は
+# 実検証器がそのデータから導出する。tick の集計 JSON をそのまま出力する。
+_CORRUPTED_STORED_ARTIFACT_TICK_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from ojp import clock, scheduler, verification
+    from ojp.domain import ClockMode
+
+    path, actor_id, artifact_json, now_us = sys.argv[1:5]
+    conn = clock.initialize_database(path, ClockMode.TEST, test_now_us=int(now_us))
+
+    verification.arbiter_stored_artifact_override = lambda name: artifact_json
+    result = scheduler.tick_once(conn, actor_id=actor_id)
+    print(json.dumps(result), flush=True)
+    conn.close()
+    """
+)
+
+# Lifecycle（期限処理・自動承認・裁定・返金予約）は commit させたまま、
+# その直後の送金だけを注入点で止める tick。`seam` は ledger モジュールの
+# failpoint 属性名。RuntimeError は tick_once が捕捉しない（OjpError だけを
+# 捕捉する）ため、プロセスは exit 3 で異常終了する。
+_TICK_PAYMENT_CRASH_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    from ojp import clock, ledger, scheduler
+    from ojp.domain import ClockMode
+
+    path, actor_id, seam, now_us = sys.argv[1:5]
+    conn = clock.initialize_database(path, ClockMode.TEST, test_now_us=int(now_us))
+
+    def boom(name):
+        raise RuntimeError(f"injected crash at {name}")
+
+    setattr(ledger, seam, boom)
+    try:
+        scheduler.tick_once(conn, actor_id=actor_id)
+    except RuntimeError:
+        sys.exit(3)
+    print("unexpected success", flush=True)
+    sys.exit(0)
+    """
+)
+
 
 @dataclass(frozen=True)
 class ScriptResult:
@@ -263,3 +309,74 @@ def tick_with_unresponsive_arbiter(
     if payload.get("error") is not None:
         raise HarnessError(f"tick reported an error: {payload['error']}")
     return payload
+
+
+def tick_with_corrupted_stored_artifact(
+    world: E2EWorld, *, artifact_json: str, label: str
+) -> dict[str, Any]:
+    """裁定の再検証へ渡す保存成果物を差し替えた独立プロセスで tick を 1 回回す。
+
+    verdict は注入しない（第12節「FAIL 経路は判定器不具合等を模した専用
+    fixture で検証する」）。差し替えた成果物に対して `verify_artifact` が
+    実際に走り、FAIL の理由と原因 condition は実データから導出される。
+    戻り値は tick の集計 JSON。
+    """
+    result = _run(
+        world,
+        _CORRUPTED_STORED_ARTIFACT_TICK_SCRIPT,
+        str(world.db_path),
+        "pt-system",
+        artifact_json,
+        str(world.current_clock_us()),
+    )
+    if result.returncode != 0:
+        raise HarnessError(
+            f"corrupted-artifact tick failed: exit={result.returncode}\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+    payload = result.payload
+    world.report.add_operation(
+        channel="tick",
+        actor="pt-system",
+        action=f"{label} (stored artifact corrupted)",
+        operation_id=None,
+        ok=payload.get("error") is None,
+    )
+    if payload.get("error") is not None:
+        raise HarnessError(f"tick reported an error: {payload['error']}")
+    return payload
+
+
+def crash_tick_payment(
+    world: E2EWorld, *, seam: str, label: str
+) -> ScriptResult:
+    """tick の Lifecycle だけを commit させ、続く送金を注入点で止める。
+
+    期限処理・自動承認・裁定・返金予約は確定したまま、最初の送金で
+    `seam`（`failpoint_before_commit` / `failpoint_after_commit` /
+    `failpoint_after_receipt`）が発火してプロセスが実際に終了する（exit 3）。
+    再起動後の新プロセスが同じ DB から回復することを観測するために使う
+    （第17節「再起動テストでは実際にプロセスを終了する」）。
+    """
+    result = _run(
+        world,
+        _TICK_PAYMENT_CRASH_SCRIPT,
+        str(world.db_path),
+        "pt-system",
+        seam,
+        str(world.current_clock_us()),
+    )
+    world.report.add_operation(
+        channel="failpoint",
+        actor="pt-system",
+        action=f"{label} (tick {seam})",
+        operation_id=None,
+        ok=False,
+    )
+    if result.returncode != 3:
+        raise HarnessError(
+            f"expected the injected crash (exit 3) at {seam} during tick,"
+            f" got exit={result.returncode}\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+    return result

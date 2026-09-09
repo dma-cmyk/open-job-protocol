@@ -44,7 +44,12 @@ class OperationRecord:
 
 @dataclass(frozen=True)
 class ObservationRecord:
-    """1 観測点での保存則・非負・受取権者一致・親子二重計上なしの結果。"""
+    """1 観測点での保存則・非負・受取権者一致・親子二重計上なしの結果。
+
+    `commit_count` / `commits_ok` は Journal の commit 列を再生して
+    **中間 commit も含めた全 commit 直後**で同じ条件を検査した結果
+    （計画書 第17節「各commit後に保存則と権限不変条件を確認」）。
+    """
 
     label: str
     totals: dict[str, str]
@@ -59,6 +64,9 @@ class ObservationRecord:
     refunded_by_payee: dict[str, str]
     no_double_counting_ok: bool
     double_counting_violations: list[str]
+    commit_count: int
+    commits_ok: bool
+    commit_violations: list[str]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -75,6 +83,9 @@ class ObservationRecord:
             "refunded_by_payee": self.refunded_by_payee,
             "no_double_counting_ok": self.no_double_counting_ok,
             "double_counting_violations": self.double_counting_violations,
+            "commit_count": self.commit_count,
+            "commits_ok": self.commits_ok,
+            "commit_violations": self.commit_violations,
         }
 
 
@@ -139,6 +150,7 @@ class ScenarioReport:
                 and obs.accounts_non_negative
                 and obs.payee_entitlement_ok
                 and obs.no_double_counting_ok
+                and obs.commits_ok
                 for obs in self.observations
             )
             if self.observations
@@ -185,6 +197,7 @@ def assert_report_contents(
         and obs["accounts_non_negative"]
         and obs["payee_entitlement_ok"]
         and obs["no_double_counting_ok"]
+        and obs["commits_ok"]
         for obs in data["conservation"]
     )
     return data

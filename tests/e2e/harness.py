@@ -45,6 +45,9 @@ SYSTEM_ID = "pt-system"
 # 終端 Job 状態（第6節）。期限処理の観測条件に使う。
 TERMINAL_JOB_STATES = frozenset({"DONE", "FAILED", "EXPIRED"})
 
+# locked の 4 用途（第9節）。ledger show の locked_breakdown と同じキー集合。
+LOCKED_BUCKETS = ("child_payout", "child_work", "parent_payout", "refund")
+
 # 期限計算は `world.current_clock_us()`（共有 Clock の現在値）を起点に相対で行い、
 # harness 側に t0 の値を焼き込まない。
 
@@ -328,6 +331,28 @@ def negative_accounts(snapshot: Snapshot) -> list[str]:
     ]
 
 
+def entitled_payee(
+    snapshot: Snapshot, job_id: str, kind: str
+) -> tuple[str | None, str | None]:
+    """受取権者を予約・Receipt とは無関係に leases / submissions / jobs から導出する。
+
+    計画書 第12節どおり、payout なら「当該 Job の有効 Submission を出した
+    Lease の Worker」、refund なら「Root Job の Requester」。戻り値は
+    (受取権者, 導出根拠)。未知の kind では (None, None) を返す。
+    """
+    if kind == "payout":
+        return (
+            snapshot.submission_worker(job_id),
+            f"lease worker of the valid submission for {job_id}",
+        )
+    if kind == "refund":
+        return (
+            snapshot.job_requesters.get(snapshot.root_id),
+            f"root requester of {snapshot.root_id}",
+        )
+    return None, None
+
+
 def check_payee_entitlement(snapshot: Snapshot) -> list[str]:
     """受取権者との一致を保存則とは独立に検証する。
 
@@ -342,13 +367,8 @@ def check_payee_entitlement(snapshot: Snapshot) -> list[str]:
     for operation in snapshot.operations:
         job_id = str(operation["job_id"])
         kind = str(operation["kind"])
-        if kind == "payout":
-            entitled = snapshot.submission_worker(job_id)
-            source = f"lease worker of the valid submission for {job_id}"
-        elif kind == "refund":
-            entitled = snapshot.job_requesters.get(snapshot.root_id)
-            source = f"root requester of {snapshot.root_id}"
-        else:
+        entitled, source = entitled_payee(snapshot, job_id, kind)
+        if source is None:
             violations.append(f"unknown payment kind: {kind}")
             continue
         if entitled is None:
@@ -473,6 +493,282 @@ def check_no_double_counting(snapshot: Snapshot) -> list[str]:
             f"D decomposition mismatch: root_side={root_side}"
             f" child_side={child_side} settled={settled}"
             f" != D={snapshot.deposit_units}"
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# commit 単位の観測（Journal の commit 列からの再生）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommitState:
+    """Journal の commit 1 件を適用した直後の Root 会計状態。
+
+    `observe()` は外部操作や tick の**完了後**しか見られないが、
+    `scheduler.tick_once` は失効処理・自動承認・裁定・返金予約・送金 1 件ずつを
+    それぞれ別の DB transaction で確定する（`service.process_payments` は
+    予約ごとに `process_single_payment` を呼ぶ）。`journal_transactions` は
+    その確定 1 件につき 1 行なので、commit 列を再生すれば tick 内の
+    中間 commit も観測できる。
+    """
+
+    sequence: int
+    operation_id: str
+    reason: str
+    deposit_units: int
+    # (owner_job_id, bucket) -> 残高 / 累計流入
+    balances: dict[tuple[str, str], int]
+    inflow: dict[tuple[str, str], int]
+    # この commit までに確定した Receipt（累計）
+    settled_receipts: tuple[dict[str, Any], ...]
+
+    def balance(self, owner_job_id: str, bucket: str) -> int:
+        return self.balances.get((owner_job_id, bucket), 0)
+
+    @property
+    def available_units(self) -> int:
+        return sum(
+            units
+            for (_owner, bucket), units in self.balances.items()
+            if bucket == "available"
+        )
+
+    @property
+    def locked_breakdown_units(self) -> dict[str, int]:
+        breakdown = {bucket: 0 for bucket in LOCKED_BUCKETS}
+        for (_owner, bucket), units in self.balances.items():
+            if bucket in breakdown:
+                breakdown[bucket] += units
+        return breakdown
+
+    @property
+    def locked_units(self) -> int:
+        return sum(self.locked_breakdown_units.values())
+
+    @property
+    def escrow_units(self) -> int:
+        return self.available_units + self.locked_units
+
+    def _receipt_totals(self, kind: str) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for receipt in self.settled_receipts:
+            if receipt["kind"] != kind:
+                continue
+            payee = str(receipt["payee_id"])
+            totals[payee] = totals.get(payee, 0) + int(receipt["amount_units"])
+        return totals
+
+    @property
+    def paid_by_payee_units(self) -> dict[str, int]:
+        return self._receipt_totals("payout")
+
+    @property
+    def refunded_by_payee_units(self) -> dict[str, int]:
+        return self._receipt_totals("refund")
+
+    @property
+    def paid_units(self) -> int:
+        return sum(self.paid_by_payee_units.values())
+
+    @property
+    def refunded_units(self) -> int:
+        return sum(self.refunded_by_payee_units.values())
+
+
+def replay_commits(snapshot: Snapshot) -> list[CommitState]:
+    """Journal を commit 順に再生し、各 commit 直後の会計状態を復元する。
+
+    `journal_transactions.operation_id` は PRIMARY KEY なので 1 operation_id =
+    1 commit。`Snapshot.journal` は commit 順（rowid 順）に並んでいるため、
+    同じ operation_id の連続する明細が 1 commit にあたる。Receipt は
+    locked 減額と同じ transaction で確定するので（第9節 手順3）、
+    `transfer_receipts.operation_id` が一致する commit で paid / refunded へ入る。
+    """
+    receipts_by_operation: dict[str, list[dict[str, Any]]] = {}
+    for receipt in snapshot.receipts:
+        receipts_by_operation.setdefault(str(receipt["operation_id"]), []).append(
+            receipt
+        )
+
+    grouped: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for entry in snapshot.journal:
+        operation_id = str(entry["operation_id"])
+        if not grouped or grouped[-1][0] != operation_id:
+            grouped.append((operation_id, str(entry["reason"]), []))
+        grouped[-1][2].append(entry)
+
+    balances: dict[tuple[str, str], int] = {}
+    inflow: dict[tuple[str, str], int] = {}
+    settled: list[dict[str, Any]] = []
+    deposit_units = 0
+    commits: list[CommitState] = []
+    for sequence, (operation_id, reason, entries) in enumerate(grouped, start=1):
+        for entry in entries:
+            key = (str(entry["owner_job_id"]), str(entry["bucket"]))
+            delta = int(entry["delta_units"])
+            balances[key] = balances.get(key, 0) + delta
+            if delta > 0:
+                inflow[key] = inflow.get(key, 0) + delta
+                # D は reason='fund' の available への流入から導出する
+                # （ledger.get_root_ledger_view と同じ導出）
+                if reason == "fund" and key[1] == "available":
+                    deposit_units += delta
+        settled.extend(receipts_by_operation.get(operation_id, ()))
+        commits.append(
+            CommitState(
+                sequence=sequence,
+                operation_id=operation_id,
+                reason=reason,
+                deposit_units=deposit_units,
+                balances=dict(balances),
+                inflow=dict(inflow),
+                settled_receipts=tuple(settled),
+            )
+        )
+    return commits
+
+
+def check_commit_history(snapshot: Snapshot) -> list[str]:
+    """Journal の各 commit 直後で保存則・非負・受取権者・二重計上なしを検証する。
+
+    tick 内の中間 commit（失効処理の確定、送金 1 件ごとの確定）は観測点の
+    スナップショットには現れない。ここでは commit 列を再生して**すべての
+    commit 直後**で計画書 第18節 N14 の 3 条件と第17節の受取権者一致を
+    検査する。再生の妥当性は「最終 commit の状態が実プロセスから観測した
+    スナップショットと一致すること」で担保する。
+    """
+    violations: list[str] = []
+    commits = replay_commits(snapshot)
+    reserved_amounts = {
+        str(operation["operation_id"]): parse_amount_string(operation["amount"])
+        for operation in snapshot.operations
+    }
+
+    for commit in commits:
+        where = f"commit #{commit.sequence} ({commit.reason}/{commit.operation_id})"
+
+        # 1. 保存則 D = E + paid + refunded
+        expected = commit.escrow_units + commit.paid_units + commit.refunded_units
+        if commit.deposit_units != expected:
+            violations.append(
+                f"{where}: D != E + paid + refunded: D={commit.deposit_units}"
+                f" E={commit.escrow_units} paid={commit.paid_units}"
+                f" refunded={commit.refunded_units}"
+            )
+
+        # 2. 全口座非負
+        for (owner, bucket), units in sorted(commit.balances.items()):
+            if units < 0:
+                violations.append(
+                    f"{where}: negative account {owner}/{bucket} = {units}"
+                )
+
+        # 3. 親子二重計上なし（D の分解と Child ごとの原資の行き先）
+        root_side = (
+            commit.balance(snapshot.root_id, "available")
+            + commit.balance(snapshot.root_id, "parent_payout")
+            + commit.balance(snapshot.root_id, "refund")
+        )
+        child_side = sum(
+            units
+            for (owner, bucket), units in commit.balances.items()
+            if owner != snapshot.root_id and bucket in ("child_work", "child_payout")
+        )
+        settled_units = sum(
+            int(receipt["amount_units"]) for receipt in commit.settled_receipts
+        )
+        if root_side + child_side + settled_units != commit.deposit_units:
+            violations.append(
+                f"{where}: D decomposition mismatch: root_side={root_side}"
+                f" child_side={child_side} settled={settled_units}"
+                f" != D={commit.deposit_units}"
+            )
+        child_owners = sorted(
+            {
+                owner
+                for (owner, _bucket) in commit.inflow
+                if owner != snapshot.root_id
+            }
+        )
+        for child_id in child_owners:
+            allocated = commit.inflow.get((child_id, "child_work"), 0)
+            budget = snapshot.child_budget_units.get(child_id)
+            if budget is not None and allocated not in (0, budget):
+                violations.append(
+                    f"{where}: child {child_id} allocated {allocated}"
+                    f" != budget {budget}"
+                )
+            moved_to_payout = commit.inflow.get((child_id, "child_payout"), 0)
+            child_paid = sum(
+                int(receipt["amount_units"])
+                for receipt in commit.settled_receipts
+                if receipt["job_id"] == child_id and receipt["kind"] == "payout"
+            )
+            if commit.balance(child_id, "child_payout") + child_paid != moved_to_payout:
+                violations.append(
+                    f"{where}: child {child_id} child_payout balance"
+                    f" {commit.balance(child_id, 'child_payout')} + paid {child_paid}"
+                    f" != moved to payout {moved_to_payout}"
+                )
+            returned = (
+                allocated - commit.balance(child_id, "child_work") - moved_to_payout
+            )
+            if returned < 0:
+                violations.append(
+                    f"{where}: child {child_id} negative returned amount {returned}"
+                )
+
+        # 4. この commit までに確定した Receipt が受取権者どおりであること
+        for receipt in commit.settled_receipts:
+            operation_id = str(receipt["operation_id"])
+            entitled, source = entitled_payee(
+                snapshot, str(receipt["job_id"]), str(receipt["kind"])
+            )
+            if source is None:
+                violations.append(
+                    f"{where}: unknown payment kind for {operation_id}:"
+                    f" {receipt['kind']}"
+                )
+                continue
+            if entitled is None or receipt["payee_id"] != entitled:
+                violations.append(
+                    f"{where}: receipt payee mismatch for {operation_id}:"
+                    f" receipt={receipt['payee_id']} entitled={entitled} ({source})"
+                )
+            reserved = reserved_amounts.get(operation_id)
+            if reserved is not None and int(receipt["amount_units"]) != reserved:
+                violations.append(
+                    f"{where}: receipt amount mismatch for {operation_id}:"
+                    f" receipt={receipt['amount_units']} reserved={reserved}"
+                )
+
+    # 5. 再生の妥当性: 最終 commit が実プロセスの観測値と一致する
+    if commits:
+        final = commits[-1]
+        for name, replayed, observed in (
+            ("deposit", final.deposit_units, snapshot.deposit_units),
+            ("available", final.available_units, snapshot.available_units),
+            ("locked", final.locked_units, snapshot.locked_units),
+            ("paid", final.paid_units, snapshot.paid_units),
+            ("refunded", final.refunded_units, snapshot.refunded_units),
+        ):
+            if replayed != observed:
+                violations.append(
+                    f"journal replay mismatch on {name}: replayed={replayed}"
+                    f" observed={observed}"
+                )
+        if final.locked_breakdown_units != snapshot.locked_breakdown_units:
+            violations.append(
+                "journal replay mismatch on locked_breakdown:"
+                f" replayed={final.locked_breakdown_units}"
+                f" observed={snapshot.locked_breakdown_units}"
+            )
+    elif snapshot.escrow_units or snapshot.deposit_units or snapshot.receipts:
+        violations.append(
+            "journal has no commit but the ledger is not empty:"
+            f" D={snapshot.deposit_units} E={snapshot.escrow_units}"
         )
     return violations
 
@@ -805,6 +1101,21 @@ class E2EWorld:
         finally:
             conn.close()
 
+    @contextlib.contextmanager
+    def observing_root(self, root_id: str) -> Iterator[None]:
+        """観測対象の Root を一時的に切り替える（1 DB に複数 Root があるシナリオ用）。
+
+        `snapshot` / `observe` は `root_id` を基準に台帳と Job を集めるため、
+        別 Root（X15 の「別Root からの操作」など）を同じ不変条件で観測する
+        ときにこの context manager で切り替える。抜けると元の Root へ戻る。
+        """
+        previous = self.root_id
+        self.root_id = root_id
+        try:
+            yield
+        finally:
+            self.root_id = previous
+
     def snapshot(self, label: str) -> Snapshot:
         """`ojp ledger show ROOT --json`（実プロセス）＋ 読取接続でスナップショットを取る。"""
         if self.root_id is None:
@@ -859,7 +1170,9 @@ class E2EWorld:
                 " JOIN journal_transactions t ON t.operation_id = e.operation_id"
                 " JOIN budget_accounts a ON a.id = e.account_id"
                 " WHERE a.root_id = ?"
-                " ORDER BY t.created_at_us ASC, t.operation_id ASC, e.entry_no ASC",
+                # rowid は INSERT 順 = commit 順。test mode の固定 Clock では
+                # created_at_us が同値になるため、commit 順の正本は rowid。
+                " ORDER BY t.rowid ASC, e.entry_no ASC",
                 (self.root_id,),
             ).fetchall()
             event_rows = conn.execute(
@@ -931,12 +1244,20 @@ class E2EWorld:
         受取権者一致・親子二重計上なしのいずれかが破れていれば即座に失敗させる
         （計画書 第18節 N14「各 commit を観測。D=E+paid+refunded、口座非負、
         親子二重計上なし」）。
+
+        1 回の tick や 1 回の外部操作が複数 commit に分かれる場合（tick の
+        失効処理・自動承認・裁定・返金予約・送金 1 件ごとはそれぞれ別 commit）、
+        観測点のスナップショットは最後の commit だけを写す。そのため
+        `check_commit_history` が Journal の commit 列を再生し、**中間 commit
+        も含めた全 commit 直後**で同じ条件を検査する。
         """
         snap = self.snapshot(label)
         conservation_violations = check_conservation(snap)
         entitlement_violations = check_payee_entitlement(snap)
         negatives = negative_accounts(snap)
         double_counting_violations = check_no_double_counting(snap)
+        commit_violations = check_commit_history(snap)
+        commit_count = len(replay_commits(snap))
         self.report.add_observation(
             ObservationRecord(
                 label=label,
@@ -961,6 +1282,9 @@ class E2EWorld:
                 },
                 no_double_counting_ok=not double_counting_violations,
                 double_counting_violations=double_counting_violations,
+                commit_count=commit_count,
+                commits_ok=not commit_violations,
+                commit_violations=commit_violations,
             )
         )
         self.snapshots.append(snap)
@@ -976,6 +1300,10 @@ class E2EWorld:
             raise HarnessError(
                 f"parent/child double counting at {label!r}:"
                 f" {double_counting_violations}"
+            )
+        if commit_violations:
+            raise HarnessError(
+                f"per-commit invariant violated at {label!r}: {commit_violations}"
             )
         return snap
 
@@ -1012,6 +1340,19 @@ class AgentSession:
     async def list_tool_names(self) -> list[str]:
         tools = await self._session.list_tools()
         return sorted(tool.name for tool in tools.tools)
+
+    async def list_tool_argument_names(self) -> dict[str, list[str]]:
+        """tool 名 → 宣言済み引数名（inputSchema の properties）の対応。
+
+        「MCP 引数に actor_id・payee_id を受け付けない」「期待結果・テスト・
+        判定器を引数で渡せない」（第5節・第13節）を、公開されている引数の
+        集合そのもので照合するために使う。
+        """
+        tools = await self._session.list_tools()
+        return {
+            tool.name: sorted((tool.input_schema or {}).get("properties", {}))
+            for tool in tools.tools
+        }
 
     async def call(
         self,
@@ -1151,15 +1492,15 @@ def write_root_card(
     return path
 
 
-def create_and_fund_root(
+def create_root_job(
     world: E2EWorld,
     *,
-    amount: str = "100.000000",
     card_path: Path = ROOT_CARD_PATH,
 ) -> tuple[str, str]:
-    """Requester が CLI で Root を作成し、全額入金して OPEN にする。
+    """Requester が CLI で Root（DRAFT）と公開候補 Version を作るだけで、入金しない。
 
-    戻り値は (root_id, published_version_id)。
+    未入金 Root（X01）を観測するために fund と分離してある。戻り値は
+    (root_id, published_version_id) で、`world.root_id` も設定する。
     """
     create = world.run_cli(
         ["job", "create", "--card", str(card_path)],
@@ -1170,13 +1511,39 @@ def create_and_fund_root(
     root_id = str(create.data["job_id"])
     version_id = str(create.data["version_id"])
     world.root_id = root_id
+    return root_id, version_id
 
-    world.run_cli(
+
+def fund_root(
+    world: E2EWorld,
+    root_id: str,
+    *,
+    amount: str = "100.000000",
+    label: str = "root",
+    expect_ok: bool = True,
+) -> CliResult:
+    """Requester が CLI で Root へ入金する（`expect_ok=False` で拒否の観測にも使う）。"""
+    return world.run_cli(
         ["job", "fund", root_id, "--amount", amount],
         actor=REQUESTER_ID,
-        operation_id=world.next_operation_id("fund", "root"),
+        operation_id=world.next_operation_id("fund", label),
+        expect_ok=expect_ok,
         action="job fund",
     )
+
+
+def create_and_fund_root(
+    world: E2EWorld,
+    *,
+    amount: str = "100.000000",
+    card_path: Path = ROOT_CARD_PATH,
+) -> tuple[str, str]:
+    """Requester が CLI で Root を作成し、全額入金して OPEN にする。
+
+    戻り値は (root_id, published_version_id)。
+    """
+    root_id, version_id = create_root_job(world, card_path=card_path)
+    fund_root(world, root_id, amount=amount)
     return root_id, version_id
 
 
@@ -1277,3 +1644,19 @@ def write_artifact(world: E2EWorld, name: str, payload: dict[str, Any]) -> Path:
     path = world.project_root / f"artifact-{name}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def subcontract_usage(
+    world: E2EWorld, root_id: str, *, label: str = "subcontract usage"
+) -> dict[str, Any]:
+    """`ojp ledger show ROOT --json` の subcontract_usage（U と available の正本）。
+
+    U は「Child 支払い済み総額 + Σ(child_work + child_payout)」（第10節）。
+    上限判定と同じ導出をアプリ側から読み、テスト側の再計算と突き合わせる。
+    """
+    result = world.run_cli(
+        ["ledger", "show", root_id],
+        actor=REQUESTER_ID,
+        action=f"ledger show ({label})",
+    )
+    return result.data["subcontract_usage"]
